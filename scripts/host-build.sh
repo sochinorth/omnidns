@@ -11,4 +11,6 @@ cmake -S "$ROOT" -B "$ROOT/build/host" -G Ninja \
 	-DCMAKE_PREFIX_PATH="$PREFIX" "$@" >/dev/null
 ninja -C "$ROOT/build/host"
 export LD_LIBRARY_PATH=$PREFIX/lib
+# the SDK ctest wrapper LD_PRELOADs runas.so, which leaks into the tests
+export ASAN_OPTIONS=${ASAN_OPTIONS:+$ASAN_OPTIONS:}verify_asan_link_order=0
 ctest --test-dir "$ROOT/build/host" --output-on-failure ${CTEST_ARGS:-}
