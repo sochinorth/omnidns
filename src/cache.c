@@ -142,6 +142,20 @@ void cache_flush(struct cache *c)
 		entry_drop(c, e);
 }
 
+uint32_t cache_sweep_expired(struct cache *c)
+{
+	uint32_t now = omni_now(), it = 0, n = 0;
+	struct centry *e;
+
+	while ((e = hmap_next(&c->map, &it))) {
+		if (now > e->inserted && now - e->inserted >= e->lifetime) {
+			entry_drop(c, e);
+			n++;
+		}
+	}
+	return n;
+}
+
 void cache_free(struct cache *c)
 {
 	if (!c)

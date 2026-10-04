@@ -267,6 +267,48 @@ TEST(rewrite_drop)
 	CHECK_EQ(svcb_rewrite_hints(r.b, r.n - 1, map_fn, &calls, false, out, sizeof(out), &olen), -EBADMSG);
 }
 
+TEST(rewrite_mandatory)
+{
+	static const uint8_t mand[] = { 0, SVCB_KEY_ALPN, 0, SVCB_KEY_IPV4HINT,
+					0, SVCB_KEY_IPV6HINT };
+	struct svcb_view v;
+	struct rd r = { .n = 0 };
+	uint8_t out[1024];
+	uint16_t olen;
+	const uint8_t *val;
+
+	r_u16(&r, 1);
+	r_bytes(&r, "\0", 1);
+	r_param(&r, 0, mand, sizeof(mand));
+	r_param(&r, SVCB_KEY_ALPN, alpn, sizeof(alpn));
+	r_param(&r, SVCB_KEY_IPV4HINT, v4, sizeof(v4));
+	r_param(&r, SVCB_KEY_IPV6HINT, v6, sizeof(v6));
+	REQUIRE(svcb_parse(r.b, r.n, &v) == 0);
+
+	/* ipv6hint dropped -> removed from mandatory as well */
+	CHECK_EQ(svcb_rewrite_hints(r.b, r.n, NULL, NULL, true, out, sizeof(out), &olen), 0);
+	CHECK_EQ(svcb_parse(out, olen, &v), 0);
+	CHECK_EQ(find_param(out, olen, 0, &val), 4);
+	CHECK(val[1] == SVCB_KEY_ALPN && val[3] == SVCB_KEY_IPV4HINT);
+	CHECK_EQ(find_param(out, olen, SVCB_KEY_IPV6HINT, &val), -1);
+
+	/* both hints dropped -> only alpn stays mandatory */
+	CHECK_EQ(svcb_rewrite_hints(r.b, r.n, drop_all, NULL, false, out, sizeof(out), &olen), 0);
+	CHECK_EQ(find_param(out, olen, 0, &val), 2);
+	CHECK(val[1] == SVCB_KEY_ALPN);
+	CHECK_EQ(olen, r.n - 4 - (4 + sizeof(v4)) - (4 + sizeof(v6)));
+
+	/* mandatory listing only hints -> param removed entirely */
+	r.n = 0;
+	r_u16(&r, 1);
+	r_bytes(&r, "\0", 1);
+	r_param(&r, 0, mand + 4, 2);
+	r_param(&r, SVCB_KEY_IPV6HINT, v6, sizeof(v6));
+	CHECK_EQ(svcb_rewrite_hints(r.b, r.n, NULL, NULL, true, out, sizeof(out), &olen), 0);
+	CHECK_EQ(olen, 3);
+	CHECK_EQ(find_param(out, olen, 0, &val), -1);
+}
+
 TEST(rewrite_alias)
 {
 	struct rd r;
@@ -289,6 +331,7 @@ int main(void)
 	RUN(parse_malformed);
 	RUN(rewrite_map);
 	RUN(rewrite_drop);
+	RUN(rewrite_mandatory);
 	RUN(rewrite_alias);
 	return test_summary();
 }

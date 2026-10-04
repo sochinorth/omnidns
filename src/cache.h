@@ -63,6 +63,11 @@ int cache_insert(struct cache *c, const struct config *cfg,
 		 struct binding *const *binds, uint16_t nbinds);
 
 void cache_flush(struct cache *c);
+/*
+ * Drop every expired entry (releasing its binding refs, so expired bindings
+ * become reclaimable). Called periodically; returns entries dropped.
+ */
+uint32_t cache_sweep_expired(struct cache *c);
 uint32_t cache_count(const struct cache *c);
 size_t cache_bytes(const struct cache *c);
 

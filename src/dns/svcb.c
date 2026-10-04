@@ -86,12 +86,47 @@ static int rewrite_hint(int family, const uint8_t *val, uint16_t vlen,
 	return 0;
 }
 
+/*
+ * Remove `removed` keys (bit 0: ipv4hint, bit 1: ipv6hint) from the
+ * mandatory param (key 0, hence first) of the rewritten rdata in place;
+ * drop the param when it becomes empty. RFC 9460 makes an RR whose
+ * mandatory list names an absent key invalid.
+ */
+static size_t fix_mandatory(uint8_t *out, size_t start, size_t end, unsigned removed)
+{
+	size_t vlen, i, w;
+
+	if (!removed || end - start < 4 || get16(out + start) != 0)
+		return end;
+	vlen = get16(out + start + 2);
+	w = 0;
+	for (i = 0; i + 1 < vlen; i += 2) {
+		uint16_t k = get16(out + start + 4 + i);
+
+		if ((k == SVCB_KEY_IPV4HINT && (removed & 1)) ||
+		    (k == SVCB_KEY_IPV6HINT && (removed & 2)))
+			continue;
+		put16(out + start + 4 + w, k);
+		w += 2;
+	}
+	if (w == vlen)
+		return end;
+	if (!w) {
+		memmove(out + start, out + start + 4 + vlen, end - start - 4 - vlen);
+		return end - 4 - vlen;
+	}
+	put16(out + start + 2, (uint16_t)w);
+	memmove(out + start + 4 + w, out + start + 4 + vlen, end - start - 4 - vlen);
+	return end - (vlen - w);
+}
+
 int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
 		       svcb_addr_fn fn, void *ctx, bool drop_v6,
 		       uint8_t *out, size_t cap, uint16_t *outlen)
 {
 	struct svcb_view v;
-	size_t off, o, room;
+	size_t off, o, room, params;
+	unsigned removed = 0;
 	int r;
 
 	r = svcb_parse(rdata, len, &v);
@@ -101,15 +136,17 @@ int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
 	if (cap < off)
 		return -ENOSPC;
 	memcpy(out, rdata, off);
-	o = off;
+	o = params = off;
 	while (off < len) {
 		uint16_t key = get16(rdata + off), vlen = get16(rdata + off + 2);
 		const uint8_t *val = rdata + off + 4;
 		size_t n;
 
 		off += 4 + (size_t)vlen;
-		if (key == SVCB_KEY_IPV6HINT && drop_v6)
+		if (key == SVCB_KEY_IPV6HINT && drop_v6) {
+			removed |= 2;
 			continue;
+		}
 		if (!hint_alen(key) || !fn) {
 			if (cap - o < 4 + (size_t)vlen)
 				return -ENOSPC;
@@ -123,12 +160,14 @@ int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
 				 fn, ctx, room ? out + o + 4 : NULL, room, &n);
 		if (r)
 			return r;
-		if (!n)
+		if (!n) {
+			removed |= key == SVCB_KEY_IPV4HINT ? 1 : 2;
 			continue;
+		}
 		put16(out + o, key);
 		put16(out + o + 2, (uint16_t)n);
 		o += 4 + n;
 	}
-	*outlen = (uint16_t)o;
+	*outlen = (uint16_t)fix_mandatory(out, params, o, removed);
 	return 0;
 }

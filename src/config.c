@@ -704,6 +704,7 @@ struct u32_opt {
 static const struct u32_opt u32_opts[] = {
 	U32OPT("fwmask", fwmask, 0xff000000u, 1, UINT32_MAX),
 	U32OPT("fakeip_grace", fakeip_grace, 600, 0, 30 * 86400),
+	U32OPT("fakeip_ttl_max", fakeip_ttl_max, 3600, 1, 7 * 86400),
 	U32OPT("fakeip_max_bindings", fakeip_max_bindings, 65536, 1, 1u << 24),
 	U32OPT("cache_size", cache_size, 10000, 0, 1u << 24),
 	U32OPT("cache_max_bytes", cache_max_bytes, 16u << 20, 0, UINT32_MAX),
@@ -1108,7 +1109,7 @@ static void put_prefix(uint8_t **q, bool has, const struct ip_prefix *p)
 
 static uint64_t rule_fingerprint(const struct config *cfg, const struct rule *r)
 {
-	uint8_t buf[64], *q = buf;
+	uint8_t buf[128], *q = buf;
 	uint64_t upid = r->up ? r->up->id : 0, h;
 
 	*q++ = (uint8_t)r->action;
@@ -1123,7 +1124,8 @@ static uint64_t rule_fingerprint(const struct config *cfg, const struct rule *r)
 		put_prefix(&q, cfg->has_pool4, &cfg->pool4);
 		put_prefix(&q, cfg->has_pool6, &cfg->pool6);
 		memcpy(q, &cfg->fakeip_grace, 4);
-		q += 4;
+		memcpy(q + 4, &cfg->fakeip_ttl_max, 4);
+		q += 8;
 	}
 	h = omni_hash(r->id, strlen(r->id) + 1);
 	memcpy(q, &h, 8);

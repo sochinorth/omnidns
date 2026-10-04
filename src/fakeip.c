@@ -658,6 +658,20 @@ uint32_t fakeip_marks_in_use(struct fakeip_db *db, uint32_t *out, uint32_t max)
 	return n;
 }
 
+uint32_t fakeip_evict_expired(struct fakeip_db *db)
+{
+	uint32_t now = omni_now(), it = 0, n = 0;
+	struct binding *b;
+
+	while ((b = hmap_next(&db->by_key, &it))) {
+		if (binding_evictable(b, now)) {
+			binding_drop(db, b, true);
+			n++;
+		}
+	}
+	return n;
+}
+
 void fakeip_maybe_evict(struct fakeip_db *db)
 {
 	s3_maybe_evict(&db->s3);

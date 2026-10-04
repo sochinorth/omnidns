@@ -63,6 +63,10 @@ config rule 'catchall'                     # no nameset: must be last
   `hash(secret, rule, mark, name, real IP)`.
 - A binding stays alive until its TTL plus `fakeip_grace` (600 s) has passed.
   Established flows survive beyond that through conntrack.
+- Fake records get their TTL capped at `fakeip_ttl_max` (3600 s), and so do
+  the bindings behind them.
+- A single answer yields at most 32 fakes.
+- Upstream TTLs of 2³¹ or more are treated as 0 (RFC 2181).
 - Bindings live in RAM only. On startup omnidns owns and recreates
   `table inet omnidns`.
 - Reverse lookups (PTR) for fake addresses are answered locally.
@@ -117,6 +121,15 @@ The kernel must be ≥ 6.3, because omnidns uses `NFT_MSG_DESTROYSETELEM`.
   that the client resolves later. Add such CDN names to the nameset.
 - **DNSSEC** records are dropped from rewritten answers. Upstream queries are
   sent with DO=0.
+- **Pool capacity is shared by all clients.** A LAN client that controls an
+  authoritative zone, and queries many of its names through a `fakeip` rule,
+  can fill the pool (`fakeip_max_bindings`, default 65536) for up to
+  `fakeip_ttl_max` + `fakeip_grace`. After that, new fakeip names get
+  SERVFAIL. Real IPs are never returned as a fallback.
+
+  This matters most with a catchall `fakeip` rule on networks with untrusted
+  clients. Mitigations: lower `fakeip_ttl_max`, use a larger pool, or limit
+  `fakeip` rules to curated namesets.
 - **Hardware/software flow offloading** bypasses nftables marks for
   offloaded flows.
 

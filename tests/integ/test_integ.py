@@ -45,6 +45,7 @@ ZONE = {
         ["warp.test", "AAAA", 120, REAL6],
         ["www.warp.test", "CNAME", 300, "edge.cdn.test"],
         ["edge.cdn.test", "A", 60, REAL_A],
+        ["long.warp.test", "A", 86400, REAL_A],
         ["cloak.test", "CNAME", 300, "tracker.ads.test"],
         ["tracker.ads.test", "A", 60, "203.0.113.66"],
         ["ads.test", "A", 60, "203.0.113.66"],
@@ -336,6 +337,13 @@ def fakeip_dataplane(env):
     r2 = env.q("warp.test", "A")
     check(answers(r2, "A") == [fake], "fake changed: %r" % r2)
     check(r2["an"][0]["ttl"] < r["an"][0]["ttl"], "TTL not decremented")
+
+
+@test
+def fakeip_ttl_capped(env):
+    r = env.q("long.warp.test", "A")
+    check(in_pool(answers(r, "A")[0]) and r["an"][0]["ttl"] <= 3600,
+          "fake TTL not capped by fakeip_ttl_max: %r" % r)
 
 
 @test

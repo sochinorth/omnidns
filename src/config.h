@@ -23,6 +23,8 @@
  *   fakeip_v4 (unset), fakeip_v6 (unset): CIDR,
  *     v4: plen 8..30; v6: plen 32..120; must not overlap loopback/multicast/0/::
  *   fakeip_grace (600 s), fakeip_max_bindings (65536),
+ *   fakeip_ttl_max (3600 s): TTL cap of rewritten (fake) records, which
+ *     also bounds binding lifetime against huge upstream TTLs,
  *   cache_size (10000 entries), cache_max_bytes (16 MiB), neg_ttl_max (3600),
  *   block_mode (nodata|nxdomain|null, default nodata), block_ttl (300),
  *   upstream_timeout (1500 ms), upstream_total_timeout (5000 ms),
@@ -157,7 +159,7 @@ struct rule {
 	/*
 	 * Semantic fingerprint: hash of (id, action, up->id, mark, plus for
 	 * block: block_mode, block_ttl; plus for fakeip: pool prefixes,
-	 * fakeip_grace). Two rules with equal fingerprint produce identical
+	 * fakeip_grace, fakeip_ttl_max). Two rules with equal fingerprint produce identical
 	 * resolution behaviour for a name they match.
 	 */
 	uint64_t fingerprint;
@@ -179,6 +181,7 @@ struct config {
 	bool has_pool4, has_pool6;
 	struct ip_prefix pool4, pool6;
 	uint32_t fakeip_grace;
+	uint32_t fakeip_ttl_max;
 	uint32_t fakeip_max_bindings;
 
 	uint32_t cache_size;

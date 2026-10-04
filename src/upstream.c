@@ -297,6 +297,10 @@ static bool ex_on_resp(struct exchange *ex, const uint8_t *b, size_t len)
 	if ((m.flags & DNS_F_TC) && !tcp) {
 		dns_msg_free(&m);
 		ex_start_tcp(ex);
+	} else if (m.flags & DNS_F_TC) {
+		/* truncated even over TCP: never deliver (or cache) a partial answer */
+		dns_msg_free(&m);
+		ex_next(ex, -EIO);
 	} else if (rcode_fail(dns_msg_rcode(&m))) {
 		dns_msg_free(&m);
 		ex_next(ex, -EIO);

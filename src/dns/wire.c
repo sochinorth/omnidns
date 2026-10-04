@@ -580,6 +580,9 @@ static int parse_rr(struct dns_msg *m, struct pctx *c, uint8_t sec)
 	type = get16(c->p + off);
 	cls = get16(c->p + off + 2);
 	ttl = get32(c->p + off + 4);
+	/* RFC 2181 sec. 8: a TTL with the MSB set is treated as zero (not OPT) */
+	if (ttl & 0x80000000u && type != DNS_T_OPT)
+		ttl = 0;
 	rdlen = get16(c->p + off + 8);
 	off += DNS_RR_FIXED;
 	if (c->len - off < rdlen)

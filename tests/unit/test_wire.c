@@ -192,6 +192,28 @@ TEST(basic_parse)
 	dns_msg_free(&m);
 }
 
+/* RFC 2181 sec. 8: TTLs with the MSB set are treated as zero */
+TEST(ttl_msb_clamp)
+{
+	uint8_t a[4] = { 192, 0, 2, 1 };
+	struct dns_msg m;
+	struct pkt p;
+
+	dns_msg_init(&m);
+	p_hdr(&p, DNS_F_QR, 1, 2, 0, 0);
+	p_q(&p, "x.test", DNS_T_A);
+	p_name(&p, "x.test");
+	p_rrfix(&p, DNS_T_A, 0x80000001u, 4);
+	p_bytes(&p, a, 4);
+	p_name(&p, "x.test");
+	p_rrfix(&p, DNS_T_A, 0x7fffffffu, 4);
+	p_bytes(&p, a, 4);
+	REQUIRE(parse(&m, &p) == 0);
+	CHECK_EQ(m.rr[0].ttl, 0);
+	CHECK_EQ(m.rr[1].ttl, 0x7fffffff);
+	dns_msg_free(&m);
+}
+
 /* CNAME rdata compressed against the question */
 TEST(cname_compressed_rdata)
 {
@@ -905,6 +927,7 @@ int main(void)
 
 	hash_init_fixed(key);
 	RUN(basic_parse);
+	RUN(ttl_msb_clamp);
 	RUN(cname_compressed_rdata);
 	RUN(pointer_loops);
 	RUN(jump_limit);

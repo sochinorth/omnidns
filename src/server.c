@@ -22,14 +22,22 @@
 #define UDP_BUDGET		64	/* datagrams per wakeup */
 #define TCP_IDLE_MS		10000
 #define TCP_MAX_INFLIGHT	16
-#define TCP_MAX_OUTQ		(256 * 1024)
+#define TCP_MAX_OUTQ		(256 * 1024)	/* stop reading above this */
+#define TCP_HARD_OUTQ		(1024 * 1024)	/* drop the client above this */
 #define EDNS_MAX_UDP		1232
 
+/*
+ * Pending UDP requests hold a reference: a listener closed by a reload
+ * keeps its fd until the last reply went out, so the fd number cannot be
+ * reused (e.g. by a TCP client) while replies are still due on it.
+ */
 struct listener {
 	struct uloop_fd ufd;
 	struct list_head list;
 	int proto;			/* IPPROTO_UDP / IPPROTO_TCP */
 	struct sockaddr_storage addr;
+	uint32_t refcnt;
+	bool closed;
 };
 
 /* per client IP pending-query accounting */
@@ -67,6 +75,7 @@ struct creq {
 	struct resolve_req *rr;
 	struct client_cnt *cc;
 	struct tcp_conn *conn;		/* NULL for UDP */
+	struct listener *lst;		/* UDP only, referenced */
 	int udp_fd;
 	struct sockaddr_storage peer;
 	socklen_t peerlen;
@@ -112,8 +121,9 @@ static void sa_ip(const struct sockaddr_storage *ss, uint8_t *family, uint8_t ip
 			*family = 4;
 			memcpy(ip, &a->s6_addr[12], 4);
 		} else {
+			/* one host may hold many SLAAC/privacy addresses: account per /64 */
 			*family = 6;
-			memcpy(ip, a, 16);
+			memcpy(ip, a, 8);
 		}
 	}
 }
@@ -161,6 +171,21 @@ static void client_release(struct client_cnt *c)
 		return;
 	hmap_del_ptr(&clients, omni_hash(&c->family, 1) ^ omni_hash(c->ip, 16), c);
 	free(c);
+}
+
+static void listener_put(struct listener *l)
+{
+	if (--l->refcnt || !l->closed)
+		return;
+	close(l->ufd.fd);
+	free(l);
+}
+
+static void creq_release(struct creq *q)
+{
+	client_release(q->cc);
+	if (q->lst)
+		listener_put(q->lst);
 }
 
 /* ---- response building ---- */
@@ -304,7 +329,7 @@ static void creq_done(void *ctx, const struct dns_msg *resp)
 				 q->ifindex, out_buf, len);
 	}
 	list_del(&q->list);
-	client_release(q->cc);
+	creq_release(q);
 	if (q->conn) {
 		struct tcp_conn *c = q->conn;
 
@@ -323,7 +348,7 @@ static void creq_free(struct creq *q)
 	if (q->rr)
 		resolve_cancel(q->rr);
 	list_del(&q->list);
-	client_release(q->cc);
+	creq_release(q);
 	free(q);
 }
 
@@ -385,6 +410,8 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 	}
 	*q = *tmpl;
 	q->cc = cc;
+	if (q->lst)
+		q->lst->refcnt++;
 	q->id = m.id;
 	q->rdcd = m.flags & (DNS_F_RD | DNS_F_CD);
 	q->qname = m.qname;
@@ -401,7 +428,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 		if (q->conn)
 			q->conn->inflight--;
 		list_del(&q->list);
-		client_release(cc);
+		creq_release(q);
 		free(q);
 		ret = build_error(buf, len, DNS_R_SERVFAIL, &m, m.edns.present, reply, reply_cap);
 		goto out;
@@ -439,6 +466,7 @@ static void udp_read_cb(struct uloop_fd *ufd, unsigned events)
 		stats.udp_queries++;
 		tmpl.o = srv_o;
 		tmpl.udp_fd = ufd->fd;
+		tmpl.lst = container_of(ufd, struct listener, ufd);
 		tmpl.peerlen = mh.msg_namelen;
 		for (c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
 			if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
@@ -539,7 +567,7 @@ static void tcp_send(struct tcp_conn *c, const uint8_t *buf, size_t len)
 	memcpy(ob->data + 2, buf, len);
 	list_add_tail(&ob->list, &c->outq);
 	c->outq_bytes += ob->len;
-	if (!tcp_flush(c)) {
+	if (!tcp_flush(c) || c->outq_bytes > TCP_HARD_OUTQ) {
 		c->read_closed = true;
 		/* drop everything queued; close once in-flight finish */
 		struct outbuf *o2, *t2;
@@ -733,9 +761,10 @@ static void close_listeners(struct list_head *head)
 
 	list_for_each_entry_safe(l, tmp, head, list) {
 		uloop_fd_delete(&l->ufd);
-		close(l->ufd.fd);
 		list_del(&l->list);
-		free(l);
+		l->closed = true;
+		l->refcnt++;
+		listener_put(l);
 	}
 }
 

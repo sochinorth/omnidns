@@ -484,6 +484,40 @@ static bool strip_type(const struct resolve_req *r, uint16_t t)
 	       (t == DNS_T_DS && r->qtype != DNS_T_DS);
 }
 
+/*
+ * Additional-section address records (A/AAAA/SVCB/HTTPS) are kept only for
+ * names whose rule is a plain forward, and only when nothing in this walk
+ * latched or bound: real addresses of fakeip or blocked names must never
+ * reach the client via glue (e.g. SRV/MX additional data). The decision
+ * depends on rules, so the owner is recorded as a cache dependency.
+ */
+static bool glue_ok(struct resolve_req *r, const struct dns_rr *rr)
+{
+	const struct config *cfg = r->o->cfg;
+	uint16_t idx;
+
+	if (rr->section != DNS_S_AR ||
+	    (rr->type != DNS_T_A && rr->type != DNS_T_AAAA &&
+	     rr->type != DNS_T_SVCB && rr->type != DNS_T_HTTPS))
+		return true;
+	if (r->latch.on || r->nbinds)
+		return false;
+	idx = match_lookup_wire(cfg->idx, rr->owner, rr->owner_len);
+	if (idx == MATCH_NONE || idx >= cfg->nrules || cfg->rules[idx].action != RULE_FORWARD)
+		return false;
+	return dep_add(r, rr->owner, rr->owner_len, cfg->rules[idx].fingerprint) == 0;
+}
+
+static bool all_glue_ok(struct resolve_req *r)
+{
+	uint16_t i;
+
+	for (i = 0; i < r->resp.nrr; i++)
+		if (!glue_ok(r, &r->resp.rr[i]))
+			return false;
+	return true;
+}
+
 /* Copy NS/AR of the last response into out. */
 static int copy_tail(struct resolve_req *r, bool strip_sec, bool strip_glue, bool no_ar)
 {
@@ -498,8 +532,8 @@ static int copy_tail(struct resolve_req *r, bool strip_sec, bool strip_glue, boo
 			continue;
 		if (strip_sec && strip_type(r, rr->type))
 			continue;
-		if (strip_glue && rr->section == DNS_S_AR &&
-		    (rr->type == DNS_T_A || rr->type == DNS_T_AAAA))
+		if ((strip_glue && rr->section == DNS_S_AR &&
+		     (rr->type == DNS_T_A || rr->type == DNS_T_AAAA)) || !glue_ok(r, rr))
 			continue;
 		ret = add_rr(&r->out, rr->section, rr);
 		if (ret)
@@ -521,9 +555,10 @@ static int copy_prefix(struct resolve_req *r)
 	return 0;
 }
 
-static bool can_pass_through(const struct resolve_req *r)
+static bool can_pass_through(struct resolve_req *r)
 {
-	return r->nresp == 1 && !r->requeried && !r->synth && !r->latch.on && !r->nbinds;
+	return r->nresp == 1 && !r->requeried && !r->synth && !r->latch.on && !r->nbinds &&
+	       all_glue_ok(r);
 }
 
 static int pass_through(struct resolve_req *r)
@@ -612,13 +647,31 @@ struct hint_ctx {
 	uint32_t ttl;
 };
 
+/*
+ * At most RESOLVE_MAX_FAKES distinct fakes per answer (-EDQUOT beyond: the
+ * address is omitted), so one hostile answer cannot drain the pool.
+ */
+#define RESOLVE_MAX_FAKES 32
+
+/* TTL of rewritten records and their bindings: capped by fakeip_ttl_max. */
+static uint32_t fake_ttl(const struct resolve_req *r, uint32_t ttl)
+{
+	return ttl < r->o->cfg->fakeip_ttl_max ? ttl : r->o->cfg->fakeip_ttl_max;
+}
+
 static struct binding *do_bind(struct resolve_req *r, const char *rule_id, uint32_t mark,
 			       const uint8_t *ep, uint8_t eplen, int fam,
 			       const uint8_t *real, uint32_t ttl, int *err)
 {
 	struct binding *b;
 
+	if (r->nbinds >= RESOLVE_MAX_FAKES) {
+		*err = -EDQUOT;
+		return NULL;
+	}
 	b = fakeip_bind(r->o->fdb, rule_id, mark, ep, eplen, fam, real, ttl, err);
+	if (!b && *err == -ENOSPC && cache_sweep_expired(r->o->cache))
+		b = fakeip_bind(r->o->fdb, rule_id, mark, ep, eplen, fam, real, ttl, err);
 	if (!b) {
 		if (*err == -ENOSPC)
 			log_rl(LOG_WARNING, "fake IP pool exhausted (rule %s, IPv%d)",
@@ -640,7 +693,7 @@ static int hint_fn(void *ctx, int family, const uint8_t *in, uint8_t *out)
 	b = do_bind(h->r, h->rule_id, h->mark, h->endpoint, h->endpoint_len,
 		    family, in, h->ttl, &err);
 	if (!b)
-		return err;
+		return err == -EDQUOT ? 1 : err;
 	memcpy(out, b->fake, family == 4 ? 4 : 16);
 	return 0;
 }
@@ -648,7 +701,9 @@ static int hint_fn(void *ctx, int family, const uint8_t *in, uint8_t *out)
 static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 		      const struct plan *p, bool *changed)
 {
-	struct hint_ctx h = { .r = r, .rule_id = p->rule_id, .mark = p->mark, .ttl = rr->ttl };
+	struct hint_ctx h = {
+		.r = r, .rule_id = p->rule_id, .mark = p->mark, .ttl = fake_ttl(r, rr->ttl),
+	};
 	struct svcb_view v;
 	uint8_t *buf;
 	uint16_t len;
@@ -674,7 +729,7 @@ static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 		if (len != rr->rdlen || memcmp(buf, rr->rdata, len))
 			*changed = true;
 		ret = dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len,
-				     rr->type, rr->cls, rr->ttl, buf, len);
+				     rr->type, rr->cls, h.ttl, buf, len);
 	}
 	free(buf);
 	return ret;
@@ -683,14 +738,15 @@ static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struct plan *p)
 {
 	int fam = afamily(rr->type), err;
+	uint32_t ttl = fake_ttl(r, rr->ttl);
 	struct binding *b;
 
 	b = do_bind(r, p->rule_id, p->mark, r->name.data, r->name.len, fam,
-		    rr->rdata, rr->ttl, &err);
+		    rr->rdata, ttl, &err);
 	if (!b)
-		return err;
+		return err == -EDQUOT ? 0 : err;
 	return dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len, rr->type,
-			      rr->cls, rr->ttl, b->fake, rr->rdlen);
+			      rr->cls, ttl, b->fake, rr->rdlen);
 }
 
 /* Decide one ServiceMode RR (match its effective target). */

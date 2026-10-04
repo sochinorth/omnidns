@@ -27,19 +27,46 @@ static bool destroy_on_exit;
 static bool log_to_stderr;
 
 /*
- * Desired dataplane: pools and fwmask from cfg, marks = marks of fakeip
- * rules in cfg plus marks still referenced by live bindings.
+ * Mark chains installed so far. They are kept across reloads until the
+ * fwmask changes: walks in flight across a reload may still bind with a
+ * mark the new config no longer uses, and chains are tiny.
  */
-static int build_desired(const struct config *cfg, struct nft_desired *d, uint32_t *marks)
-{
-	uint32_t n = 0;
-	int i;
+static uint32_t kept_marks[MAX_MARKS];
+static uint32_t nkept_marks;
 
-	if (omni.fdb)
-		n = fakeip_marks_in_use(omni.fdb, marks, MAX_MARKS);
-	for (i = 0; i < cfg->nrules && n < MAX_MARKS; i++)
-		if (cfg->rules[i].action == RULE_FAKEIP)
-			marks[n++] = cfg->rules[i].mark;
+static void add_mark(uint32_t *marks, uint32_t *n, uint32_t m)
+{
+	uint32_t i;
+
+	for (i = 0; i < *n; i++)
+		if (marks[i] == m)
+			return;
+	if (*n < MAX_MARKS)
+		marks[(*n)++] = m;
+}
+
+/*
+ * Desired dataplane: pools and fwmask from cfg, marks = marks of fakeip
+ * rules in cfg, marks still referenced by bindings and (unless the mask
+ * changes) every mark installed before.
+ */
+static int build_desired(const struct config *cfg, struct nft_desired *d, uint32_t *marks,
+			 bool keep_old)
+{
+	uint32_t n = 0, i, nb;
+	int r;
+
+	if (omni.fdb) {
+		nb = fakeip_marks_in_use(omni.fdb, marks, MAX_MARKS);
+		for (i = 0; i < nb; i++)
+			add_mark(marks, &n, marks[i]);
+	}
+	for (r = 0; r < cfg->nrules; r++)
+		if (cfg->rules[r].action == RULE_FAKEIP)
+			add_mark(marks, &n, cfg->rules[r].mark);
+	if (keep_old)
+		for (i = 0; i < nkept_marks; i++)
+			add_mark(marks, &n, kept_marks[i]);
 	memset(d, 0, sizeof(*d));
 	d->fwmask = cfg->fwmask;
 	d->has_pool4 = cfg->has_pool4;
@@ -63,6 +90,7 @@ static int reload(void)
 	static uint32_t marks[MAX_MARKS];
 	struct config *ncfg, *old = omni.cfg;
 	struct nft_desired d;
+	bool mask_changed;
 	char err[512];
 	int ret;
 
@@ -71,11 +99,18 @@ static int reload(void)
 		log_err("reload: %s; keeping previous configuration", err);
 		return -EINVAL;
 	}
-	if (ncfg->fwmask != old->fwmask && fakeip_live_count(omni.fdb)) {
-		log_err("reload: fwmask change rejected while %u fake IP bindings are live; "
-			"keeping previous configuration", fakeip_live_count(omni.fdb));
-		ret = -EBUSY;
-		goto fail;
+	mask_changed = ncfg->fwmask != old->fwmask;
+	if (mask_changed) {
+		/* cached answers pin bindings and all embed the old marks */
+		cache_flush(omni.cache);
+		fakeip_evict_expired(omni.fdb);
+		if (fakeip_live_count(omni.fdb)) {
+			log_err("reload: fwmask change rejected while %u fake IP bindings are "
+				"live; keeping previous configuration",
+				fakeip_live_count(omni.fdb));
+			ret = -EBUSY;
+			goto fail;
+		}
 	}
 	ret = fakeip_set_config(omni.fdb, ncfg->has_pool4 ? &ncfg->pool4 : NULL,
 				ncfg->has_pool6 ? &ncfg->pool6 : NULL,
@@ -85,7 +120,10 @@ static int reload(void)
 			"new pool; keeping previous configuration", strerror(-ret));
 		goto fail;
 	}
-	build_desired(ncfg, &d, marks);
+	/* element deletes of evicted bindings must land before their chains go */
+	nft_flush(omni.nft);
+	nft_drain(omni.nft);
+	build_desired(ncfg, &d, marks, !mask_changed);
 	ret = nft_reconcile(omni.nft, &d);
 	if (ret) {
 		log_err("reload: nftables reconciliation failed (%s); keeping previous "
@@ -96,6 +134,8 @@ static int reload(void)
 				  old->fakeip_max_bindings, old->fakeip_grace);
 		goto fail;
 	}
+	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
+	nkept_marks = d.nmarks;
 	ncfg->gen = ++omni.next_gen;
 	omni.cfg = ncfg;
 	ret = server_reconfigure(&omni);
@@ -120,6 +160,19 @@ static void sighup_cb(struct uloop_signal *s)
 }
 
 static struct uloop_signal sighup = { .signo = SIGHUP, .cb = sighup_cb };
+
+/* Expired cache entries pin their bindings: sweep them regularly so expired
+ * bindings become reclaimable, then trim the binding DB. */
+#define SWEEP_INTERVAL_MS 30000
+
+static void sweep_cb(struct uloop_timeout *t)
+{
+	cache_sweep_expired(omni.cache);
+	fakeip_maybe_evict(omni.fdb);
+	uloop_timeout_set(t, SWEEP_INTERVAL_MS);
+}
+
+static struct uloop_timeout sweep_timer = { .cb = sweep_cb };
 
 static void usage(const char *prog)
 {
@@ -176,11 +229,13 @@ int main(int argc, char **argv)
 		log_err("cannot open nftables netlink socket");
 		goto out_loop;
 	}
-	build_desired(omni.cfg, &d, marks);
+	build_desired(omni.cfg, &d, marks, false);
 	if (nft_bootstrap(omni.nft, &d)) {
 		log_err("nftables bootstrap failed");
 		goto out_nft;
 	}
+	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
+	nkept_marks = d.nmarks;
 	omni.fdb = fakeip_new(omni.cfg->has_pool4 ? &omni.cfg->pool4 : NULL,
 			      omni.cfg->has_pool6 ? &omni.cfg->pool6 : NULL,
 			      omni.cfg->fakeip_max_bindings, omni.cfg->fakeip_grace,
@@ -194,6 +249,7 @@ int main(int argc, char **argv)
 	if (server_start(&omni))
 		goto out_upstream;
 	uloop_signal_add(&sighup);
+	uloop_timeout_set(&sweep_timer, SWEEP_INTERVAL_MS);
 
 	log_info("omnidns started: %u rules, port %u", omni.cfg->nrules, omni.cfg->port);
 	uloop_run();
