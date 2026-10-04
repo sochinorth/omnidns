@@ -35,13 +35,14 @@ TABLE = "omniinteg"
 LAN = "192.168.77.1"
 CLIENT = "192.168.77.2"
 REAL_A, REAL_B = "203.0.113.10", "203.0.113.11"
+LAN6, CLIENT6, REAL6 = "fd77::1", "fd77::2", "2001:db8:1::10"
 UP = {"isp": ("127.0.1.1", 5301), "cf": ("127.0.1.2", 5302), "alt": ("127.0.1.3", 5303)}
 
 ZONE = {
     "records": [
         ["plain.test", "A", 300, REAL_B],
         ["warp.test", "A", 120, REAL_A],
-        ["warp.test", "AAAA", 120, "2001:db8::10"],
+        ["warp.test", "AAAA", 120, REAL6],
         ["www.warp.test", "CNAME", 300, "edge.cdn.test"],
         ["edge.cdn.test", "A", 60, REAL_A],
         ["cloak.test", "CNAME", 300, "tracker.ads.test"],
@@ -129,6 +130,13 @@ class Env:
         for a in (REAL_A, REAL_B):
             sh("ip addr add %s/32 dev wan0" % a)
         sh("ip route add 198.18.0.0/15 dev wan0")
+        sh("ip -6 addr add %s/64 dev lan0 nodad" % LAN6)
+        self.cl("ip -6 addr add %s/64 dev lan1 nodad && ip -6 route add default via %s"
+                % (CLIENT6, LAN6))
+        sh("ip -6 addr add %s/128 dev wan0 nodad" % REAL6)
+        sh("ip -6 route add fd00:198:18::/64 dev wan0")
+        with open("/proc/sys/net/ipv6/conf/all/forwarding", "w") as f:
+            f.write("1")
         for ip, _ in UP.values():
             sh("ip addr add %s/8 dev lo" % ip, check_rc=False)
         with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
@@ -174,8 +182,8 @@ EOF""")
             self.procs.append(p)
 
     def services(self):
-        for addr in (REAL_A, REAL_B):
-            s = socket.socket()
+        for addr in (REAL_A, REAL_B, REAL6):
+            s = socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((addr, 8080))
             s.listen(64)
@@ -228,12 +236,14 @@ EOF""")
                 % (HERE, LAN, name, qtype, tcp, kw))
         return json.loads(self.cl("%s -c %s" % (sys.executable, sh_quote(code))))
 
-    def connect(self, ip, port=8080):
+    def connect(self, ip, port=8080, router=False):
         code = ("import socket,sys\n"
-                "s=socket.socket(); s.settimeout(2)\n"
+                "s=socket.socket(%s); s.settimeout(2)\n"
                 "try:\n s.connect((%r,%d)); print(s.recv(100).decode().strip())\n"
-                "except Exception as e: print('ERR', type(e).__name__)\n" % (ip, port))
-        return self.cl("%s -c %s" % (sys.executable, sh_quote(code))).strip()
+                "except Exception as e: print('ERR', type(e).__name__)\n"
+                % ("socket.AF_INET6" if ":" in ip else "", ip, port))
+        cmd = "%s -c %s" % (sys.executable, sh_quote(code))
+        return (sh(cmd) if router else self.cl(cmd)).strip()
 
     def nft_map(self, name):
         out = json.loads(sh("nft -j list map inet %s %s" % (TABLE, name)))
@@ -427,6 +437,42 @@ config rule 'adblock'""")
     env.write_config(CONFIG)
     env.hup()
     check(answers(env.q("warp.test", "A"), "A") == [fake], "same fake after restore")
+
+
+@test
+def router_originated_output_hook(env):
+    fake = answers(env.q("warp.test", "A"), "A")[0]
+    before = env.counters()
+    out = env.connect(fake, router=True)
+    check(out == "hello from " + REAL_A, "router-originated connect via fake: %r" % out)
+    after = env.counters()
+    check(after[0] > before[0], "mark not set on output path: %r -> %r" % (before, after))
+
+
+@test
+def v6_pool_via_reload(env):
+    cfg = CONFIG.replace("option fakeip_v4 '198.18.0.0/15'",
+                         "option fakeip_v4 '198.18.0.0/15'\n\toption fakeip_v6 'fd00:198:18::/64'")
+    cfg = cfg.replace("list listen_addr '{lan}'", "list listen_addr '{lan}'\n\tlist listen_addr '%s'" % LAN6)
+    env.write_config(cfg)
+    env.hup()
+    check("reloaded" in env.daemon_log().splitlines()[-1], "v6 reload failed:\n" + env.daemon_log()[-800:])
+    r = env.q("warp.test", "AAAA")
+    ips = answers(r, "AAAA")
+    check(len(ips) == 1 and ips[0].startswith("fd00:198:18:"), "no v6 fake: %r" % r)
+    check(env.nft_map("fake2real_v6").get(ips[0]) == REAL6, "fake2real_v6 missing")
+    out = env.connect(ips[0])
+    check(out == "hello from " + REAL6, "connect via v6 fake: %r" % out)
+    p = env.q("svc.warp.test", "HTTPS")["an"][0]["data"]["params"]
+    check(p.get("ipv6hint") and all(h.startswith("fd00:198:18:") for h in p["ipv6hint"]),
+          "ipv6hint not rewritten: %r" % p)
+    # v6 transport to the daemon
+    r = dnsmini.query(LAN6, 53, "plain.test", "A")
+    check(answers(r, "A") == [REAL_B], "query over v6 transport")
+    env.write_config(CONFIG)
+    env.hup()
+    check("rejected" in env.daemon_log().splitlines()[-1],
+          "removing the v6 pool with live v6 bindings must be rejected")
 
 
 def main():
