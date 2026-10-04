@@ -16,7 +16,7 @@ void log_init(const char *ident, bool to_stderr, int max_level)
 		openlog(ident, LOG_PID, LOG_DAEMON);
 }
 
-static void log_vmsg(int prio, const char *fmt, va_list ap)
+static void __attribute__((format(printf, 2, 0))) log_vmsg(int prio, const char *fmt, va_list ap)
 {
 	if (prio > log_level)
 		return;

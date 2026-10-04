@@ -343,7 +343,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 		return 0;			/* no header or a response: drop */
 
 	dns_msg_init(&m);
-	ret = dns_parse_query(&m, buf, len);
+	ret = dns_parse(&m, buf, len);
 	if (ret == -ENOMEM) {
 		ret = 0;
 		goto out;
