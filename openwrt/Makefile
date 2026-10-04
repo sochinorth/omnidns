@@ -24,7 +24,7 @@ define Package/omnidns
   SUBMENU:=IP Addresses and Names
   TITLE:=Policy-aware DNS proxy with fake-IP policy routing
   DEPENDS:=+libubox +libuci +libmnl +libnftnl \
-	+kmod-nft-core +kmod-nft-nat +kmod-nft-reject
+	+kmod-nft-core +kmod-nft-nat
 endef
 
 define Package/omnidns/description

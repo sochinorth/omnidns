@@ -111,7 +111,7 @@ Then route `*.lan` and reverse zones to it with a `forward` rule. The default
 config already does this through `/etc/omnidns.d/dnsmasq.conf`, which
 contains `nameserver 127.0.0.1#5335`.
 
-Package dependencies: `libubox libuci libmnl libnftnl kmod-nft-core kmod-nft-nat kmod-nft-reject`.
+Package dependencies: `libubox libuci libmnl libnftnl kmod-nft-core kmod-nft-nat` (reject and ct are part of kmod-nft-core).
 The kernel must be ≥ 6.3, because omnidns uses `NFT_MSG_DESTROYSETELEM`.
 
 ## Known limitations
