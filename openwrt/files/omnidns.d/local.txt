@@ -1,0 +1,4 @@
+# names answered by dnsmasq
+*.lan
+*.in-addr.arpa
+*.ip6.arpa
