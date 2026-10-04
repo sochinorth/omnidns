@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """End-to-end tests for omnidns in unprivileged network namespaces.
 
     tests/integ/test_integ.py [path/to/omnidns] [-k substring]

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MIT */
 #ifndef OMNI_DNS_SVCB_H
 #define OMNI_DNS_SVCB_H
 

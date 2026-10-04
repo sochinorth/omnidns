@@ -4,3 +4,5 @@ openwrt-sdk/
 .sdk.upper/
 .sdk.work/
 .claude/
+__pycache__/
+*.pyc

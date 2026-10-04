@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MIT */
 #ifndef OMNI_ARENA_H
 #define OMNI_ARENA_H
 

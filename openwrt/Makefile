@@ -11,7 +11,8 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=omnidns
 PKG_VERSION:=0.1.0
 PKG_RELEASE:=1
-PKG_LICENSE:=GPL-2.0-only
+PKG_LICENSE:=MIT
+PKG_LICENSE_FILES:=LICENSE
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk

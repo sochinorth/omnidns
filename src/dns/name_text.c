@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MIT
 /* Text <-> wire conversion of domain names (the rest of wire.h is wire.c). */
 #include <errno.h>
 #include <string.h>

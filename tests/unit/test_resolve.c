@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: MIT
 /*
  * resolve.c walk tests: scripted upstream stub, real config/match/fakeip/
  * cache and real nftables (inside an unprivileged netns).

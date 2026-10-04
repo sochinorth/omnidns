@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* Minimal unit test harness: one executable per test file.
  *
  *   TEST(name) { CHECK(cond); CHECK_EQ(a, b); ... }

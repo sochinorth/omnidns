@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MIT */
 #ifndef OMNI_S3FIFO_H
 #define OMNI_S3FIFO_H
 

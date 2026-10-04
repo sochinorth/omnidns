@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: MIT */
 #ifndef OMNI_MATCH_H
 #define OMNI_MATCH_H
 

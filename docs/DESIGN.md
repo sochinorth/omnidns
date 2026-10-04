@@ -1,213 +1,444 @@
-# omnidns — implementation plan
+# omnidns design
 
-## Context
+omnidns is a DNS proxy for OpenWrt routers that applies policy **per name and
+per alias**, and can turn a DNS decision into a routing decision. LAN clients
+use it as their resolver. For each query it walks the resolution chain
+(CNAME, DNAME, HTTPS/SVCB AliasMode). At every step it evaluates the current
+name against an ordered ruleset, and it may answer with *fake IPs*: tokens
+that nftables translates back to the real address while applying an fwmark.
 
-omnidns is a new DNS proxy daemon for OpenWrt. It answers LAN clients directly and matches each name against an ordered UCI ruleset. It follows alias chains and checks policy again at each step. For selected names it returns fake "token" IPs. A fake IP encodes routing policy, and nftables DNATs it back to the real IP and applies an fwmark. The project starts empty. We have an aarch64 OpenWrt SDK (kernel 6.12, so the single-register arith limit applies), plus host libmnl 1.0.5 and libnftnl 1.3.2. There is no host libubox, `dig` or dnspython. nftables does work inside `unshare -rn`, so integration tests can run without root.
+This document describes how it works and why. For configuration and usage,
+see [MANUAL.md](MANUAL.md).
 
-### Decisions you made (Q&A)
-- **The latch pins the upstream.** Once fakeip latches, both the fwmark and the upstream are frozen. Later rules can only `block`.
-- **The block response is configurable.** Global `option block_mode nodata|nxdomain|null`, default `nodata` (with a synthetic SOA, neg-TTL `block_ttl`, default 300). The same response is used when a CNAME-cloaked tracker matches mid-chain.
-- **Binding key** = `(rule_id, fwmark, endpoint_name, real_ip)`. endpoint_name is the owner of the terminal A/AAAA RRset, or the effective SVCB TargetName. The upstream is not part of the key, so changing it does not churn fakes.
-- **Aliases chased by the client are a documented limitation.** These are HTTPS AliasMode targets and hintless ServiceMode targets. Their follow-up queries are evaluated on their own name only.
+## Goals and non-goals
 
-### Spec corrections and assumptions (correct me at review)
-1. **The recursion bug in the pseudocode.** `return omni_resolve(rules, answ.cname)` drops the CNAME prefix, so clients reject the answer. It also discards the fakeip latch. Replaced by the walk-state machine below: the prefix RRs are spliced in front of the re-queried answer.
-2. **The re-query condition.** Re-query the target only when the *effective upstream identity* changes. A different verdict with the same upstream keeps walking the same response. Upstream identity is the canonical server list (file content), not the path.
-3. **Typo:** `fake2real_v6`/`fake2mark_v6` keys must be `ipv6_addr`.
-4. **fwmark encoding:** a rule's `fwmark '0x01'` is a small value shifted into `fwmask` (`0x01 << ctz(0xff000000)` = `0x01000000`). It must be non-zero and fit the mask.
-5. **Masked marks everywhere.** Your sketch's `ct mark != 0 meta mark set ct mark` clobbers bits that other software owns (mwan3, fw4 offload, qos). The fix:
-   - each mark chain uses a single bitwise statement, which is legal on 6.12: `meta mark set meta mark and ~M or V; ct mark set ct mark and ~M or V`.
-   - restore becomes `ct mark and M vmap { V1 : jump mark_V1, ... }`, which reuses the mark chains.
-6. **Unmatched fake IPs.** You can't reject inside a nat chain. After DNAT, daddr is the real IP, so a filter chain in forward/output does `ip daddr <pool> reject`. That catches only *unmapped* fakes, and clients fail fast instead of hanging.
-7. **`listen '5353'` collides with mDNS** (umdns/avahi). Clients can't use non-53 ports anyway. So: `option port 53` plus `list listen_addr` (default: LAN addresses), and dnsmasq moves to e.g. `127.0.0.1#5335`. Never bind the WAN, so we don't become an open resolver.
-8. **resolv.conf has no port syntax**, yet dnsmasq needs one to be an upstream. Extension: `nameserver 127.0.0.1#5335`. `%scope` is accepted for link-local IPv6.
-9. **Catchall rules.** A rule with no `nameset` option matches everything. It must be the last rule, or the config is rejected. Any action is allowed, so "fakeip everything except domestic" works. A rule whose nameset globs resolve to no readable files matches nothing (warn). A config with no catchall is rejected.
-10. **DNSSEC.** Upstream queries use EDNS0 (bufsize 1232) with DO=0. Responses that need rewriting get RRSIG/NSEC* stripped. Unmodified responses are forwarded as received (only ID/question case/EDNS rebuilt per client). ECS is never sent.
-11. **AAAA under a fakeip latch when no v6 pool is configured** returns NODATA, and ipv6hint is stripped. Real v6 is never leaked past a policy.
-12. **Pool exhausted** (no slot free past its `safe_until`): SERVFAIL plus a rate-limited syslog warning. Never fall back to the real IP.
-13. **`safe_until` = expiry of the answered TTL + `fakeip_grace` (default 600s).** Established flows survive map deletion anyway, because the NAT is in conntrack. So `safe_until` only has to cover clients that cache past the TTL.
-14. **fwmask changes are rejected while live bindings exist**, same as pool changes.
-15. **PTR queries for fake-pool addresses** are answered locally from the binding (endpoint name), else NXDOMAIN. They are never leaked upstream.
-16. **Other qtypes** (MX, TXT, SRV, …) take the same walk for steering and blocking, with no rewriting. ANY → NOTIMP (RFC 8482-ish minimal). Non-IN class and AXFR/IXFR → REFUSED.
-17. **Upstream files change at runtime** (WAN reconnect). The procd init uses `procd_add_reload_trigger omnidns` plus interface triggers, which send SIGHUP. Unchanged upstream content means no invalidation.
-18. **libuci** is used for config parsing (standard on OpenWrt, sits alongside libubox).
+Goals:
 
----
+- Policy follows the whole alias chain, not just the queried name. A
+  CNAME-cloaked tracker is blocked; a CDN alias behind a VPN-routed name stays
+  VPN-routed.
+- Routing policy is expressed through DNS without per-destination routes.
+  The fake IP itself carries the policy.
+- Live connections never break because of DNS-side events: cache eviction,
+  reloads, re-resolution.
+- Safe to expose to arbitrary LAN clients: every input is bounded, and
+  memory and work are capped.
+- Small and dependency-light: plain C11, libubox, libuci, libmnl, libnftnl.
+
+Non-goals:
+
+- Recursive resolution or DNSSEC validation; omnidns forwards to upstreams.
+- Encrypted DNS transports.
+- Configuring policy routing (`ip rule`, routing tables). omnidns only marks
+  packets.
 
 ## Architecture
 
-Single-threaded `uloop` event loop. Repo layout (CMake, the OpenWrt-native choice for libubox projects):
+A single-threaded `uloop` event loop. All I/O is non-blocking, except
+nftables control-plane transactions at startup and reload, which are short
+synchronous netlink exchanges.
 
 ```
-CMakeLists.txt
-src/
-  main.c         uloop setup, signals, procd-friendly foreground, syslog
-  log.h          ulog wrappers + rate-limited logging
-  util/hmap.[ch] open-addressing hashmap, SipHash-2-4 keyed (generic, arena keys)
-  util/s3fifo.[ch] generic intrusive S3-FIFO (small/main/ghost), watermark batch eviction
-  util/arena.[ch] bump allocator for nameset strings
-  dns/wire.[ch]  parser/builder: bounded, compression-loop-safe, RR iterator, name normalize
-  dns/svcb.[ch]  SVCB/HTTPS rdata parse/rewrite (ipv4hint/ipv6hint), preserve other params
-  config.[ch]    UCI → struct config; nameset file cache (path,dev,ino,mtime,size → parsed)
-  upstream.[ch]  resolv.conf parse, upstream identity hash, UDP/TCP client, retry, coalescing
-  match.[ch]     suffix index: hmap<suffix → {min_exact_ord, min_suffix_ord}>, match_rules()
-  resolve.[ch]   walk state machine (async continuation), answer assembly
-  fakeip.[ch]    pools, allocator, binding DB (key→b, fake→b), renew/evict
-  nft.[ch]       libmnl/libnftnl: table bootstrap, mark chains, element batches, reconcile
-  cache.[ch]     answer cache + dependency validation
-  server.[ch]    UDP + TCP listeners, client limits, response truncation/EDNS
-  ubus.[ch]      (phase 6) status/dump/flush methods
-openwrt/
-  Makefile       package recipe (DEPENDS: +libubox +libuci +libmnl +libnftnl +kmod-nft-nat)
-  files/omnidns.init  procd service
-  files/omnidns.config  default UCI
-tests/
-  unit/*.c       per-module tests (plain asserts, run on host)
-  fuzz/*.c       libFuzzer targets: wire parser, svcb rewrite, resolv.conf, nameset
-  integ/         python3 stdlib-only fake upstream + client, netns runner
+ client ──► server ──► resolve ──► cache (hit) ──────────────────────► reply
+                          │
+                          ├──► match (rule per name)
+                          ├──► upstream (UDP/TCP, coalesced)
+                          └──► fakeip (bindings) ──► nft (async batches)
+                                                       │ ack
+                          reply ◄── cache insert ◄─────┘
 ```
 
-### Core algorithms
+| module | role |
+|---|---|
+| `server` | UDP/TCP listeners, query validation, EDNS, per-client limits |
+| `resolve` | the policy walk and answer assembly |
+| `match` | suffix index: name → first matching rule |
+| `config` | UCI loading, nameset and upstream files, rule fingerprints |
+| `upstream` | async DNS client with failover, TCP fallback, coalescing |
+| `fakeip` | binding table and deterministic allocator |
+| `nft` | nftables table: chains, maps, async element batches |
+| `cache` | cache of final answers, with dependency revalidation |
+| `dns/wire`, `dns/svcb` | bounded DNS message parser/builder, SVCB rewriting |
+| `util/*` | hash map, SipHash, arena, S3-FIFO, clock |
 
-**Matching (match.c).** All rules' patterns go into one hmap keyed by the normalized dotted suffix string. Each value holds `{min_exact_ord, min_suffix_ord}` (uint16, `NONE`=0xffff). To match `a.b.google.com`:
-- at the full name, consider exact and suffix;
-- at each ancestor (`b.google.com`, `google.com`, `com`), consider suffix only;
-- the minimum ordinal wins;
-- if nothing matched, use the catchall ordinal.
+## Configuration model
 
-`*.x` is stored as a suffix entry for `x`, apex-inclusive. Names containing non-LDH/escaped bytes still match by ancestor suffix. Reload rebuilds the index from cached per-file pattern arrays. Unchanged files are not re-read.
+Rules are UCI sections evaluated in file order; **the first match wins**.
+Specificity does not matter, so exceptions are written by placing them
+earlier. A rule's UCI section name is its stable identity. Each rule has one
+action:
 
-**The walk (resolve.c).** State is `{name, upstream, latch (fakeip policy|NULL), prefix_rrs[], deps[], steps}`. The `steps` limit is 12, and a visited-name set detects loops.
-1. `r = match(name)`, then `deps += (name, r.id, r.fingerprint)`.
-2. `block` → stop, using block_mode for the original qname.
-3. If there is no latch:
-   - `forward` → `want = r.upstream`.
-   - `fakeip` → `latch = r` and `want = r.upstream`.
-   If there is a latch, `want = latch.upstream`.
-4. If no response is in hand or `want != upstream`: query `(name, qtype)` at `want` and set `upstream = want`.
-5. Scan the answer from `name`. For a CNAME, DNAME (use the synthesized CNAME, or substitute it ourselves) or HTTPS/SVCB AliasMode (qtype HTTPS/SVCB only), append the alias RRs to the prefix, set `name = target`, and loop to step 1. That re-evaluates the alias against the current response, and step 4 re-queries only when the upstream changes. If the chain dangles with no terminal RRset and no further alias, query the target ourselves.
-6. Terminal RRset:
-   - A/AAAA with a latch → allocate or renew bindings, then rewrite.
-   - SVCB/HTTPS ServiceMode: each RR is its own endpoint. Its effective TargetName (`.` means the owner) is matched:
-     - `block` → drop that RR;
-     - else if a latch exists → rewrite the hints with the latch;
-     - else if `fakeip` → that RR gets its own latch and rewritten hints;
-     - else leave it alone.
-     The target is never resolved. If every RR is dropped, the answer is NODATA.
-7. Assemble the answer from the prefix RRs, the terminal RRs and the original authority/additional when unchanged. Nothing is rewritten, so the reply can be forwarded verbatim.
-8. Bindings are collected during the walk but committed only once the walk finishes and the answer is final, which honours the "defer allocation" note. Commit order: allocate → one nft batch (add elements) → wait for ACK → cache insert → reply. If nft fails, return SERVFAIL.
+- `block`: answer per `block_mode` (NODATA with a synthetic SOA, NXDOMAIN, or
+  `0.0.0.0`/`::`).
+- `forward`: query the rule's upstream for the next step.
+- `fakeip`: like `forward`, and additionally *latch* the rule's fwmark.
 
-**Fake IPs (fakeip.c).**
-- **Allocation:** the first candidate is `base + siphash(secret, key) mod size`, then linear probing. Excluded: the pool's network/broadcast (v4), the subnet-router anycast (v6), 0/::, multicast, and loopback (checked on pool config).
-- **Probe outcomes:** a free slot → take it. A slot with an expired occupant (`safe_until` < now) → reclaim it: queue a nft delete+add for that fake in the same batch. Probing is bounded at 64; past that, use the S3-FIFO eviction pass.
-- **Renewal:** a lookup by key that finds an existing binding (live or expired, not yet evicted) just extends `safe_until`. A real IP that disappears is simply not extended.
-- **Data structures:** two hmaps (key→binding, fake→binding) and a capacity cap `fakeip_max_bindings` (default 65536). S3-FIFO skips non-evictable entries. Batched eviction runs from a high to a low watermark, with nft deletes in bounded batches (`nft_batch_max`, default 1024 elements).
-- **Policy identity:** a fakeip policy is `(rule_id, fwmark)`. The mark-chain refcount is the number of bindings using that mark. A chain is removed only when its refcount hits 0 and no rule references it.
+The last rule has no nameset and matches everything; exactly one such
+catchall must exist.
 
-**nftables (nft.c).** The process owns `table inet omnidns`. At startup, one transaction does delete-table-if-exists + create. Contents:
-- maps `fake2real_v4/v6` (addr:addr) and `fake2mark_v4/v6` (addr:verdict).
-- chains `mark_<V>`.
-- `prerouting_restore` (mangle) and `prerouting_classify` (dstnat: vmap → ct mark set meta mark and M → dnat via map).
-- `output_restore`/`output_classify` (hook output, for router-originated traffic).
-- `reject_unmapped` (filter forward/output).
+**Namesets** are files of patterns: `example.com` matches exactly, and
+`*.example.com` matches the apex and everything below it. Files are cached by
+`(path, dev, inode, mtime, size)`, so a reload re-reads only changed files.
 
-Netlink runs async on a uloop fd with sequence-tracked ACKs. Element adds from concurrent resolutions in one loop iteration are coalesced into one batch. Reload builds the desired mark chains and classify rules, then diffs against our shadow state. Changes go in as bounded transactions; on failure the old config stays and the error goes to syslog. Maps are never flushed on reload.
+**Upstreams** are resolv.conf files. Only numeric `nameserver` lines are used,
+extended with `#port` and IPv6 `%scope`. An upstream's identity is a hash of
+the ordered server list, not of the file path. Two files with the same
+servers are the same upstream, and rewriting a file with identical contents
+changes nothing.
 
-**Cache (cache.c).**
-- **Key** = `(lowercased qname, qtype, qclass)`. The DO bit is irrelevant because upstream queries always use DO=0.
-- **Value:**
-  - the assembled answer, compressed off and pre-parsed into RR offsets so TTLs can be patched;
-  - its insert time and the per-RR original TTLs;
-  - `deps[]` of `(name, rule_id, rule_fingerprint)`. The fingerprint is a hash of action, upstream identity, fwmark and the latch-relevant settings;
-  - the binding refs;
-  - the `cfg_gen` it was validated against.
-- **Hit:** if `entry.cfg_gen != cur_gen`, call `match()` again for each dep name and compare `(rule_id, fingerprint)`. A mismatch drops the entry; a match re-stamps the gen. This catches newly inserted earlier rules, nameset edits and upstream changes cheaply and conservatively. Then decrement the TTLs (floor 0). An entry expires at its minimum TTL.
-- **Negative answers:** cached for the SOA minimum, capped at `neg_ttl_max` (default 3600).
-- **Eviction:** bounded S3-FIFO by entries and bytes (`cache_size`, default 10000), batched with watermarks. Dropping an entry never touches bindings. A served fakeip hit keeps its bindings at or past the remaining TTL + grace, extending them if needed.
+Every rule has a **fingerprint**: a hash of everything that influences
+resolution for a name it matches. That is its id, action and upstream
+identity, plus the mark, pools, grace and TTL cap for `fakeip`, or the block
+mode and TTL for `block`. Fingerprints let cached answers be revalidated
+after a reload without re-resolving them (see [Cache](#answer-cache)).
 
-**Upstream (upstream.c).**
-- Each query uses a fresh random-port UDP socket and a random ID. Responses are checked against the source addr/port, ID and question.
-- Servers are tried in order with a per-try timeout (`upstream_timeout`, default 1500ms) and an overall deadline of 5s.
-- TC=1 → retry once over TCP on the same server.
-- SERVFAIL/REFUSED/timeouts → next server. All failing → SERVFAIL to the client.
-- Identical in-flight `(upstream_id, name, qtype)` queries are coalesced.
+## Name matching
 
-**Server (server.c).**
-- UDP and TCP on each listen addr. The listen sockets are opened before privileges drop.
-- **EDNS:** honour the client's bufsize, clamped to [512, 1232]. A response larger than that is truncated with TC=1. Echo OPT if the client sent one. Return FORMERR for malformed queries and BADVERS for EDNS version > 0.
-- **TCP:** pipelined queries with out-of-order answers (RFC 7766), at most 64 connections and 16 in-flight per connection, a 10s idle timeout and a 64KiB read cap.
-- **Global limits:** at most 1024 pending client queries and 64 per client IP; past those, REFUSED/drop. The question section is echoed byte-exact so 0x20 clients keep their case.
+All patterns from all rules go into a single hash map keyed by the dotted
+name. Each node stores two rule ordinals: the first rule with an exact
+pattern for this name, and the first rule with a suffix pattern. To match
+`a.b.example.com`, the lookup checks:
 
-### Config (UCI)
+| node | considered |
+|---|---|
+| `a.b.example.com` | exact and suffix |
+| `b.example.com`, `example.com`, `com` | suffix only |
 
-```uci
-config omnidns 'main'
-	option port '53'
-	list listen_addr '192.168.1.1'
-	option fwmask '0xff000000'
-	option fakeip_v4 '198.18.0.0/15'
-	option fakeip_v6 '64:ff9b:1::/48'      # optional
-	option fakeip_grace '600'
-	option fakeip_max_bindings '65536'
-	option cache_size '10000'
-	option block_mode 'nodata'              # nodata|nxdomain|null
-	option block_ttl '300'
-	option upstream_timeout '1500'
+The lowest ordinal wins; if nothing matches, the catchall applies. A lookup
+costs one hash probe per label and never allocates. 100k patterns build in
+about 7 ms and use about 6.5 MB, and lookups run at about 8M/s on a desktop
+CPU.
 
-config rule 'adblock'            # section name = stable rule id
-	option action 'block'
-	list nameset '/tmp/omnidns.d/adlist/*'
-...
-config rule 'catchall'           # no nameset → must be last
-	option action 'forward'
-	option upstream '/etc/omnidns.d/dns_1111.conf'
+## Resolution: the walk
+
+Resolution is a state machine over the alias chain. Its state:
+
+- `name`: the name currently being evaluated (starts as the qname)
+- `upstream`: the upstream whose response is in hand
+- `latch`: the fakeip rule in force, if any (rule id, mark, upstream)
+- `prefix`: alias records collected so far, in order
+- `deps`: every (name, rule fingerprint) that influenced the result
+
+Each step:
+
+1. Match `name` and record the dependency.
+2. If the rule is `block`, stop and answer the block response *for the
+   original qname*. This applies mid-chain too, which is what defeats CNAME
+   cloaking.
+3. Pick the wanted upstream. A latch, once set, pins the upstream for the rest
+   of the walk. Otherwise a `fakeip` rule sets the latch, and a `fakeip` or
+   `forward` rule selects its own upstream.
+4. Re-query only if the wanted upstream's **identity** differs from the one
+   that produced the response in hand. A changed verdict with the same
+   upstream keeps reading the same response.
+5. Scan the response for the next alias owned by `name`:
+   - a DNAME covering `name` (its synthesized CNAME is used, or synthesized
+     here if the upstream left it out),
+   - a CNAME,
+   - for HTTPS/SVCB queries, an AliasMode record with a non-root target.
+
+   The alias records join the prefix and the walk continues with the target.
+6. Otherwise the walk ends at `name`:
+   - data of the requested type → terminal processing;
+   - NXDOMAIN or NODATA → negative answer: the prefix plus the upstream's SOA;
+   - neither (the upstream did not follow the chain) → query `name`
+     directly.
+
+A walk is limited to 12 alias steps, and revisiting a name fails as a loop
+(both SERVFAIL).
+
+### Why the latch pins the upstream
+
+Once a name is decided to go through, say, a VPN, its CDN aliases must
+resolve through the same upstream. A domestic upstream would return
+geo-local addresses that are then tunnelled abroad. Downstream rules can
+still `block`, but they cannot change the routing decision.
+
+### Terminal processing
+
+- **A/AAAA under a latch**: every address gets a binding and is rewritten to
+  its fake. If the latch has no pool for the address family, the answer is
+  NODATA: a real address never escapes a fakeip policy.
+- **HTTPS/SVCB ServiceMode**: each record is an independent endpoint. Its
+  effective target (the TargetName, or the owner name for `.`) is matched on
+  its own:
+  - `block` drops just that record;
+  - an active latch, or a target that matches a `fakeip` rule, gets
+    `ipv4hint`/`ipv6hint` rewritten under that policy. So sibling endpoints
+    may carry different policies.
+
+  All other parameters (alpn, ech, …) are preserved byte for byte. A dropped
+  hint is also removed from `mandatory`. Targets are never resolved
+  proactively. If every record is dropped, the answer is NODATA.
+- **Other types** pass through unchanged after the walk.
+
+### Answer assembly
+
+The answer section is the prefix followed by the terminal records.
+
+When anything was rewritten:
+- RRSIG, NSEC and NSEC3 records are removed;
+- AD is cleared;
+- additional-section addresses are dropped.
+
+Separately, an additional A/AAAA/SVCB record is kept only if its owner's
+rule is a plain `forward`. This stops glue (e.g. SRV/MX targets) from
+leaking real addresses of fakeip or blocked names.
+
+When a single upstream response needed no change at all, it is passed
+through as received (minus OPT).
+
+### Deferred binding
+
+Bindings are created only after the final answer is fully determined, then
+committed to nftables. The reply is sent only after the kernel has
+acknowledged the batch carrying those bindings: a client must never receive a
+fake IP before the dataplane can translate it. If the batch fails, the
+client gets SERVFAIL.
+
+## Fake IPs
+
+### Bindings
+
+A binding maps a fake address to a real one under a policy:
+
+```
+key:   (rule id, mark, endpoint name, family, real IP)
+value: fake IP, safe_until, nft ticket, refcount
 ```
 
-On SIGHUP, the full new config is built off to the side (nameset file cache, index, upstreams). It is validated: pool and fwmask changes are rejected if live bindings would be stranded. The nft changes are applied, and only then is the new config swapped in atomically with `cfg_gen++`. If any step fails, the old config stays and the error goes to syslog.
+The *endpoint name* is the owner of the terminal A/AAAA record set, or the
+effective SVCB target. Two names that alias to the same CDN host share fakes.
+The upstream is not part of the key, so changing a rule's upstream does not
+churn fakes.
 
----
+### Allocation
 
-## Execution plan (root agent + implementation subagents)
+```
+candidate₀ = pool_first + SipHash(secret, key) mod pool_usable
+candidateᵢ = next usable address (linear probing)
+```
 
-I'm the integration agent. Before fanning out I write the headers myself: types, function signatures and invariants for every module. Subagents then work against frozen interfaces, each with its own unit tests. Every phase ends with me building, running all tests and reviewing.
+- **Excluded addresses**: the IPv4 network and broadcast addresses, and the
+  IPv6 all-zero host. Pools may not overlap 0/8, loopback, multicast, `::`,
+  `::1`, v4-mapped space or `ff00::/8`.
+- **Determinism**: allocation is deterministic within a process lifetime. A
+  binding that was evicted and comes back usually gets the same fake again.
+- **Probing**: up to 64 candidates are tried.
+  - A free slot is taken.
+  - A slot whose binding is expired and unreferenced is reclaimed.
+  - A live slot is skipped.
+- **Exhaustion**: if the probe fails, expired cache entries are swept and
+  allocation is retried once. If that also fails, the result is SERVFAIL;
+  omnidns never falls back to the real address.
 
-**Phase 0 — scaffold (me).**
-- `git init`, CMake, and a host build of libubox + libuci. Both are fetched from git.openwrt.org into `third_party/` (gitignored) and installed to `build/host-prefix`; libmnl/libnftnl come from the system.
-- All `src/**/*.h` interfaces, `log.h`, a test runner target, and sanitizer flags (`-fsanitize=address,undefined`) for the host build.
+### Lifetime
 
-**Phase 1 — leaf modules (4 parallel subagents, git worktrees):**
-- A: `util/hmap`, `util/arena`, `util/s3fifo`, with tests (including eviction with skip-pinned).
-- B: `dns/wire` + `dns/svcb`, with tests and fuzz targets (compression loops, truncated RRs, oversize names, SVCB param ordering).
-- C: `config` (UCI + nameset globbing/caching + resolv.conf w/ `#port`) and `match`, with tests including the 100k-pattern ordinal-semantics test.
-- D: `nft`, covering bootstrap, mark chains, element batching and reconcile. Tested in `unshare -rn` by asserting `nft -j list table inet omnidns`.
+```
+safe_until = now + min(TTL, fakeip_ttl_max) + fakeip_grace
+```
 
-**Phase 2 — `fakeip` + `upstream` (2 parallel subagents).**
-- fakeip: allocator determinism, exclusions, reclaim of expired occupants, renewal, exhaustion, and pool/mask-change rejection.
-- upstream: tested against a python stdlib fake server for retries, TC→TCP, coalescing, spoofed-response rejection and timeouts.
+- **Expiry**: a binding becomes evictable only when `safe_until` has passed
+  *and* no cached answer references it. The fake records sent to clients
+  carry the same capped TTL, so a client that respects TTLs never holds a
+  fake past `safe_until`. The grace period covers clients that don't.
+- **Established flows**: they don't depend on bindings at all. DNAT and the
+  mark are recorded in conntrack on the first packet, so removing a map
+  element only affects *new* connections.
+- **Eviction**: an S3-FIFO bounded by `fakeip_max_bindings`. It runs lazily,
+  only under pressure, and only evicts evictable bindings.
+- **Persistence**: bindings live in RAM only. On startup omnidns recreates its
+  nftables table from scratch.
 
-**Phase 3 — `resolve` + `cache` + `server` + `main` (1 subagent for resolve/cache, me for server/main/integration).** The walk is the core semantic piece. It gets a table-driven test suite with a scripted upstream, one case per rule in the "walk" section:
-- latch + downstream forward with a pinned upstream;
-- block mid-chain;
-- DNAME;
-- an AliasMode chase;
-- ServiceMode siblings with different latches;
-- a dangling CNAME;
-- loop/step limits;
-- AAAA without a v6 pool.
+### Abuse limits
 
-**Phase 4 — integration (me + 1 test subagent).** `tests/integ/run.sh` sets up a netns (`unshare -rn`, veth pairs between "lan" and "wan" namespaces). It runs omnidns plus python fake upstreams (one per upstream identity) and drives queries with a stdlib python DNS client. It checks:
-- answers, rewritten hints and TTL countdown;
-- nft maps/chains after each step;
-- a real TCP connect to a fake IP that gets DNATed to a listener on "wan" with the expected fwmark (`nft` counter / `meta mark` log rule);
-- a SIGHUP reload that keeps bindings, a rejected pool change and cache invalidation on rule reorder;
-- fuzz/garbage flooding, which must stay within its memory limits.
+- TTLs of 2³¹ or more are treated as 0 (RFC 2181 §8).
+- One answer yields at most 32 fakes; extra addresses are omitted.
+- The TTL cap bounds how long any single answer can pin pool space.
 
-**Phase 5 — OpenWrt packaging (subagent).** Covers the `openwrt/Makefile`, procd init (respawn, reload triggers, interface trigger), default UCI and a README section on moving dnsmasq to :5335. Then a cross-build in the SDK: add the `base`/`packages` feeds, `make package/omnidns/compile`, and confirm the aarch64 ipk links.
+## Dataplane (nftables)
 
-**Phase 6 — polish (optional).** A ubus `status`/`dump_bindings`/`flush_cache`, a `/code-review high` pass, and docs for the known limitations (client-chased aliases, no DNSSEC passthrough when rewriting, flow offload bypasses marks).
+omnidns owns `table inet omnidns`:
 
-## Verification
-- `cmake -B build -DHOST=1 && cmake --build build && ctest --test-dir build`: all unit tests pass under ASan/UBSan.
-- Each fuzz target runs 5 min each with no crashes (`clang -fsanitize=fuzzer`).
-- `tests/integ/run.sh` passes end-to-end in an unprivileged netns, including real DNATed TCP flows carrying the correct mark.
-- The SDK cross-build produces `omnidns_*.ipk` for aarch64_cortex-a53, and `file`/`readelf` confirm it links against libubox/libuci/libmnl/libnftnl.
+```
+map fake2real_v4 { type ipv4_addr : ipv4_addr }      # and _v6
+map fake2mark_v4 { type ipv4_addr : verdict }        # and _v6
+
+chain mark_<V> {                                     # one per mark value V
+    meta mark set meta mark & ~M | V
+    ct mark   set ct mark   & ~M | V
+}
+chain restore_marks { ct mark & M vmap { V : jump mark_V, ... } }
+
+prerouting_mangle  (filter, prerouting, mangle):  jump restore_marks
+output_mangle      (route,  output,     mangle):  jump restore_marks
+prerouting_dstnat  (nat,    prerouting, dstnat):
+    ip daddr <pool> ip daddr vmap @fake2mark_v4
+    ip daddr <pool> dnat ip to ip daddr map @fake2real_v4
+output_dstnat      (nat,    output,     dstnat):  same
+forward_reject     (filter, forward,    filter-1):  ip daddr <pool> reject
+output_reject      (filter, output,     filter-1):  same
+```
+
+- **Mark encoding**: `M` is `fwmask`, and a rule's `fwmark` value is shifted
+  into it (`0x01` with mask `0xff000000` is `0x01000000`). Only the bits in
+  `M` are ever touched, so marks owned by mwan3, QoS or offloading survive.
+- **Why per-mark chains**: up to kernel 6.13, nftables cannot compute
+  `mark = (mark & ~M) | map_lookup(daddr)`, because bitwise operations take
+  immediates, not a second register. So the fake→mark map yields a *verdict*
+  that jumps to a per-mark chain, where each statement is a single
+  load–bitwise–store with immediates. The same chains restore marks from
+  conntrack.
+- **Unmapped fakes**: a mapped fake is rewritten by DNAT before routing. A
+  packet that still has a pool address in the forward or output path is
+  therefore unmapped, and it is rejected so the client fails fast instead of
+  timing out.
+
+### Control plane and data plane
+
+- **Startup**: one transaction deletes and recreates the table.
+- **Reload**: one transaction reconciles chains and rules against the
+  desired state. It never flushes maps. Mark chains are kept across reloads
+  until the fwmask changes, because walks in flight may still bind with a
+  mark the new config no longer uses.
+- **Element updates** go through a separate netlink socket.
+  - **Batching**: they are coalesced into batches, submitted at the end of
+    the loop iteration or at 1024 operations. Each batch has a monotonically
+    increasing *ticket*, and callers wait on tickets.
+  - **Idempotency**: every add first destroys the key, and every delete is a
+    destroy (`NFT_MSG_DESTROYSETELEM`, kernel ≥ 6.3). The kernel rolls back a
+    failed batch as a whole, so kernel and binding table may briefly
+    disagree, but such drift can never make a later batch fail.
+  - **Ordering**: within a batch, destroys are sent before adds. A second
+    operation on a key that already has a pending add starts a new batch.
+  - **Failure**: if a batch fails, the bindings it carried are dropped and
+    their waiters get SERVFAIL.
+
+## Answer cache
+
+- **Key**: lowercased qname, qtype, qclass. Upstream queries always use DO=0,
+  so the DO bit is not part of the key.
+- **Value**:
+  - a compact copy of the final message;
+  - insert time and lifetime;
+  - the walk's dependencies;
+  - references to the bindings in the answer;
+  - the configuration generation it was last validated against.
+- **Lifetime**:
+  - positive answers: the minimum answer TTL;
+  - negative answers: min(SOA TTL, SOA MINIMUM, `neg_ttl_max`);
+  - block answers: `block_ttl`;
+  - SERVFAIL and other errors: not cached.
+- **Hits**: served with every TTL reduced by the entry's age.
+- **Revalidation**: if the entry's generation differs from the current
+  config's, every dependency name is matched again, and each rule
+  fingerprint must equal the recorded one; otherwise the entry is dropped.
+  This catches inserted or reordered rules, nameset edits and upstream
+  changes. A reload doesn't flush the cache, and an entry is never served
+  under the wrong policy.
+- **Binding references** pin bindings while an answer can still be served. A
+  30 s sweep drops expired entries so their bindings become reclaimable.
+  Dropping a cache entry never deletes a binding.
+- **Eviction**: an S3-FIFO bounded by entry count and bytes, run in batches
+  down to 7/8 of the limit.
+
+## Upstream client
+
+- **Transport**: every attempt uses a fresh connected UDP socket with a
+  kernel-random source port and a random ID. A response is accepted only if
+  its source, ID, QR/opcode and question all match. Queries carry EDNS0
+  (1232 bytes), DO=0 and no client subnet.
+- **Failover**: servers are tried in order. SERVFAIL, REFUSED, NOTIMP,
+  FORMERR, an unparsable response, a socket error or a per-try timeout moves
+  on to the next server; an overall deadline bounds the whole query. TC=1
+  over UDP retries the same server over TCP. A truncated TCP response counts
+  as a failure and is never delivered or cached.
+- **Coalescing**: concurrent identical queries `(upstream identity, name,
+  type)` share one exchange, capped at 1024 exchanges in flight.
+
+## Client-facing server
+
+- **Transports**: UDP and TCP on every `listen_addr`. Binding specific
+  addresses keeps omnidns off the WAN.
+- **Validation**:
+  - QR=0, opcode QUERY, one question, class IN, and EDNS version 0;
+    otherwise FORMERR, NOTIMP, REFUSED or BADVERS;
+  - ANY gets NOTIMP;
+  - AXFR/IXFR get REFUSED.
+- **Responses** echo the client's id, RD/CD bits and question bytes, so
+  0x20-randomized case survives. They carry an OPT record only if the query
+  did.
+- **Size limits**: UDP answers are limited to 512 bytes without EDNS, or
+  min(client size, 1232) with it. A larger answer is truncated with TC=1.
+- **PTR**: lookups for fake-pool addresses are answered locally from the
+  binding table and never sent upstream.
+- **TCP**: pipelining with out-of-order replies (RFC 7766), up to 16 queries
+  in flight per connection and a 10 s idle timeout. Reading stops above
+  256 KiB of queued output, and the connection is dropped above 1 MiB.
+- **Limits**:
+  - `max_pending` queries in flight in total;
+  - `max_pending_per_client` per client, where IPv6 clients are accounted
+    per /64;
+  - `max_clients_tcp` TCP connections.
+
+  Over the limits, UDP queries are dropped and TCP queries get REFUSED.
+- **Pending replies across a reload**: a UDP listener closed by a reload
+  keeps its socket open until its last pending reply is sent. A reused file
+  descriptor can never receive another client's answer.
+
+## Reload
+
+`SIGHUP` builds a complete new configuration on the side. Only if every
+step succeeds does it replace the old one:
+
+1. Load and validate the UCI file. Nameset and upstream files are re-read
+   only if changed.
+2. If `fwmask` changed:
+   - flush the cache, since every cached fake embeds old marks;
+   - evict expired bindings;
+   - reject the reload if any binding is still live.
+3. Apply new pool and capacity settings to the binding table. Reject the
+   reload if a live binding would fall outside a new pool.
+4. Drain pending nftables deletes, then reconcile chains and rules in one
+   transaction.
+5. Swap in the new configuration with a new generation number, and re-bind
+   the listeners if they changed.
+
+On any failure, the previous configuration stays in effect and the reason
+goes to syslog. Live bindings and their map elements are never touched by a
+reload. The procd service sends SIGHUP on config changes and whenever an
+interface comes up, since WAN reconnects rewrite `resolv.conf.auto`.
+
+## Limitations
+
+- **Aliases chased by clients**: some aliases are followed by the client
+  rather than by omnidns. HTTPS AliasMode targets and hintless ServiceMode
+  targets come back as separate queries, and those are evaluated on their own
+  names, so the original name's policy does not carry over.
+- **DNSSEC**: rewritten answers cannot be validated by clients, so DNSSEC
+  records are stripped from them.
+- **Shared pool**: pool capacity is shared by all clients. A client that
+  controls an authoritative zone can, through a `fakeip` rule, fill the pool
+  for up to `fakeip_ttl_max` + `fakeip_grace`.
+- **Flow offloading**: offloaded flows bypass nftables, so they are not
+  marked.
+
+## Testing
+
+- **Unit tests**: each module has unit tests under ASan/UBSan, including
+  randomized model tests for the hash map, S3-FIFO and the binding table. The
+  nftables tests run in an unprivileged user+net namespace against the real
+  kernel, including a real DNATed connection with the expected marks.
+- **Resolver tests**: the walk has a table-driven suite with a scripted
+  upstream and real nftables underneath.
+- **End-to-end**: `tests/integ/test_integ.py` builds a router namespace and a
+  client namespace connected by veth, runs omnidns with Python fake
+  upstreams, and checks:
+  - answers, caching and TTLs;
+  - real IPv4/IPv6 connections through fake IPs, including the marks they
+    carry;
+  - router-originated traffic;
+  - reload semantics;
+  - a garbage-packet flood.
+- **Fuzzing**: the DNS parser/builder and the SVCB rewriter have libFuzzer
+  targets.
