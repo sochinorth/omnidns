@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
-#include <libgen.h>
 #include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -1198,23 +1197,24 @@ static int load_sections(struct loader *L, struct uci_package *pkg)
 	return 0;
 }
 
+/*
+ * Load by absolute path: libuci then reads the committed file only and
+ * ignores uncommitted deltas in /tmp/.uci (which a confdir load would apply).
+ */
 static int load_uci(struct loader *L, const char *path)
 {
-	char *d = strdup(path), *b = strdup(path), *msg = NULL;
+	char *abs = realpath(path, NULL), *msg = NULL;
 	struct uci_package *pkg = NULL;
 	int ret;
 
-	if (!d || !b) {
-		ret = fail(L, "out of memory");
-		goto out;
-	}
+	if (!abs)
+		return fail(L, "cannot load '%s': %s", path, strerror(errno));
 	L->uci = uci_alloc_context();
 	if (!L->uci) {
 		ret = fail(L, "out of memory");
 		goto out;
 	}
-	if (uci_set_confdir(L->uci, dirname(d)) ||
-	    uci_load(L->uci, basename(b), &pkg) || !pkg) {
+	if (uci_load(L->uci, abs, &pkg) || !pkg) {
 		uci_get_errorstr(L->uci, &msg, NULL);
 		ret = fail(L, "cannot load '%s': %s", path, msg ? msg : "uci error");
 		free(msg);
@@ -1222,8 +1222,7 @@ static int load_uci(struct loader *L, const char *path)
 	}
 	ret = load_sections(L, pkg);
 out:
-	free(d);
-	free(b);
+	free(abs);
 	return ret;
 }
 
