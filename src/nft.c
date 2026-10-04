@@ -23,6 +23,8 @@
 
 #include "log.h"
 #include "nft.h"
+#include "util/hash.h"
+#include "util/hmap.h"
 
 #define NFT_TABLE_MAX	64
 #define CHUNK_MAX	256		/* elements per NEWSETELEM/DELSETELEM msg */
@@ -62,10 +64,17 @@ struct echunk {
 struct ebatch {
 	struct list_head list;
 	uint64_t ticket;
-	struct list_head chunks[S_NUM];
+	/* [set * 2 + 0] destroys, [set * 2 + 1] adds; destroys are sent first */
+	struct list_head chunks[S_NUM * 2];
+	struct hmap added;		/* struct ekey: keys with a pending add */
 	uint32_t nops, nmsgs;
 	uint32_t seq_first, seq_last, acks_left;
 	int err;
+};
+
+struct ekey {
+	uint8_t family;
+	uint8_t addr[16];
 };
 
 struct shadow {
@@ -798,14 +807,20 @@ static struct ebatch *batch_new(struct nft_ctx *n)
 	struct ebatch *b = oom(calloc(1, sizeof(*b)));
 
 	b->ticket = n->next_ticket++;
-	for (int i = 0; i < S_NUM; i++)
+	for (int i = 0; i < S_NUM * 2; i++)
 		INIT_LIST_HEAD(&b->chunks[i]);
 	return b;
 }
 
 static void batch_free(struct ebatch *b)
 {
-	for (int i = 0; i < S_NUM; i++) {
+	uint32_t it = 0;
+	void *k;
+
+	while ((k = hmap_next(&b->added, &it)))
+		free(k);
+	hmap_free(&b->added);
+	for (int i = 0; i < S_NUM * 2; i++) {
 		struct echunk *c, *tmp;
 
 		list_for_each_entry_safe(c, tmp, &b->chunks[i], list) {
@@ -876,11 +891,13 @@ static void kick_cb(struct uloop_timeout *tmo)
 static void batch_build(struct nft_ctx *n, struct ebatch *b, struct txn *t)
 {
 	txn_begin(n, t);
-	for (int i = 0; i < S_NUM; i++) {
-		struct echunk *c;
+	for (int phase = 0; phase < 2; phase++) {
+		for (int i = 0; i < S_NUM; i++) {
+			struct echunk *c;
 
-		list_for_each_entry(c, &b->chunks[i], list)
-			txn_elems(n, t, c->type, c->s, c->n);
+			list_for_each_entry(c, &b->chunks[i * 2 + phase], list)
+				txn_elems(n, t, c->type, c->s, c->n);
+		}
 	}
 	txn_end(n, t);
 }
@@ -914,7 +931,7 @@ static void submit_cb(struct uloop_timeout *tmo)
 static void append_elem(struct nft_ctx *n, int set, int type, struct nftnl_set_elem *e)
 {
 	struct ebatch *b = n->open;
-	struct list_head *head = &b->chunks[set];
+	struct list_head *head = &b->chunks[set * 2 + (type == NFT_MSG_NEWSETELEM)];
 	struct echunk *c = NULL;
 
 	if (!list_empty(head))
@@ -940,11 +957,17 @@ static struct nftnl_set_elem *elem_key(const uint8_t *key, uint32_t len)
 	return e;
 }
 
-static void queue_del(struct nft_ctx *n, int real, int mark, const uint8_t *fake,
-		      uint32_t alen)
+/*
+ * DESTROYSETELEM (kernel >= 6.3) is a delete that ignores missing keys.
+ * Every element op goes through it, so element ops are idempotent and a
+ * kernel state that drifted from the binding DB (e.g. after a failed,
+ * rolled-back batch) can never make later batches fail.
+ */
+static void queue_destroy(struct nft_ctx *n, int real, int mark, const uint8_t *fake,
+			  uint32_t alen)
 {
-	append_elem(n, real, NFT_MSG_DELSETELEM, elem_key(fake, alen));
-	append_elem(n, mark, NFT_MSG_DELSETELEM, elem_key(fake, alen));
+	append_elem(n, real, NFT_MSG_DESTROYSETELEM, elem_key(fake, alen));
+	append_elem(n, mark, NFT_MSG_DESTROYSETELEM, elem_key(fake, alen));
 }
 
 static uint64_t op_done(struct nft_ctx *n)
@@ -960,6 +983,52 @@ static uint64_t op_done(struct nft_ctx *n)
 	return ticket;
 }
 
+static bool ekey_eq(const void *val, const void *key, void *ctx)
+{
+	return !memcmp(val, key, sizeof(struct ekey));
+}
+
+static void ekey_make(struct ekey *k, int family, const uint8_t *fake)
+{
+	memset(k, 0, sizeof(*k));
+	k->family = family == AF_INET6 ? 6 : 4;
+	memcpy(k->addr, fake, family == AF_INET6 ? 16 : 4);
+}
+
+/*
+ * Destroys are emitted before adds within a batch, which is only correct
+ * while each key has at most one add and nothing after it. A second op on
+ * a key with a pending add therefore starts a new batch.
+ */
+static void op_order_key(struct nft_ctx *n, int family, const uint8_t *fake, bool add)
+{
+	struct ekey k, *nk;
+	uint64_t h;
+
+	ekey_make(&k, family, fake);
+	h = omni_hash(&k, sizeof(k));
+	if (n->open && hmap_get(&n->open->added, h, &k, ekey_eq, NULL))
+		nft_flush(n);
+	if (!add)
+		return;
+	if (!n->open)
+		n->open = batch_new(n);
+	nk = oom(malloc(sizeof(*nk)));
+	*nk = k;
+	if (hmap_put(&n->open->added, h, nk))
+		oom(NULL);
+}
+
+/* accepts 4/6 as well as AF_INET/AF_INET6 */
+static int norm_family(int family)
+{
+	if (family == 4)
+		return AF_INET;
+	if (family == 6)
+		return AF_INET6;
+	return family;
+}
+
 static bool op_begin(struct nft_ctx *n, int family)
 {
 	if (family != AF_INET && family != AF_INET6) {
@@ -972,25 +1041,28 @@ static bool op_begin(struct nft_ctx *n, int family)
 }
 
 /*
- * Adds use NLM_F_CREATE without EXCL: re-adding an identical element is a
- * no-op, but a key already mapped to different data fails (EEXIST). Hence
- * `replace`, which deletes the key from both maps first. A delete of a
- * missing key fails with ENOENT and aborts the whole batch, so callers
- * must only pass replace=true when the element is known to exist.
+ * An add always destroys the key first (so a key mapped to different data
+ * never fails with EEXIST); `replace` is therefore implied and kept only
+ * for API compatibility.
  */
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
 		      const uint8_t *real, uint32_t mark, bool replace)
 {
-	bool v6 = family == AF_INET6;
-	int rs = v6 ? S_REAL6 : S_REAL4, ms = v6 ? S_MARK6 : S_MARK4;
-	uint32_t alen = v6 ? 16 : 4;
+	bool v6;
+	int rs, ms;
+	uint32_t alen;
 	struct nftnl_set_elem *e;
 	char chain[32];
 
+	family = norm_family(family);
 	if (!op_begin(n, family))
 		return 0;
-	if (replace)
-		queue_del(n, rs, ms, fake, alen);
+	op_order_key(n, family, fake, true);
+	v6 = family == AF_INET6;
+	rs = v6 ? S_REAL6 : S_REAL4;
+	ms = v6 ? S_MARK6 : S_MARK4;
+	alen = v6 ? 16 : 4;
+	queue_destroy(n, rs, ms, fake, alen);
 
 	e = elem_key(fake, alen);
 	nftnl_set_elem_set(e, NFTNL_SET_ELEM_DATA, real, alen);
@@ -1006,11 +1078,16 @@ uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
 
 uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 {
-	bool v6 = family == AF_INET6;
+	bool v6;
 
+	family = norm_family(family);
 	if (!op_begin(n, family))
 		return 0;
-	queue_del(n, v6 ? S_REAL6 : S_REAL4, v6 ? S_MARK6 : S_MARK4, fake,
+	op_order_key(n, family, fake, false);
+	if (!n->open)
+		n->open = batch_new(n);
+	v6 = family == AF_INET6;
+	queue_destroy(n, v6 ? S_REAL6 : S_REAL4, v6 ? S_MARK6 : S_MARK4, fake,
 		  v6 ? 16 : 4);
 	return op_done(n);
 }

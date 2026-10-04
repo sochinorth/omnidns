@@ -349,11 +349,38 @@ TEST(async_add_del)
 	CHECK(lacks(o, "fc00::1 :"));
 	free(o);
 
-	/* add without replace to a different value fails */
-	t3 = nft_elem_add(n, AF_INET, f1, r1, 0x01000000, false);
+	/* adds are idempotent: remapping an existing key always succeeds,
+	 * also with the 4/6 family shorthand used by the fakeip DB */
+	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000, false);
 	wait_on(&a, t3);
 	run_loop();
-	CHECK(a.err != 0);
+	CHECK_EQ(a.err, 0);
+	o = list_table();
+	CHECK(has(o, "198.18.0.1 : 10.1.1.1"));
+	free(o);
+
+	/* same key twice in one loop iteration: the second op must win */
+	nft_elem_add(n, 4, f1, r2, 0x02000000, false);
+	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000, false);
+	wait_on(&a, t3);
+	run_loop();
+	CHECK_EQ(a.err, 0);
+	o = list_table();
+	CHECK(has(o, "198.18.0.1 : 10.1.1.1"));
+	CHECK(has(o, "198.18.0.1 : jump mark_01000000"));
+	free(o);
+	/* add then delete in one iteration: element must be gone */
+	nft_elem_add(n, 4, f1, r2, 0x02000000, false);
+	t3 = nft_elem_del(n, 4, f1);
+	wait_on(&a, t3);
+	run_loop();
+	CHECK_EQ(a.err, 0);
+	o = list_table();
+	CHECK(lacks(o, "198.18.0.1 :"));
+	free(o);
+	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000, false);
+	wait_on(&a, t3);
+	run_loop();
 
 	/* cancel: never fires */
 	t3 = nft_elem_del(n, AF_INET, f2);
@@ -365,7 +392,7 @@ TEST(async_add_del)
 	CHECK_EQ(a.fired, 0);
 	CHECK(nft_ticket_done(n, t3));
 	CHECK_EQ(count_elems("fake2real_v4"), 1);
-	CHECK_EQ(nfails, 1);
+	CHECK_EQ(nfails, 0);
 }
 
 TEST(async_failure)
@@ -397,12 +424,13 @@ TEST(async_failure)
 	run_loop();
 	CHECK_EQ(a.err, failed_err);
 
-	/* replace of a non-existent element fails (ENOENT) */
+	/* replace or delete of a non-existent element is a no-op (DESTROY) */
 	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000, true);
+	nft_elem_del(n, 6, (const uint8_t *)"\xfc\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x77");
 	wait_on(&b, t2);
 	run_loop();
-	CHECK_EQ(b.err, -ENOENT);
-	CHECK_EQ(nfails, 2);
+	CHECK_EQ(b.err, 0);
+	CHECK_EQ(nfails, 1);
 
 	/* the next batch is unaffected */
 	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000, false);
