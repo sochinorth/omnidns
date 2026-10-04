@@ -3,3 +3,4 @@ third_party/
 openwrt-sdk/
 .sdk.upper/
 .sdk.work/
+.claude/
