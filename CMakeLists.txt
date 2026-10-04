@@ -43,7 +43,9 @@ if(HOST_TESTS)
 		add_executable(${name} ${t})
 		target_link_libraries(${name} omnicore)
 		add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tests/unit)
-		set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+		# the SDK ctest wrapper preloads runas.so, which breaks ASan
+		set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77
+			ENVIRONMENT "LD_PRELOAD=")
 	endforeach()
 	# Tests needing an unprivileged netns (nftables) are wrapped by the test
 	# itself re-exec'ing under `unshare -rn` (see tests/unit/test.h).
