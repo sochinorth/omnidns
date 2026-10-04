@@ -360,7 +360,7 @@ def https_hints(env):
     p = r["an"][0]["data"]["params"]
     check(all(in_pool(h) for h in p["ipv4hint"]), "ipv4hint not rewritten: %r" % p)
     check("ipv6hint" not in p, "ipv6hint must be dropped without a v6 pool: %r" % p)
-    check(p["alpn"] == ["h2"] and p["ech"] == "0000", "other params not preserved: %r" % p)
+    check(p["alpn"] == ["h2"] and p["ech"] == "000000", "other params not preserved: %r" % p)
     check(env.connect(p["ipv4hint"][0]) == "hello from " + REAL_A, "connect via hint")
 
 
