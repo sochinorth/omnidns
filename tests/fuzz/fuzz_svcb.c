@@ -57,10 +57,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	/* no callback and no drop: byte-exact copy */
 	ASSERT(svcb_rewrite_hints(data, len, NULL, NULL, false, out2, sizeof(out2), &olen2) == 0);
 	ASSERT(olen2 == len && !memcmp(out2, data, len));
-	/* exact-size output works; one byte less fails */
-	ASSERT(svcb_rewrite_hints(data, len, map_fn, NULL, drop_v6, out2, olen, &olen2) == 0);
+	/* an input-sized buffer always suffices; too small never overflows */
+	ASSERT(svcb_rewrite_hints(data, len, map_fn, NULL, drop_v6, out2, len, &olen2) == 0);
 	ASSERT(olen2 == olen && !memcmp(out, out2, olen));
-	ASSERT(svcb_rewrite_hints(data, len, map_fn, NULL, drop_v6, out2,
-				  olen - 1, &olen2) == -ENOSPC);
+	r = svcb_rewrite_hints(data, len, map_fn, NULL, drop_v6, out2, olen - 1, &olen2);
+	ASSERT(r == -ENOSPC);
 	return 0;
 }

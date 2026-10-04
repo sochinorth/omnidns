@@ -52,6 +52,9 @@ typedef int (*svcb_addr_fn)(void *ctx, int family, const uint8_t *in, uint8_t *o
  * whole param is removed. `drop_v6` removes ipv6hint unconditionally
  * (without calling fn).
  * Writes the new rdata to out (cap bytes) and its length to *outlen.
+ * The output is never longer than the input, and cap >= len always
+ * suffices (a smaller cap may fail with -ENOSPC even if the final result
+ * would fit, since `mandatory` is fixed up after the hints are written).
  * Returns 0, -ENOSPC, -EBADMSG, or the callback's error.
  */
 int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
