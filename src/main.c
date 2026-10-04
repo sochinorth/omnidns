@@ -24,6 +24,7 @@
 static struct omni omni;
 static const char *nft_table;
 static bool destroy_on_exit;
+static bool log_to_stderr;
 
 /*
  * Desired dataplane: pools and fwmask from cfg, marks = marks of fakeip
@@ -54,7 +55,7 @@ static void apply_runtime_limits(const struct config *cfg)
 {
 	upstream_set_timeouts(cfg->upstream_timeout_ms, cfg->upstream_total_timeout_ms);
 	cache_set_limits(omni.cache, cfg->cache_size, cfg->cache_max_bytes);
-	log_init("omnidns", false, cfg->log_level);
+	log_init("omnidns", log_to_stderr, cfg->log_level);
 }
 
 static int reload(void)
@@ -135,7 +136,6 @@ int main(int argc, char **argv)
 	static uint32_t marks[MAX_MARKS];
 	struct nft_desired d;
 	uint8_t secret[16];
-	bool to_stderr = false;
 	char err[512];
 	int opt, ret = 1;
 
@@ -143,14 +143,14 @@ int main(int argc, char **argv)
 	while ((opt = getopt(argc, argv, "c:ft:xh")) != -1) {
 		switch (opt) {
 		case 'c': omni.config_path = optarg; break;
-		case 'f': to_stderr = true; break;
+		case 'f': log_to_stderr = true; break;
 		case 't': nft_table = optarg; break;
 		case 'x': destroy_on_exit = true; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
 	}
 
-	log_init("omnidns", to_stderr, LOG_INFO);
+	log_init("omnidns", log_to_stderr, LOG_INFO);
 	hash_init();
 	if (getrandom(secret, sizeof(secret), 0) != sizeof(secret)) {
 		log_err("getrandom: %s", strerror(errno));
@@ -165,7 +165,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	omni.cfg->gen = ++omni.next_gen;
-	log_init("omnidns", to_stderr, omni.cfg->log_level);
+	log_init("omnidns", log_to_stderr, omni.cfg->log_level);
 
 	if (uloop_init()) {
 		log_err("uloop_init failed");
