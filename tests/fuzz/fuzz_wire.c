@@ -44,14 +44,14 @@ static void check_rr(const struct dns_msg *m, const struct dns_rr *rr)
 	if (rr->type != DNS_T_DNAME || !m->has_q)
 		return;
 	r = dns_name_dname_subst(m->qname.data, m->qname.len, rr->owner,
-				 rr->owner_len, t.data, t.len, &s);
+	                         rr->owner_len, t.data, t.len, &s);
 	ASSERT(r == 0 || r == -EINVAL || r == -EOVERFLOW);
 	if (!r)
 		ASSERT(dns_name_check(s.data, s.len) == s.len);
 	if (r == -EINVAL)
 		ASSERT(m->qname.len <= rr->owner_len ||
 		       !dns_name_is_under(m->qname.data, m->qname.len,
-					  rr->owner, rr->owner_len));
+		                          rr->owner, rr->owner_len));
 }
 
 static void check_msg(const struct dns_msg *m)

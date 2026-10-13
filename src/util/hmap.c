@@ -58,7 +58,7 @@ void hmap_free(struct hmap *m)
 }
 
 void *hmap_get(const struct hmap *m, uint64_t hash, const void *key,
-	       hmap_eq_fn eq, void *ctx)
+               hmap_eq_fn eq, void *ctx)
 {
 	uint32_t i;
 
@@ -110,7 +110,7 @@ static void hmap_del_slot(struct hmap *m, uint32_t i)
 }
 
 void *hmap_del(struct hmap *m, uint64_t hash, const void *key,
-	       hmap_eq_fn eq, void *ctx)
+               hmap_eq_fn eq, void *ctx)
 {
 	uint32_t i;
 

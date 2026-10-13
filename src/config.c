@@ -210,7 +210,7 @@ static bool server_eq(const struct upstream_server *a, const struct upstream_ser
 }
 
 int resolvconf_parse(const char *text, size_t len,
-		     struct upstream_server *out, int max, int *nskipped)
+                     struct upstream_server *out, int max, int *nskipped)
 {
 	const char *p = text, *end = text + len, *s, *e;
 	int n = 0, skipped = 0;
@@ -290,7 +290,7 @@ struct upstream_set *upstream_set_load(const char *path, char *err, size_t errle
 	free(text);
 	if (skipped)
 		log_warn("upstream file '%s': %d invalid nameserver line(s) ignored",
-			 path, skipped);
+		         path, skipped);
 	if (n <= 0) {
 		snprintf(err, errlen, "upstream file '%s': no usable nameserver", path);
 		return NULL;
@@ -371,7 +371,7 @@ struct pat_vec {
 };
 
 static int pat_push(struct pat_vec *pv, struct arena *a, const char *s,
-		    size_t len, bool suffix)
+                    size_t len, bool suffix)
 {
 	struct ns_pattern *p;
 
@@ -395,8 +395,8 @@ static int pat_push(struct pat_vec *pv, struct arena *a, const char *s,
 }
 
 int nameset_parse(const char *text, size_t len, struct arena *a,
-		  struct ns_pattern **out, uint32_t *n, uint32_t *ninvalid,
-		  const char *path)
+                  struct ns_pattern **out, uint32_t *n, uint32_t *ninvalid,
+                  const char *path)
 {
 	const char *p = text, *end = text + len, *s, *e, *line;
 	struct pat_vec pv = { 0 };
@@ -429,7 +429,7 @@ int nameset_parse(const char *text, size_t len, struct arena *a,
 		}
 		if (++bad <= NAMESET_LOG_INVALID)
 			log_warn("%s:%u: invalid pattern '%.*s'", path ? path : "nameset",
-				 lineno, (int)(e - line > 80 ? 80 : e - line), line);
+			         lineno, (int)(e - line > 80 ? 80 : e - line), line);
 	}
 	if (bad > NAMESET_LOG_INVALID)
 		log_warn("%s: %u invalid patterns in total", path ? path : "nameset", bad);
@@ -680,7 +680,7 @@ static int fail(struct loader *L, const char *fmt, ...)
 }
 
 static const char *opt_str(struct loader *L, struct uci_section *s, const char *name,
-			   const char *where, int *ret)
+                           const char *where, int *ret)
 {
 	struct uci_option *o = uci_lookup_option(L->uci, s, name);
 
@@ -745,7 +745,7 @@ static int load_u32_opts(struct loader *L, struct uci_section *s)
 			continue;
 		if (parse_u32(v, &x) || x < d->min || x > d->max)
 			return fail(L, "global: option '%s': invalid value '%s' (%u..%u)",
-				    d->name, v, d->min, d->max);
+			            d->name, v, d->min, d->max);
 		*(uint32_t *)((char *)L->cfg + d->off) = x;
 	}
 	return 0;
@@ -853,7 +853,7 @@ static int load_pool(struct loader *L, struct uci_section *s, int family)
 		ip_prefix_parse(reserved_nets[i].pfx, &r);
 		if (prefix_overlap(p, &r))
 			return fail(L, "global: %s '%s' overlaps reserved %s",
-				    name, v, reserved_nets[i].pfx);
+			            name, v, reserved_nets[i].pfx);
 	}
 	if (family == AF_INET)
 		cfg->has_pool4 = true;
@@ -876,7 +876,7 @@ static void warn_unknown_global(struct uci_section *s)
 
 	uci_foreach_element(&s->options, e) {
 		bool known = option_known(e->name, known_global,
-					  sizeof(known_global) / sizeof(known_global[0]));
+		                          sizeof(known_global) / sizeof(known_global[0]));
 
 		for (size_t i = 0; !known && i < sizeof(u32_opts) / sizeof(u32_opts[0]); i++)
 			known = !strcmp(e->name, u32_opts[i].name);
@@ -944,12 +944,12 @@ static int rule_add_file(struct loader *L, struct rule *r, const char *path)
 		if (err == -ENOMEM)
 			return fail(L, "out of memory");
 		log_warn("rule '%s': nameset '%s' unreadable (%s), skipped",
-			 r->id, path, strerror(-err));
+		         r->id, path, strerror(-err));
 		return 0;
 	}
 	for (uint16_t i = 0; i < r->nfiles; i++) {
 		if (r->files[i] == f || (r->files[i]->dev == f->dev &&
-					 r->files[i]->ino == f->ino)) {
+		                         r->files[i]->ino == f->ino)) {
 			nsc_put(f);
 			return 0;
 		}
@@ -990,7 +990,7 @@ static int rule_glob(struct loader *L, struct rule *r, const char *pattern)
 
 		if (stat(g.gl_pathv[i], &st) || !S_ISREG(st.st_mode)) {
 			log_warn("rule '%s': nameset '%s' is not a readable regular file, skipped",
-				 r->id, g.gl_pathv[i]);
+			         r->id, g.gl_pathv[i]);
 			continue;
 		}
 		ret = rule_add_file(L, r, g.gl_pathv[i]);
@@ -1016,7 +1016,7 @@ static int rule_namesets(struct loader *L, struct rule *r, struct uci_option *o)
 	}
 	if (!ret && !r->nfiles)
 		log_warn("rule '%s': nameset globs matched no readable files; rule matches nothing",
-			 r->id);
+		         r->id);
 	return ret;
 }
 
@@ -1048,13 +1048,13 @@ static int rule_mark(struct loader *L, struct rule *r, const char *v)
 	r->mark = config_mark_shift(x, L->cfg->fwmask);
 	if (!r->mark)
 		return fail(L, "rule '%s': fwmark '%s' must be non-zero and fit fwmask 0x%x",
-			    r->id, v, L->cfg->fwmask);
+		            r->id, v, L->cfg->fwmask);
 	for (uint16_t i = 0; i < r->ord; i++) {
 		const struct rule *o = &L->cfg->rules[i];
 
 		if (o->action == RULE_FAKEIP && o->mark == r->mark) {
 			log_warn("rule '%s': shares fwmark 0x%x with rule '%s'",
-				 r->id, r->mark, o->id);
+			         r->id, r->mark, o->id);
 			break;
 		}
 	}
@@ -1082,7 +1082,7 @@ static int rule_options(struct loader *L, struct rule *r, struct uci_section *s)
 		log_warn("rule '%s': upstream ignored for action block", r->id);
 	if (r->action != RULE_FAKEIP && mark)
 		log_warn("rule '%s': fwmark ignored for action %s", r->id,
-			 r->action == RULE_BLOCK ? "block" : "forward");
+		         r->action == RULE_BLOCK ? "block" : "forward");
 	if (r->action == RULE_BLOCK)
 		return 0;
 	if (!up || !*up)
@@ -1142,12 +1142,12 @@ static int load_rule(struct loader *L, struct uci_section *s)
 
 	if (s->anonymous)
 		return fail(L, "rule #%u: anonymous rule sections are not allowed "
-			    "(give each rule a stable name)", cfg->nrules + 1);
+		            "(give each rule a stable name)", cfg->nrules + 1);
 	if (cfg->nrules >= CONFIG_MAX_RULES)
 		return fail(L, "too many rules (max %d)", CONFIG_MAX_RULES);
 	if (cfg->nrules && cfg->rules[cfg->nrules - 1].catchall)
 		return fail(L, "rule '%s': catchall rule '%s' (no nameset) must be the last rule",
-			    s->e.name, cfg->rules[cfg->nrules - 1].id);
+		            s->e.name, cfg->rules[cfg->nrules - 1].id);
 	r = &cfg->rules[cfg->nrules];
 	memset(r, 0, sizeof(*r));
 	r->ord = cfg->nrules++;
@@ -1229,7 +1229,7 @@ out:
 }
 
 struct config *config_load(const char *path, struct nameset_cache *nsc,
-			   char *err, size_t errlen)
+                           char *err, size_t errlen)
 {
 	struct loader L = { .nsc = nsc, .err = err, .errlen = errlen };
 	struct config *cfg = calloc(1, sizeof(*cfg));

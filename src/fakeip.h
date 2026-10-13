@@ -62,8 +62,8 @@ struct fakeip_db;
 
 /* p4/p6 may be NULL. secret: 16 random bytes (or fixed in tests). */
 struct fakeip_db *fakeip_new(const struct ip_prefix *p4, const struct ip_prefix *p6,
-			     uint32_t max_bindings, uint32_t grace,
-			     const uint8_t secret[16], struct nft_ctx *nft);
+                             uint32_t max_bindings, uint32_t grace,
+                             const uint8_t secret[16], struct nft_ctx *nft);
 void fakeip_free(struct fakeip_db *db);	/* frees memory only, no nft ops */
 
 bool fakeip_has_pool(const struct fakeip_db *db, int family);
@@ -75,8 +75,8 @@ bool fakeip_has_pool(const struct fakeip_db *db, int family);
  * -EAFNOSUPPORT (no pool for family), -ENOSPC (exhausted), -ENOMEM.
  */
 struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t mark,
-			    const uint8_t *endpoint, uint8_t endpoint_len,
-			    int family, const uint8_t *real, uint32_t ttl, int *err);
+                            const uint8_t *endpoint, uint8_t endpoint_len,
+                            int family, const uint8_t *real, uint32_t ttl, int *err);
 
 void fakeip_ref(struct binding *b);
 void fakeip_unref(struct fakeip_db *db, struct binding *b);
@@ -94,7 +94,7 @@ bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr)
  * (existing in-pool bindings keep their fakes).
  */
 int fakeip_set_config(struct fakeip_db *db, const struct ip_prefix *p4,
-		      const struct ip_prefix *p6, uint32_t max_bindings, uint32_t grace);
+                      const struct ip_prefix *p6, uint32_t max_bindings, uint32_t grace);
 /* Number of non-evictable bindings (used to reject fwmask changes). */
 uint32_t fakeip_live_count(struct fakeip_db *db);
 

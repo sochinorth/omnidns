@@ -255,8 +255,8 @@ static void srv_text(const struct upstream_set *u, char *buf, size_t cap)
 }
 
 struct upstream_query *upstream_query(struct upstream_set *u,
-				      const uint8_t *qname, uint8_t qlen, uint16_t qtype,
-				      upstream_cb cb, void *ctx)
+                                      const uint8_t *qname, uint8_t qlen, uint16_t qtype,
+                                      upstream_cb cb, void *ctx)
 {
 	struct upstream_query *q = calloc(1, sizeof(*q));
 	char srv[64], tb[16];
@@ -266,7 +266,7 @@ struct upstream_query *upstream_query(struct upstream_set *u,
 	srv_text(u, srv, sizeof(srv));
 	nqueries++;
 	snprintf(qlog + strlen(qlog), sizeof(qlog) - strlen(qlog), "%s%s %s %s",
-		 qlog[0] ? "|" : "", srv, name, dns_type_str(qtype, tb));
+	         qlog[0] ? "|" : "", srv, name, dns_type_str(qtype, tb));
 	q->cb = cb;
 	q->ctx = ctx;
 	q->t.cb = stub_fire;
@@ -395,8 +395,8 @@ static void setup(const char *cfgtext)
 		abort();
 	}
 	o.fdb = fakeip_new(o.cfg->has_pool4 ? &o.cfg->pool4 : NULL,
-			   o.cfg->has_pool6 ? &o.cfg->pool6 : NULL,
-			   o.cfg->fakeip_max_bindings, o.cfg->fakeip_grace, SECRET, nft);
+	                   o.cfg->has_pool6 ? &o.cfg->pool6 : NULL,
+	                   o.cfg->fakeip_max_bindings, o.cfg->fakeip_grace, SECRET, nft);
 	o.cache = cache_new(1000, 1 << 20, o.fdb);
 	nscripts = 0;
 	qlog[0] = 0;
@@ -496,7 +496,7 @@ static const char *rrs(const struct dns_rr *rr)
 		break;
 	}
 	snprintf(buf[i], sizeof(buf[i]), "%s %u %s%s%s", ntext(rr->owner, rr->owner_len),
-		 rr->ttl, dns_type_str(rr->type, tb), rd[0] ? " " : "", rd);
+	         rr->ttl, dns_type_str(rr->type, tb), rd[0] ? " " : "", rd);
 	return buf[i];
 }
 
@@ -528,7 +528,7 @@ static bool in_kernel(int fam, const uint8_t *fake, const char *real, uint32_t m
 
 	inet_ntop(fam == 4 ? AF_INET : AF_INET6, fake, f, sizeof(f));
 	snprintf(cmd, sizeof(cmd), "nft list map inet " TABLE " fake2real_v%d; "
-		 "nft list map inet " TABLE " fake2mark_v%d", fam, fam);
+	         "nft list map inet " TABLE " fake2mark_v%d", fam, fam);
 	o1 = sh(cmd);
 	snprintf(n1, sizeof(n1), "%s : %s", f, real);
 	snprintf(n2, sizeof(n2), "%s : jump mark_%08x", f, mark);
@@ -545,7 +545,7 @@ static int kernel_elems(int fam)
 	int n;
 
 	snprintf(cmd, sizeof(cmd), "nft list map inet " TABLE " fake2real_v%d | "
-		 "grep -oE ' : [0-9a-f]' | wc -l", fam);
+	         "grep -oE ' : [0-9a-f]' | wc -l", fam);
 	out = sh(cmd);
 	n = atoi(out);
 	free(out);
@@ -554,7 +554,7 @@ static int kernel_elems(int fam)
 
 /* rdata at `addr` is a fake of family fam for (real, mark, endpoint), in the kernel */
 static bool is_fake(int fam, const uint8_t *addr, const char *real, uint32_t mark,
-		    const char *endpoint)
+                    const char *endpoint)
 {
 	struct binding *b = fakeip_lookup(o.fdb, fam, addr);
 	uint8_t r[16];
@@ -608,7 +608,7 @@ static void block_case(const char *mode, int want_rcode, bool null)
 	char cfg[4096];
 
 	snprintf(cfg, sizeof(cfg), GLOBAL_HDR "\toption block_mode '%s'\n\toption block_ttl '120'\n"
-		 RULES, mode);
+	         RULES, mode);
 	setup(cfg);
 	REQUIRE(run("x.ads.example", DNS_T_A));
 	CHECK(no_queries());
@@ -780,8 +780,8 @@ TEST(h_dname)
 		       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.z.plain.example");
 		strcpy(owner, "z.plain.example");
 		snprintf(rr, sizeof(rr), "an %s 60 DNAME "
-			 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
-			 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", owner);
+		         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb."
+		         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", owner);
 		S("10.0.0.1", q, DNS_T_A, 0, rr);
 		REQUIRE(run(q, DNS_T_A));
 		CHECK_EQ(rcode(), 6);
@@ -816,7 +816,7 @@ static void chain(char *buf, size_t cap, int n)
 	buf[0] = 0;
 	for (i = 0; i < n; i++)
 		snprintf(buf + strlen(buf), cap - strlen(buf),
-			 "an c%d.plain.example 300 CNAME c%d.plain.example;", i, i + 1);
+		         "an c%d.plain.example 300 CNAME c%d.plain.example;", i, i + 1);
 	snprintf(buf + strlen(buf), cap - strlen(buf), "an c%d.plain.example 300 A 1.1.1.1", n);
 }
 

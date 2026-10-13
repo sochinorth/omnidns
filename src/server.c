@@ -191,7 +191,7 @@ static void creq_release(struct creq *q)
 /* ---- response building ---- */
 
 static int build_reply(const struct creq *q, const struct dns_msg *resp,
-		       uint8_t *buf, size_t maxlen)
+                       uint8_t *buf, size_t maxlen)
 {
 	struct dns_msg m;
 	int ret;
@@ -206,7 +206,7 @@ static int build_reply(const struct creq *q, const struct dns_msg *resp,
 	}
 	m.id = q->id;
 	m.flags = (m.flags & ~(DNS_F_RD | DNS_F_CD | DNS_F_OPCODE | DNS_F_AA)) |
-		  DNS_F_QR | DNS_F_RA | q->rdcd;
+	          DNS_F_QR | DNS_F_RA | q->rdcd;
 	ret = dns_msg_set_question(&m, q->qname.data, q->qname.len, q->qtype, q->qclass);
 	if (ret)
 		goto out;
@@ -228,7 +228,7 @@ out:
 
 /* Minimal error reply when only the raw header (and maybe question) is known. */
 static int build_error(const uint8_t *query, size_t qlen, int rcode,
-		       const struct dns_msg *parsed, bool edns, uint8_t *buf, size_t cap)
+                       const struct dns_msg *parsed, bool edns, uint8_t *buf, size_t cap)
 {
 	struct dns_msg m;
 	int ret;
@@ -240,7 +240,7 @@ static int build_error(const uint8_t *query, size_t qlen, int rcode,
 	m.flags = DNS_F_QR | (((query[2] << 8) | query[3]) & (DNS_F_OPCODE | DNS_F_RD | DNS_F_CD));
 	if (parsed && parsed->has_q)
 		dns_msg_set_question(&m, parsed->qname.data, parsed->qname.len,
-				     parsed->qtype, parsed->qclass);
+		                     parsed->qtype, parsed->qclass);
 	if (edns) {
 		m.edns.present = true;
 		m.edns.udp_size = EDNS_MAX_UDP;
@@ -254,8 +254,8 @@ static int build_error(const uint8_t *query, size_t qlen, int rcode,
 /* ---- UDP ---- */
 
 static void udp_send(int fd, const struct sockaddr_storage *peer, socklen_t peerlen,
-		     const struct sockaddr_storage *local, bool have_local, int ifindex,
-		     const uint8_t *buf, size_t len)
+                     const struct sockaddr_storage *local, bool have_local, int ifindex,
+                     const uint8_t *buf, size_t len)
 {
 	union {
 		char v4[CMSG_SPACE(sizeof(struct in_pktinfo))];
@@ -326,7 +326,7 @@ static void creq_done(void *ctx, const struct dns_msg *resp)
 		len = build_reply(q, resp, out_buf, udp_limit(q));
 		if (len > 0)
 			udp_send(q->udp_fd, &q->peer, q->peerlen, &q->local, q->have_local,
-				 q->ifindex, out_buf, len);
+			         q->ifindex, out_buf, len);
 	}
 	list_del(&q->list);
 	creq_release(q);
@@ -385,7 +385,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 	else if (m.edns.present && m.edns.version > 0)
 		rcode = DNS_R_BADVERS;
 	else if (m.qclass != DNS_C_IN || m.qtype == DNS_T_AXFR || m.qtype == DNS_T_IXFR ||
-		 m.qtype == DNS_T_OPT)
+	         m.qtype == DNS_T_OPT)
 		rcode = DNS_R_REFUSED;
 	if (rcode >= 0) {
 		ret = build_error(buf, len, rcode, &m, m.edns.present, reply, reply_cap);
@@ -397,7 +397,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 		stats.refused_limit++;
 		if (tmpl->conn)
 			ret = build_error(buf, len, DNS_R_REFUSED, &m, m.edns.present,
-					  reply, reply_cap);
+			                  reply, reply_cap);
 		else
 			ret = 0;
 		goto out;
@@ -489,7 +489,7 @@ static void udp_read_cb(struct uloop_fd *ufd, unsigned events)
 		rlen = handle_query(udp_buf, n, &tmpl, &udp_reqs, out_buf, 512);
 		if (rlen > 0)
 			udp_send(ufd->fd, &tmpl.peer, tmpl.peerlen, &tmpl.local, tmpl.have_local,
-				 tmpl.ifindex, out_buf, rlen);
+			         tmpl.ifindex, out_buf, rlen);
 	}
 }
 
@@ -536,7 +536,7 @@ static bool tcp_flush(struct tcp_conn *c)
 	list_for_each_entry_safe(ob, tmp, &c->outq, list) {
 		while (ob->off < ob->len) {
 			ssize_t n = send(c->ufd.fd, ob->data + ob->off, ob->len - ob->off,
-					 MSG_DONTWAIT | MSG_NOSIGNAL);
+			                 MSG_DONTWAIT | MSG_NOSIGNAL);
 
 			if (n < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -601,7 +601,7 @@ static bool tcp_read(struct tcp_conn *c)
 			n = recv(c->ufd.fd, c->hdr + c->hdr_got, 2 - c->hdr_got, MSG_DONTWAIT);
 		} else {
 			n = recv(c->ufd.fd, c->msg + c->msg_got, c->msg_len - c->msg_got,
-				 MSG_DONTWAIT);
+			         MSG_DONTWAIT);
 		}
 		if (n == 0) {
 			c->read_closed = true;
@@ -642,7 +642,7 @@ static bool tcp_read(struct tcp_conn *c)
 			tmpl.peer = c->peer;
 			stats.tcp_queries++;
 			rlen = handle_query(c->msg, c->msg_len, &tmpl, &c->reqs,
-					    out_buf, sizeof(out_buf));
+			                    out_buf, sizeof(out_buf));
 			free(c->msg);
 			c->msg = NULL;
 			c->hdr_got = 0;

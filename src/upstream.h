@@ -39,8 +39,8 @@ void upstream_init(uint32_t try_timeout_ms, uint32_t total_timeout_ms);
 void upstream_set_timeouts(uint32_t try_timeout_ms, uint32_t total_timeout_ms);
 
 struct upstream_query *upstream_query(struct upstream_set *u,
-				      const uint8_t *qname, uint8_t qlen, uint16_t qtype,
-				      upstream_cb cb, void *ctx);
+                                      const uint8_t *qname, uint8_t qlen, uint16_t qtype,
+                                      upstream_cb cb, void *ctx);
 /* Callback will not be invoked after cancel. */
 void upstream_cancel(struct upstream_query *q);
 

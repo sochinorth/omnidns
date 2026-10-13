@@ -134,9 +134,9 @@ bool dns_name_is_under(const uint8_t *name, uint8_t nlen, const uint8_t *zone, u
  * owner, or -EOVERFLOW if the result exceeds 255 bytes (=> YXDOMAIN).
  */
 int dns_name_dname_subst(const uint8_t *qname, uint8_t qlen,
-			 const uint8_t *owner, uint8_t olen,
-			 const uint8_t *target, uint8_t tlen,
-			 struct dns_name *out);
+                         const uint8_t *owner, uint8_t olen,
+                         const uint8_t *target, uint8_t tlen,
+                         struct dns_name *out);
 /* Validate an uncompressed wire name at p (max avail bytes); returns its
  * length (1..255) or -EBADMSG. */
 int dns_name_check(const uint8_t *p, size_t avail);
@@ -166,11 +166,11 @@ int dns_parse_query(struct dns_msg *m, const uint8_t *buf, size_t len);
  * uncompressed. RRs must be appended in section order (AN, NS, AR);
  * returns -EINVAL otherwise, -E2BIG past DNS_MAX_RRS. */
 int dns_msg_add_rr(struct dns_msg *m, enum dns_section sec,
-		   const uint8_t *owner, uint8_t owner_len,
-		   uint16_t type, uint16_t cls, uint32_t ttl,
-		   const uint8_t *rdata, uint16_t rdlen);
+                   const uint8_t *owner, uint8_t owner_len,
+                   uint16_t type, uint16_t cls, uint32_t ttl,
+                   const uint8_t *rdata, uint16_t rdlen);
 int dns_msg_set_question(struct dns_msg *m, const uint8_t *qname, uint8_t qlen,
-			 uint16_t qtype, uint16_t qclass);
+                         uint16_t qtype, uint16_t qclass);
 int dns_msg_copy(struct dns_msg *dst, const struct dns_msg *src);	/* deep, compact */
 
 /* Count of RRs in a section. */

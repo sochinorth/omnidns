@@ -63,7 +63,7 @@ static long count_elems(const char *map)
 	long n;
 
 	snprintf(cmd, sizeof(cmd),
-		 "nft list map inet " TABLE " %s | grep -oE ' : (jump|[0-9a-f])' | wc -l", map);
+	         "nft list map inet " TABLE " %s | grep -oE ' : (jump|[0-9a-f])' | wc -l", map);
 	out = sh(cmd);
 	n = strtol(out, NULL, 10);
 	free(out);
@@ -135,7 +135,7 @@ TEST(bootstrap_v4v6_marks)
 	CHECK(has(o, "meta mark set meta mark & 0x01ffffff | 0x01000000"));
 	CHECK(has(o, "ct mark set ct mark & 0x02ffffff | 0x02000000"));
 	CHECK(has(o, "ct mark & 0xff000000 vmap { 0x01000000 : jump mark_01000000, "
-		  "0x02000000 : jump mark_02000000 }"));
+	          "0x02000000 : jump mark_02000000 }"));
 	CHECK(has(o, "ip6 daddr fc00::/64 ip6 daddr vmap @fake2mark_v6"));
 	CHECK(has(o, "ip6 daddr fc00::/64 dnat ip6 to ip6 daddr map @fake2real_v6"));
 	CHECK(has(o, "ip6 daddr fc00::/64 reject"));
@@ -160,7 +160,7 @@ TEST(reconcile)
 	CHECK(has(o, "chain mark_03000000"));
 	CHECK(lacks(o, "mark_02000000"));
 	CHECK(has(o, "ct mark & 0xff000000 vmap { 0x01000000 : jump mark_01000000, "
-		  "0x03000000 : jump mark_03000000 }"));
+	          "0x03000000 : jump mark_03000000 }"));
 	CHECK(has(o, "ip daddr 198.18.0.0/16 dnat ip to ip daddr map @fake2real_v4"));
 	CHECK(lacks(o, "198.18.0.0/15"));
 	CHECK(has(o, "ip6 daddr fd00::/63 dnat ip6 to ip6 daddr map @fake2real_v6"));
@@ -496,7 +496,7 @@ static long counter_packets(const char *chain_line)
 	long v = -1;
 
 	snprintf(cmd, sizeof(cmd),
-		 "nft list chain ip omnicnt out | grep '%s'", chain_line);
+	         "nft list chain ip omnicnt out | grep '%s'", chain_line);
 	o = sh(cmd);
 	p = strstr(o, "packets ");
 	if (p)

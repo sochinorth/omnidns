@@ -48,8 +48,8 @@ void cache_set_limits(struct cache *c, uint32_t max_entries, size_t max_bytes);
 /* Returns 0 on hit (out filled, out->id/edns untouched, qname case as
  * stored) or -ENOENT. `out` must be initialized; it is reset first. */
 int cache_lookup(struct cache *c, const struct config *cfg,
-		 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-		 struct dns_msg *out);
+                 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
+                 struct dns_msg *out);
 
 /*
  * Insert/replace. `lifetime` seconds (0 => not cached). Takes a reference on
@@ -57,10 +57,10 @@ int cache_lookup(struct cache *c, const struct config *cfg,
  * cached (returns -E2BIG).
  */
 int cache_insert(struct cache *c, const struct config *cfg,
-		 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-		 const struct dns_msg *resp, uint32_t lifetime,
-		 const struct cache_dep *deps, uint16_t ndeps,
-		 struct binding *const *binds, uint16_t nbinds);
+                 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
+                 const struct dns_msg *resp, uint32_t lifetime,
+                 const struct cache_dep *deps, uint16_t ndeps,
+                 struct binding *const *binds, uint16_t nbinds);
 
 void cache_flush(struct cache *c);
 /*

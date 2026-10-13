@@ -121,8 +121,8 @@ static size_t fix_mandatory(uint8_t *out, size_t start, size_t end, unsigned rem
 }
 
 int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
-		       svcb_addr_fn fn, void *ctx, bool drop_v6,
-		       uint8_t *out, size_t cap, uint16_t *outlen)
+                       svcb_addr_fn fn, void *ctx, bool drop_v6,
+                       uint8_t *out, size_t cap, uint16_t *outlen)
 {
 	struct svcb_view v;
 	size_t off, o, room, params;
@@ -157,7 +157,7 @@ int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
 		/* a fully dropped hint needs no room at all */
 		room = cap - o >= 4 ? cap - o - 4 : 0;
 		r = rewrite_hint(key == SVCB_KEY_IPV4HINT ? 4 : 6, val, vlen,
-				 fn, ctx, room ? out + o + 4 : NULL, room, &n);
+		                 fn, ctx, room ? out + o + 4 : NULL, room, &n);
 		if (r)
 			return r;
 		if (!n) {

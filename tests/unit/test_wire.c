@@ -60,7 +60,7 @@ static void p_name(struct pkt *p, const char *s)
 }
 
 static void p_hdr(struct pkt *p, uint16_t flags, uint16_t qd, uint16_t an,
-		  uint16_t ns, uint16_t ar)
+                  uint16_t ns, uint16_t ar)
 {
 	p->n = 0;
 	p_u16(p, 0x1234);
@@ -117,8 +117,8 @@ static bool msg_equal(const struct dns_msg *a, const struct dns_msg *b)
 	    a->nrr != b->nrr || a->edns.present != b->edns.present)
 		return false;
 	if (a->has_q && (a->qtype != b->qtype || a->qclass != b->qclass ||
-			 a->qname.len != b->qname.len ||
-			 memcmp(a->qname.data, b->qname.data, a->qname.len)))
+	                 a->qname.len != b->qname.len ||
+	                 memcmp(a->qname.data, b->qname.data, a->qname.len)))
 		return false;
 	if (a->edns.present && (a->edns.udp_size != b->edns.udp_size ||
 				a->edns.do_bit != b->edns.do_bit ||

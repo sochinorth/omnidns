@@ -82,7 +82,7 @@ static bool owned(const struct dns_rr *rr, const struct dns_name *n)
 }
 
 static const struct dns_rr *find_rr(const struct dns_msg *m, const struct dns_name *n,
-				    uint16_t type)
+                                    uint16_t type)
 {
 	uint16_t i;
 
@@ -133,7 +133,7 @@ static int afamily(uint16_t qtype)
 static int add_rr(struct dns_msg *m, enum dns_section sec, const struct dns_rr *rr)
 {
 	return dns_msg_add_rr(m, sec, rr->owner, rr->owner_len, rr->type, rr->cls,
-			      rr->ttl, rr->rdata, rr->rdlen);
+	                      rr->ttl, rr->rdata, rr->rdlen);
 }
 
 static bool rr_same(const struct dns_rr *a, const struct dns_rr *b)
@@ -325,8 +325,8 @@ static void finish_cached(struct resolve_req *r)
 		stats.fakeip_answers++;
 	if (o->cache && r->lifetime && o->cfg->gen == r->gen0)
 		cache_insert(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype,
-			     r->qclass, &r->out, r->lifetime, r->deps, r->ndeps,
-			     r->binds, r->nbinds);
+		             r->qclass, &r->out, r->lifetime, r->deps, r->ndeps,
+		             r->binds, r->nbinds);
 	deliver(r);
 }
 
@@ -362,7 +362,7 @@ static int add_synth_soa(struct resolve_req *r, uint32_t ttl)
 	put32(rd + n, ttl);
 	n += 4;
 	return dns_msg_add_rr(&r->out, DNS_S_NS, r->qname.data, r->qname.len, DNS_T_SOA,
-			      DNS_C_IN, ttl, rd, (uint16_t)n);
+	                      DNS_C_IN, ttl, rd, (uint16_t)n);
 }
 
 static void finish_block(struct resolve_req *r)
@@ -375,8 +375,8 @@ static void finish_block(struct resolve_req *r)
 	out_init(r, cfg->block_mode == BLOCK_NXDOMAIN ? DNS_R_NXDOMAIN : DNS_R_NOERROR);
 	if (cfg->block_mode == BLOCK_NULL && fam)
 		ret = dns_msg_add_rr(&r->out, DNS_S_AN, r->qname.data, r->qname.len,
-				     r->qtype, DNS_C_IN, cfg->block_ttl, zero,
-				     fam == 4 ? 4 : 16);
+		                     r->qtype, DNS_C_IN, cfg->block_ttl, zero,
+		                     fam == 4 ? 4 : 16);
 	else
 		ret = add_synth_soa(r, cfg->block_ttl);
 	if (ret) {
@@ -465,7 +465,7 @@ static bool try_ptr(struct resolve_req *r)
 	if (b) {
 		out_init(r, DNS_R_NOERROR);
 		if (dns_msg_add_rr(&r->out, DNS_S_AN, r->qname.data, r->qname.len,
-				   DNS_T_PTR, DNS_C_IN, PTR_TTL, b->endpoint, b->endpoint_len))
+		                   DNS_T_PTR, DNS_C_IN, PTR_TTL, b->endpoint, b->endpoint_len))
 			return servfail(r), true;
 	} else {
 		out_init(r, DNS_R_NXDOMAIN);
@@ -660,8 +660,8 @@ static uint32_t fake_ttl(const struct resolve_req *r, uint32_t ttl)
 }
 
 static struct binding *do_bind(struct resolve_req *r, const char *rule_id, uint32_t mark,
-			       const uint8_t *ep, uint8_t eplen, int fam,
-			       const uint8_t *real, uint32_t ttl, int *err)
+                               const uint8_t *ep, uint8_t eplen, int fam,
+                               const uint8_t *real, uint32_t ttl, int *err)
 {
 	struct binding *b;
 
@@ -691,7 +691,7 @@ static int hint_fn(void *ctx, int family, const uint8_t *in, uint8_t *out)
 	if (!fakeip_has_pool(h->r->o->fdb, family))
 		return 1;
 	b = do_bind(h->r, h->rule_id, h->mark, h->endpoint, h->endpoint_len,
-		    family, in, h->ttl, &err);
+	            family, in, h->ttl, &err);
 	if (!b)
 		return err == -EDQUOT ? 1 : err;
 	memcpy(out, b->fake, family == 4 ? 4 : 16);
@@ -699,7 +699,7 @@ static int hint_fn(void *ctx, int family, const uint8_t *in, uint8_t *out)
 }
 
 static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
-		      const struct plan *p, bool *changed)
+                      const struct plan *p, bool *changed)
 {
 	struct hint_ctx h = {
 		.r = r, .rule_id = p->rule_id, .mark = p->mark, .ttl = fake_ttl(r, rr->ttl),
@@ -724,12 +724,12 @@ static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 	if (!buf)
 		return -ENOMEM;
 	ret = svcb_rewrite_hints(rr->rdata, rr->rdlen, hint_fn, &h,
-				 !fakeip_has_pool(r->o->fdb, 6), buf, rr->rdlen, &len);
+	                         !fakeip_has_pool(r->o->fdb, 6), buf, rr->rdlen, &len);
 	if (!ret) {
 		if (len != rr->rdlen || memcmp(buf, rr->rdata, len))
 			*changed = true;
 		ret = dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len,
-				     rr->type, rr->cls, h.ttl, buf, len);
+		                     rr->type, rr->cls, h.ttl, buf, len);
 	}
 	free(buf);
 	return ret;
@@ -742,11 +742,11 @@ static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struc
 	struct binding *b;
 
 	b = do_bind(r, p->rule_id, p->mark, r->name.data, r->name.len, fam,
-		    rr->rdata, ttl, &err);
+	            rr->rdata, ttl, &err);
 	if (!b)
 		return err == -EDQUOT ? 0 : err;
 	return dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len, rr->type,
-			      rr->cls, ttl, b->fake, rr->rdlen);
+	                      rr->cls, ttl, b->fake, rr->rdlen);
 }
 
 /* Decide one ServiceMode RR (match its effective target). */
@@ -806,7 +806,7 @@ static int build_nodata(struct resolve_req *r)
 }
 
 static int plan_terminal(struct resolve_req *r, struct plan *plan, uint16_t *nkept,
-			 bool *dropped)
+                         bool *dropped)
 {
 	const struct dns_msg *m = &r->resp;
 	int fam = afamily(r->qtype), ret;
@@ -921,7 +921,7 @@ static void upstream_done(void *ctx, int err, const struct dns_msg *resp)
 static void query(struct resolve_req *r)
 {
 	r->uq = upstream_query(r->cur_up, r->name.data, r->name.len, r->qtype,
-			       upstream_done, r);
+	                       upstream_done, r);
 	if (!r->uq)
 		servfail(r);
 }
@@ -980,7 +980,7 @@ static int alias_to(struct resolve_req *r, const struct dns_name *target)
 }
 
 static int synth_cname(struct resolve_req *r, const struct dns_rr *dname,
-		       struct dns_name *target)
+                       struct dns_name *target)
 {
 	struct dns_name t;
 	int ret;
@@ -989,12 +989,12 @@ static int synth_cname(struct resolve_req *r, const struct dns_rr *dname,
 	if (ret)
 		return ret;
 	ret = dns_name_dname_subst(r->name.data, r->name.len, dname->owner,
-				   dname->owner_len, t.data, t.len, target);
+	                           dname->owner_len, t.data, t.len, target);
 	if (ret)
 		return ret;
 	r->synth = true;
 	return dns_msg_add_rr(&r->prefix, DNS_S_AN, r->name.data, r->name.len,
-			      DNS_T_CNAME, DNS_C_IN, dname->ttl, target->data, target->len);
+	                      DNS_T_CNAME, DNS_C_IN, dname->ttl, target->data, target->len);
 }
 
 static int scan_dname(struct resolve_req *r, const struct dns_rr *dname)
@@ -1123,7 +1123,7 @@ static bool try_cache(struct resolve_req *r)
 	int rcode;
 
 	if (!o->cache || cache_lookup(o->cache, o->cfg, r->qname.data, r->qname.len,
-				      r->qtype, r->qclass, &r->out))
+	                              r->qtype, r->qclass, &r->out))
 		return false;
 	stats.cache_hits++;
 	rcode = r->out.flags & DNS_F_RCODE;
@@ -1135,7 +1135,7 @@ static bool try_cache(struct resolve_req *r)
 }
 
 struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
-				  resolve_cb cb, void *ctx)
+                                  resolve_cb cb, void *ctx)
 {
 	struct resolve_req *r;
 

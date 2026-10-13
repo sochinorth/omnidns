@@ -58,7 +58,7 @@ typedef int (*svcb_addr_fn)(void *ctx, int family, const uint8_t *in, uint8_t *o
  * Returns 0, -ENOSPC, -EBADMSG, or the callback's error.
  */
 int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
-		       svcb_addr_fn fn, void *ctx, bool drop_v6,
-		       uint8_t *out, size_t cap, uint16_t *outlen);
+                       svcb_addr_fn fn, void *ctx, bool drop_v6,
+                       uint8_t *out, size_t cap, uint16_t *outlen);
 
 #endif

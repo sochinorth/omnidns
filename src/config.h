@@ -85,7 +85,7 @@ struct upstream_set {
  * Returns number of servers parsed (>= 0) or -ENOMEM.
  */
 int resolvconf_parse(const char *text, size_t len,
-		     struct upstream_server *out, int max, int *nskipped);
+                     struct upstream_server *out, int max, int *nskipped);
 
 /* Load a file; NULL with err message when unreadable or has zero servers. */
 struct upstream_set *upstream_set_load(const char *path, char *err, size_t errlen);
@@ -113,8 +113,8 @@ struct ns_pattern {
  * Patterns are allocated in `a`. Returns 0 or -ENOMEM.
  */
 int nameset_parse(const char *text, size_t len, struct arena *a,
-		  struct ns_pattern **out, uint32_t *n, uint32_t *ninvalid,
-		  const char *path);
+                  struct ns_pattern **out, uint32_t *n, uint32_t *ninvalid,
+                  const char *path);
 
 struct nameset_file {
 	char *path;
@@ -210,7 +210,7 @@ struct config {
  * readable message in err.
  */
 struct config *config_load(const char *path, struct nameset_cache *nsc,
-			   char *err, size_t errlen);
+                           char *err, size_t errlen);
 void config_free(struct config *cfg);
 
 /* Shift an unshifted fwmark value into mask; returns 0 if it does not fit

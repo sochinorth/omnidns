@@ -310,7 +310,7 @@ TEST(bulk_100k)
 
 		for (int i = 0; i < PER; i++)
 			o += (size_t)snprintf(text + o, cap - o, "%sd%d.zone%d.com\n",
-					      i % 2 ? "*." : "", i, r);
+			                      i % 2 ? "*." : "", i, r);
 		add_rule(&rs, text);
 	}
 	add_rule(&rs, NULL);
@@ -330,7 +330,7 @@ TEST(bulk_100k)
 		int d = rand() % (PER * 2), r = rand() % NR;
 
 		snprintf(names[i], sizeof(names[i]), "%s.d%d.zone%d.com",
-			 i % 3 ? "www.cdn" : "img", d, r);
+		         i % 3 ? "www.cdn" : "img", d, r);
 	}
 	t0 = now_s();
 	for (int q = 0; q < NQ; q++) {

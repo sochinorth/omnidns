@@ -17,7 +17,7 @@
 /* ---- nft stubs (fakeip needs them; tickets complete immediately) ---- */
 
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-		      const uint8_t *real, uint32_t mark, bool replace)
+                      const uint8_t *real, uint32_t mark, bool replace)
 {
 	return 1;
 }
@@ -28,7 +28,7 @@ uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 }
 
 void nft_set_fail_hook(struct nft_ctx *n, void (*fn)(void *priv, uint64_t ticket, int err),
-		       void *priv)
+                       void *priv)
 {
 }
 
@@ -119,7 +119,7 @@ static struct cache_dep dep(const struct config *cfg, const char *name)
 }
 
 static int ins(struct cache *c, const struct config *cfg, const char *qname, uint32_t life,
-	       struct binding *const *b, uint16_t nb)
+               struct binding *const *b, uint16_t nb)
 {
 	struct cache_dep d = dep(cfg, qname);
 	struct dns_name n = N(qname);
@@ -211,9 +211,9 @@ TEST(limits_e2big)
 		deps[i] = dep(cfg, "a.example");
 	mkresp(&m, "a.example", "1.1.1.1", 60);
 	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 60,
-			      deps, CACHE_MAX_DEPS + 1, NULL, 0), -E2BIG);
+	                      deps, CACHE_MAX_DEPS + 1, NULL, 0), -E2BIG);
 	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 60,
-			      deps, CACHE_MAX_DEPS, NULL, 0), 0);
+	                      deps, CACHE_MAX_DEPS, NULL, 0), 0);
 	CHECK_EQ(cache_count(c), 1);
 	dns_msg_free(&m);
 	cache_free(c);
@@ -316,7 +316,7 @@ TEST(binding_refs)
 	/* invalidation drop */
 	{
 		struct config *c2 = load(HDR "config rule 'n'\n\toption action 'block'\n"
-					 "\tlist nameset '@/n.txt'\n" RULE_FA RULE_ALL);
+		                         "\tlist nameset '@/n.txt'\n" RULE_FA RULE_ALL);
 		uint32_t before = cache_count(c);
 
 		snprintf(name, sizeof(name), "n39.example");

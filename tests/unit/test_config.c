@@ -195,9 +195,9 @@ TEST(validation_errors)
 	EXPECT_ERR("multiple 'omnidns'", GLOBAL "config omnidns 'other'\n" CATCHALL, dir);
 	EXPECT_ERR("listen_addr is required", "config omnidns 'm'\n" CATCHALL, dir);
 	EXPECT_ERR("invalid listen_addr 'lan'",
-		   "config omnidns 'm'\n\tlist listen_addr 'lan'\n" CATCHALL, dir);
+	           "config omnidns 'm'\n\tlist listen_addr 'lan'\n" CATCHALL, dir);
 	EXPECT_ERR("duplicate listen_addr", "config omnidns 'm'\n\tlist listen_addr '::1'\n"
-		   "\tlist listen_addr '::1'\n" CATCHALL, dir);
+	           "\tlist listen_addr '::1'\n" CATCHALL, dir);
 	EXPECT_ERR("invalid port", GLOBAL "\toption port '70000'\n" CATCHALL, dir);
 	EXPECT_ERR("invalid port", GLOBAL "\toption port '0'\n" CATCHALL, dir);
 	EXPECT_ERR("'fwmask'", GLOBAL "\toption fwmask '0'\n" CATCHALL, dir);
@@ -207,9 +207,9 @@ TEST(validation_errors)
 	EXPECT_ERR("block_mode", GLOBAL "\toption block_mode 'drop'\n" CATCHALL, dir);
 	EXPECT_ERR("log_level", GLOBAL "\toption log_level 'loud'\n" CATCHALL, dir);
 	EXPECT_ERR("upstream_total_timeout", GLOBAL "\toption upstream_timeout '6000'\n"
-		   CATCHALL, dir);
+	           CATCHALL, dir);
 	EXPECT_ERR("max_pending_per_client", GLOBAL "\toption max_pending '10'\n"
-		   CATCHALL, dir);
+	           CATCHALL, dir);
 	/* pools */
 	EXPECT_ERR("prefix length", GLOBAL "\toption fakeip_v4 '198.18.0.0/31'\n" CATCHALL, dir);
 	EXPECT_ERR("prefix length", GLOBAL "\toption fakeip_v4 '10.0.0.0/7'\n" CATCHALL, dir);
@@ -220,53 +220,53 @@ TEST(validation_errors)
 	EXPECT_ERR("invalid prefix", GLOBAL "\toption fakeip_v6 '10.0.0.0/8'\n" CATCHALL, dir);
 	EXPECT_ERR("invalid prefix", GLOBAL "\toption fakeip_v6 'fd00::'\n" CATCHALL, dir);
 	EXPECT_ERR("reserved 127.0.0.0/8", GLOBAL "\toption fakeip_v4 '127.16.0.0/12'\n"
-		   CATCHALL, dir);
+	           CATCHALL, dir);
 	EXPECT_ERR("reserved 0.0.0.0/8", GLOBAL "\toption fakeip_v4 '0.0.0.0/16'\n" CATCHALL, dir);
 	EXPECT_ERR("reserved 224.0.0.0/3", GLOBAL "\toption fakeip_v4 '240.0.0.0/8'\n"
-		   CATCHALL, dir);
+	           CATCHALL, dir);
 	EXPECT_ERR("reserved ::ffff:0:0/96", GLOBAL "\toption fakeip_v6 '::ffff:0:0/96'\n"
-		   CATCHALL, dir);
+	           CATCHALL, dir);
 	EXPECT_ERR("reserved ff00::/8", GLOBAL "\toption fakeip_v6 'ff02::/32'\n" CATCHALL, dir);
 	EXPECT_ERR("reserved ::/128", GLOBAL "\toption fakeip_v6 '::/32'\n" CATCHALL, dir);
 	/* rules */
 	EXPECT_ERR("anonymous", GLOBAL "config rule\n\toption action 'block'\n" CATCHALL, dir);
 	EXPECT_ERR("rule 'r': missing option 'action'",
-		   GLOBAL "config rule 'r'\n\tlist nameset '/x'\n" CATCHALL, dir);
+	           GLOBAL "config rule 'r'\n\tlist nameset '/x'\n" CATCHALL, dir);
 	EXPECT_ERR("rule 'r': invalid action 'drop'",
-		   GLOBAL "config rule 'r'\n\toption action 'drop'\n" CATCHALL, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'drop'\n" CATCHALL, dir);
 	EXPECT_ERR("rule 'r': missing option 'upstream'",
-		   GLOBAL "config rule 'r'\n\toption action 'forward'\n\tlist nameset '/x'\n"
-		   CATCHALL, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'forward'\n\tlist nameset '/x'\n"
+	           CATCHALL, dir);
 	EXPECT_ERR("rule 'r': upstream file",
-		   GLOBAL "config rule 'r'\n\toption action 'forward'\n"
-		   "\toption upstream '%s/nope.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'forward'\n"
+	           "\toption upstream '%s/nope.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
 	EXPECT_ERR("no usable nameserver",
-		   GLOBAL "config rule 'r'\n\toption action 'forward'\n"
-		   "\toption upstream '%s/empty.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'forward'\n"
+	           "\toption upstream '%s/empty.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
 	EXPECT_ERR("rule 'r': fakeip requires fakeip_v4",
-		   "config omnidns 'm'\n\tlist listen_addr '127.0.0.1'\n"
-		   "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark '1'\n"
-		   "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
+	           "config omnidns 'm'\n\tlist listen_addr '127.0.0.1'\n"
+	           "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark '1'\n"
+	           "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
 	EXPECT_ERR("rule 'r': fakeip requires option 'fwmark'",
-		   GLOBAL "config rule 'r'\n\toption action 'fakeip'\n"
-		   "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'fakeip'\n"
+	           "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
 	EXPECT_ERR("rule 'r': fwmark '0' must be non-zero",
-		   GLOBAL "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark '0'\n"
-		   "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark '0'\n"
+	           "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
 	EXPECT_ERR("rule 'r': fwmark '0x100'",
-		   GLOBAL "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark '0x100'\n"
-		   "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark '0x100'\n"
+	           "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
 	EXPECT_ERR("rule 'r': invalid fwmark",
-		   GLOBAL "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark 'red'\n"
-		   "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
+	           GLOBAL "config rule 'r'\n\toption action 'fakeip'\n\toption fwmark 'red'\n"
+	           "\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n" CATCHALL, dir, dir);
 	EXPECT_ERR("no catchall", GLOBAL);
 	EXPECT_ERR("no catchall", GLOBAL "config rule 'r'\n\toption action 'block'\n"
-		   "\tlist nameset '/x'\n");
+	           "\tlist nameset '/x'\n");
 	EXPECT_ERR("catchall rule 'all' (no nameset) must be the last rule",
-		   GLOBAL CATCHALL "config rule 'r'\n\toption action 'block'\n"
-		   "\tlist nameset '/x'\n", dir);
+	           GLOBAL CATCHALL "config rule 'r'\n\toption action 'block'\n"
+	           "\tlist nameset '/x'\n", dir);
 	EXPECT_ERR("must be the last rule", GLOBAL CATCHALL
-		   "config rule 'b'\n\toption action 'block'\n", dir);
+	           "config rule 'b'\n\toption action 'block'\n", dir);
 }
 
 TEST(too_many_rules)
@@ -278,7 +278,7 @@ TEST(too_many_rules)
 	o += (size_t)snprintf(t + o, cap - o, GLOBAL);
 	for (int i = 0; i < CONFIG_MAX_RULES; i++)
 		o += (size_t)snprintf(t + o, cap - o, "config rule 'r%d'\n"
-				      "\toption action 'block'\n\tlist nameset '/x'\n", i);
+		                      "\toption action 'block'\n\tlist nameset '/x'\n", i);
 	o += (size_t)snprintf(t + o, cap - o, CATCHALL, dir);
 	c = load_text(t);
 	CHECK(!c);
@@ -325,10 +325,10 @@ TEST(nsc_reuse)
 
 	/* through config_load: unchanged files are shared between configs */
 	c1 = loadf(GLOBAL "config rule 'r'\n\toption action 'block'\n"
-		   "\tlist nameset '%s/ns/r.txt'\n" CATCHALL, dir, dir);
+	           "\tlist nameset '%s/ns/r.txt'\n" CATCHALL, dir, dir);
 	REQUIRE(c1);
 	c3 = loadf(GLOBAL "config rule 'r'\n\toption action 'block'\n"
-		   "\tlist nameset '%s/ns/r.txt'\n" CATCHALL, dir, dir);
+	           "\tlist nameset '%s/ns/r.txt'\n" CATCHALL, dir, dir);
 	REQUIRE(c3);
 	CHECK(c1->rules[0].files[0] == c3->rules[0].files[0]);
 	CHECK_EQ(c1->rules[0].fingerprint, c3->rules[0].fingerprint);
@@ -349,8 +349,8 @@ TEST(unreadable_nameset)
 	wfile("ns/secret.txt", "s.example\n");
 	chmod(P("ns/secret.txt"), 0);
 	c = loadf(GLOBAL "config rule 'r'\n\toption action 'block'\n"
-		  "\tlist nameset '%s/ns/secret.txt'\n\tlist nameset '%s/ns/ads2.txt'\n"
-		  CATCHALL, dir, dir, dir);
+	          "\tlist nameset '%s/ns/secret.txt'\n\tlist nameset '%s/ns/ads2.txt'\n"
+	          CATCHALL, dir, dir, dir);
 	REQUIRE(c);
 	CHECK_EQ(c->rules[0].nfiles, 1);
 	config_free(c);
@@ -377,10 +377,10 @@ TEST(fingerprints)
 
 	/* block_mode affects block rules only */
 	d = loadf(GLOBAL "\toption block_mode 'null'\n"
-		  "config rule 'r'\n\toption action 'fakeip'\n"
-		  "\toption fwmark '1'\n\toption upstream '%s/%s'\n\tlist nameset '/x'\n"
-		  "config rule 'b'\n\toption action 'block'\n\tlist nameset '/x'\n" CATCHALL,
-		  dir, "up1.conf", dir);
+	          "config rule 'r'\n\toption action 'fakeip'\n"
+	          "\toption fwmark '1'\n\toption upstream '%s/%s'\n\tlist nameset '/x'\n"
+	          "config rule 'b'\n\toption action 'block'\n\tlist nameset '/x'\n" CATCHALL,
+	          dir, "up1.conf", dir);
 	REQUIRE(d);
 	CHECK_EQ(a->rules[0].fingerprint, d->rules[0].fingerprint);
 	CHECK(a->rules[1].fingerprint != d->rules[1].fingerprint);
@@ -388,10 +388,10 @@ TEST(fingerprints)
 
 	/* two fakeip rules may share a mark */
 	d = loadf(GLOBAL "config rule 'r'\n\toption action 'fakeip'\n"
-		  "\toption fwmark '1'\n\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n"
-		  "config rule 's'\n\toption action 'fakeip'\n"
-		  "\toption fwmark '1'\n\toption upstream '%s/up2.conf'\n\tlist nameset '/y'\n"
-		  CATCHALL, dir, dir, dir);
+	          "\toption fwmark '1'\n\toption upstream '%s/up1.conf'\n\tlist nameset '/x'\n"
+	          "config rule 's'\n\toption action 'fakeip'\n"
+	          "\toption fwmark '1'\n\toption upstream '%s/up2.conf'\n\tlist nameset '/y'\n"
+	          CATCHALL, dir, dir, dir);
 	REQUIRE(d);
 	CHECK_EQ(d->rules[0].mark, d->rules[1].mark);
 	CHECK(d->rules[0].fingerprint != d->rules[1].fingerprint);

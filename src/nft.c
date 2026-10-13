@@ -159,7 +159,7 @@ static struct nlmsghdr *txn_msg(struct nft_ctx *n, struct txn *t, int type,
 	nbuf_reserve(&t->b, room);
 	t->nmsg++;
 	return nftnl_nlmsg_build_hdr(t->b.p + t->b.len, type, NFPROTO_INET,
-				     flags | NLM_F_ACK, n->seq++);
+	                             flags | NLM_F_ACK, n->seq++);
 }
 
 static void txn_table(struct nft_ctx *n, struct txn *t, int type, uint16_t flags)
@@ -184,7 +184,7 @@ static struct nftnl_chain *chain_new(struct nft_ctx *n, const char *name)
 }
 
 static void txn_chain(struct nft_ctx *n, struct txn *t, int type,
-		      struct nftnl_chain *c)
+                      struct nftnl_chain *c)
 {
 	struct nlmsghdr *nlh;
 
@@ -195,7 +195,7 @@ static void txn_chain(struct nft_ctx *n, struct txn *t, int type,
 }
 
 static void txn_base_chain(struct nft_ctx *n, struct txn *t, const char *name,
-			   const char *type, int hook, int prio)
+                           const char *type, int hook, int prio)
 {
 	struct nftnl_chain *c = chain_new(n, name);
 
@@ -229,12 +229,12 @@ static void txn_set(struct nft_ctx *n, struct txn *t, struct nftnl_set *s)
 }
 
 static void txn_elems(struct nft_ctx *n, struct txn *t, int type,
-		      struct nftnl_set *s, uint32_t nelem)
+                      struct nftnl_set *s, uint32_t nelem)
 {
 	struct nlmsghdr *nlh;
 
 	nlh = txn_msg(n, t, type, type == NFT_MSG_NEWSETELEM ? NLM_F_CREATE : 0,
-		      1024 + (size_t)nelem * 160);
+	              1024 + (size_t)nelem * 160);
 	nftnl_set_elems_nlmsg_build_payload(nlh, s);
 	nbuf_commit(&t->b, nlh);
 }
@@ -274,7 +274,7 @@ static void e_meta(struct nftnl_rule *r, int key, bool set)
 
 	nftnl_expr_set_u32(e, NFTNL_EXPR_META_KEY, key);
 	nftnl_expr_set_u32(e, set ? NFTNL_EXPR_META_SREG : NFTNL_EXPR_META_DREG,
-			   NFT_REG_1);
+	                   NFT_REG_1);
 }
 
 static void e_ct(struct nftnl_rule *r, int key, bool set)
@@ -283,12 +283,12 @@ static void e_ct(struct nftnl_rule *r, int key, bool set)
 
 	nftnl_expr_set_u32(e, NFTNL_EXPR_CT_KEY, key);
 	nftnl_expr_set_u32(e, set ? NFTNL_EXPR_CT_SREG : NFTNL_EXPR_CT_DREG,
-			   NFT_REG_1);
+	                   NFT_REG_1);
 }
 
 /* reg1 = (reg1 & mask) ^ xor */
 static void e_bitwise(struct nftnl_rule *r, const void *mask, const void *xor,
-		      uint32_t len)
+                      uint32_t len)
 {
 	struct nftnl_expr *e = expr(r, "bitwise");
 
@@ -338,7 +338,7 @@ static void mark_chain_name(char *buf, uint32_t v)
 }
 
 static void txn_mark_rules(struct nft_ctx *n, struct txn *t, const char *chain,
-			   uint32_t mask, uint32_t v)
+                           uint32_t mask, uint32_t v)
 {
 	uint32_t keep = ~mask;
 	struct nftnl_rule *r;
@@ -372,13 +372,13 @@ static void set_key_host_endian(struct nftnl_set *s)
 
 	nftnl_udata_put_u32(u, NFTNL_UDATA_SET_KEYBYTEORDER, 1 /* host */);
 	nftnl_set_set_data(s, NFTNL_SET_USERDATA, nftnl_udata_buf_data(u),
-			   nftnl_udata_buf_len(u));
+	                   nftnl_udata_buf_len(u));
 	nftnl_udata_buf_free(u);
 }
 
 /* ct mark & M vmap { V : jump mark_V, ... } via an anonymous constant map */
 static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
-			     const uint32_t *marks, uint32_t nmarks)
+                             const uint32_t *marks, uint32_t nmarks)
 {
 	struct nftnl_set *s = oom(nftnl_set_alloc());
 	uint32_t id = ++n->set_id, zero = 0;
@@ -391,7 +391,7 @@ static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
 	nftnl_set_set_str(s, NFTNL_SET_NAME, "__map%d");
 	nftnl_set_set_u32(s, NFTNL_SET_ID, id);
 	nftnl_set_set_u32(s, NFTNL_SET_FLAGS,
-			  NFT_SET_ANONYMOUS | NFT_SET_CONSTANT | NFT_SET_MAP);
+	                  NFT_SET_ANONYMOUS | NFT_SET_CONSTANT | NFT_SET_MAP);
 	nftnl_set_set_u32(s, NFTNL_SET_KEY_TYPE, TYPE_MARK);
 	nftnl_set_set_u32(s, NFTNL_SET_KEY_LEN, 4);
 	nftnl_set_set_u32(s, NFTNL_SET_DATA_TYPE, NFT_DATA_VERDICT);
@@ -423,7 +423,7 @@ static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
  * load only the prefix bytes, others load the whole address and mask it.
  */
 static struct nftnl_rule *pool_rule(struct nft_ctx *n, const char *chain,
-				    const struct ip_prefix *p)
+                                    const struct ip_prefix *p)
 {
 	struct nftnl_rule *r = rule_new(n, chain);
 	bool v6 = p->family == AF_INET6;
@@ -447,7 +447,7 @@ static struct nftnl_rule *pool_rule(struct nft_ctx *n, const char *chain,
 }
 
 static void txn_dstnat_rules(struct nft_ctx *n, struct txn *t, const char *chain,
-			     const struct ip_prefix *p)
+                             const struct ip_prefix *p)
 {
 	bool v6 = p->family == AF_INET6;
 	uint32_t off = v6 ? 24 : 16, alen = v6 ? 16 : 4;
@@ -470,7 +470,7 @@ static void txn_dstnat_rules(struct nft_ctx *n, struct txn *t, const char *chain
 }
 
 static void txn_reject_rule(struct nft_ctx *n, struct txn *t, const char *chain,
-			    const struct ip_prefix *p)
+                            const struct ip_prefix *p)
 {
 	struct nftnl_rule *r = pool_rule(n, chain, p);
 	struct nftnl_expr *e = expr(r, "reject");
@@ -482,7 +482,7 @@ static void txn_reject_rule(struct nft_ctx *n, struct txn *t, const char *chain,
 }
 
 static void txn_jump_rule(struct nft_ctx *n, struct txn *t, const char *chain,
-			  const char *target)
+                          const char *target)
 {
 	struct nftnl_rule *r = rule_new(n, chain);
 	struct nftnl_expr *e = expr(r, "immediate");
@@ -705,17 +705,17 @@ int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d)
 		txn_mark_chain(n, t, s.fwmask, s.marks[i]);
 	txn_chain(n, t, NFT_MSG_NEWCHAIN, chain_new(n, "restore_marks"));
 	txn_base_chain(n, t, "prerouting_mangle", "filter", NF_INET_PRE_ROUTING,
-		       NF_IP_PRI_MANGLE);
+	               NF_IP_PRI_MANGLE);
 	txn_base_chain(n, t, "output_mangle", "route", NF_INET_LOCAL_OUT,
-		       NF_IP_PRI_MANGLE);
+	               NF_IP_PRI_MANGLE);
 	txn_base_chain(n, t, "prerouting_dstnat", "nat", NF_INET_PRE_ROUTING,
-		       NF_IP_PRI_NAT_DST);
+	               NF_IP_PRI_NAT_DST);
 	txn_base_chain(n, t, "output_dstnat", "nat", NF_INET_LOCAL_OUT,
-		       NF_IP_PRI_NAT_DST);
+	               NF_IP_PRI_NAT_DST);
 	txn_base_chain(n, t, "forward_reject", "filter", NF_INET_FORWARD,
-		       NF_IP_PRI_FILTER - 1);
+	               NF_IP_PRI_FILTER - 1);
 	txn_base_chain(n, t, "output_reject", "filter", NF_INET_LOCAL_OUT,
-		       NF_IP_PRI_FILTER - 1);
+	               NF_IP_PRI_FILTER - 1);
 	txn_jump_rule(n, t, "prerouting_mangle", "restore_marks");
 	txn_jump_rule(n, t, "output_mangle", "restore_marks");
 	txn_policy_rules(n, t, &s);
@@ -964,7 +964,7 @@ static struct nftnl_set_elem *elem_key(const uint8_t *key, uint32_t len)
  * rolled-back batch) can never make later batches fail.
  */
 static void queue_destroy(struct nft_ctx *n, int real, int mark, const uint8_t *fake,
-			  uint32_t alen)
+                          uint32_t alen)
 {
 	append_elem(n, real, NFT_MSG_DESTROYSETELEM, elem_key(fake, alen));
 	append_elem(n, mark, NFT_MSG_DESTROYSETELEM, elem_key(fake, alen));
@@ -1046,7 +1046,7 @@ static bool op_begin(struct nft_ctx *n, int family)
  * for API compatibility.
  */
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-		      const uint8_t *real, uint32_t mark, bool replace)
+                      const uint8_t *real, uint32_t mark, bool replace)
 {
 	bool v6;
 	int rs, ms;
@@ -1088,7 +1088,7 @@ uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 		n->open = batch_new(n);
 	v6 = family == AF_INET6;
 	queue_destroy(n, v6 ? S_REAL6 : S_REAL4, v6 ? S_MARK6 : S_MARK4, fake,
-		  v6 ? 16 : 4);
+	          v6 ? 16 : 4);
 	return op_done(n);
 }
 
@@ -1107,7 +1107,7 @@ bool nft_ticket_done(const struct nft_ctx *n, uint64_t ticket)
 }
 
 void nft_set_fail_hook(struct nft_ctx *n, void (*fn)(void *priv, uint64_t ticket, int err),
-		       void *priv)
+                       void *priv)
 {
 	n->fail_fn = fn;
 	n->fail_priv = priv;

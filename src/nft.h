@@ -91,7 +91,7 @@ int nft_destroy_table(struct nft_ctx *n);
  * Returns the ticket of the batch carrying the op.
  */
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-		      const uint8_t *real, uint32_t mark, bool replace);
+                      const uint8_t *real, uint32_t mark, bool replace);
 uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake);
 
 /* true when the batch `ticket` has been acknowledged (successfully or not). */
@@ -100,7 +100,7 @@ bool nft_ticket_done(const struct nft_ctx *n, uint64_t ticket);
 /* Called for each batch that failed, with its ticket (one-shot registrations
  * not needed: a single global hook, set by the fakeip DB). */
 void nft_set_fail_hook(struct nft_ctx *n, void (*fn)(void *priv, uint64_t ticket, int err),
-		       void *priv);
+                       void *priv);
 
 struct nft_waiter {
 	struct list_head list;

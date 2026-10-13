@@ -49,7 +49,7 @@ static void kern_remove(uint32_t i)
 }
 
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-		      const uint8_t *real, uint32_t mark, bool replace)
+                      const uint8_t *real, uint32_t mark, bool replace)
 {
 	int i = kern_find(family, fake);
 
@@ -92,7 +92,7 @@ uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 }
 
 void nft_set_fail_hook(struct nft_ctx *n, void (*fn)(void *priv, uint64_t ticket, int err),
-		       void *priv)
+                       void *priv)
 {
 	fail_fn = fn;
 	fail_priv = priv;
@@ -163,7 +163,7 @@ static uint8_t *wire(const char *name)
 }
 
 static struct binding *bind4(struct fakeip_db *db, const char *rule, uint32_t mark,
-			     const char *name, uint32_t real, uint32_t ttl, int *err)
+                             const char *name, uint32_t real, uint32_t ttl, int *err)
 {
 	uint8_t r[4];
 	uint8_t *w = wire(name);
@@ -175,7 +175,7 @@ static struct binding *bind4(struct fakeip_db *db, const char *rule, uint32_t ma
 }
 
 static struct binding *bind6(struct fakeip_db *db, const char *rule, uint32_t mark,
-			     const char *name, uint32_t real, uint32_t ttl, int *err)
+                             const char *name, uint32_t real, uint32_t ttl, int *err)
 {
 	uint8_t r[16] = { 0x20, 0x01, 0x0d, 0xb8 };
 	uint8_t *w = wire(name);
@@ -662,7 +662,7 @@ static uint32_t rnd(uint32_t n)
 }
 
 static void check_invariants(struct fakeip_db *db, const struct ip_prefix *p4,
-			     const struct ip_prefix *p6)
+                             const struct ip_prefix *p6)
 {
 	uint32_t it = 0, n = 0, nm = 0, marks[16], seen = 0;
 	struct binding *b;
@@ -716,7 +716,7 @@ TEST(stress)
 
 			snprintf(name, sizeof(name), "N%u.example", rnd(60));
 			b = (rnd(3) ? bind4 : bind6)(db, rules[rnd(3)], 1 + rnd(3), name,
-						    rnd(8), rnd(20), &err);
+			                            rnd(8), rnd(20), &err);
 			if (!b) {
 				CHECK_EQ(err, -ENOSPC);
 				fails++;

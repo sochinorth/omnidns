@@ -133,9 +133,9 @@ bool dns_name_is_under(const uint8_t *name, uint8_t nlen, const uint8_t *zone, u
 }
 
 int dns_name_dname_subst(const uint8_t *qname, uint8_t qlen,
-			 const uint8_t *owner, uint8_t olen,
-			 const uint8_t *target, uint8_t tlen,
-			 struct dns_name *out)
+                         const uint8_t *owner, uint8_t olen,
+                         const uint8_t *target, uint8_t tlen,
+                         struct dns_name *out)
 {
 	size_t plen;
 
@@ -287,9 +287,9 @@ static int rr_reserve(struct dns_msg *m)
 }
 
 static int push_rr(struct dns_msg *m, uint8_t sec,
-		   const uint8_t *owner, uint8_t olen,
-		   uint16_t type, uint16_t cls, uint32_t ttl,
-		   const uint8_t *rdata, uint16_t rdlen)
+                   const uint8_t *owner, uint8_t olen,
+                   uint16_t type, uint16_t cls, uint32_t ttl,
+                   const uint8_t *rdata, uint16_t rdlen)
 {
 	struct dns_rr *rr;
 	uint8_t *p;
@@ -319,9 +319,9 @@ static int push_rr(struct dns_msg *m, uint8_t sec,
 }
 
 int dns_msg_add_rr(struct dns_msg *m, enum dns_section sec,
-		   const uint8_t *owner, uint8_t owner_len,
-		   uint16_t type, uint16_t cls, uint32_t ttl,
-		   const uint8_t *rdata, uint16_t rdlen)
+                   const uint8_t *owner, uint8_t owner_len,
+                   uint16_t type, uint16_t cls, uint32_t ttl,
+                   const uint8_t *rdata, uint16_t rdlen)
 {
 	if ((unsigned)sec > DNS_S_AR || type == DNS_T_OPT)
 		return -EINVAL;
@@ -337,7 +337,7 @@ int dns_msg_add_rr(struct dns_msg *m, enum dns_section sec,
 }
 
 int dns_msg_set_question(struct dns_msg *m, const uint8_t *qname, uint8_t qlen,
-			 uint16_t qtype, uint16_t qclass)
+                         uint16_t qtype, uint16_t qclass)
 {
 	if (dns_name_check(qname, qlen) != qlen)
 		return -EINVAL;
@@ -435,7 +435,7 @@ struct pctx {
  * malformed. Pointers must go strictly backwards (and not into the header).
  */
 static int read_name(const struct pctx *c, size_t *off, size_t lim,
-		     struct dns_name *n)
+                     struct dns_name *n)
 {
 	size_t pos = *off, end = 0;
 	int jumps = 0, outlen = 0;
@@ -540,7 +540,7 @@ static int expand_rdata(const struct pctx *c, const struct rd_layout *lo,
 }
 
 static int parse_opt(struct dns_msg *m, uint8_t sec, const struct dns_name *owner,
-		     uint16_t cls, uint32_t ttl, const uint8_t *rd, uint16_t rdlen)
+                     uint16_t cls, uint32_t ttl, const uint8_t *rd, uint16_t rdlen)
 {
 	size_t off = 0;
 
@@ -689,7 +689,7 @@ static void ctab_truncate(struct bctx *b, int nent)
 }
 
 static int ctab_find(const struct bctx *b, const uint8_t *s, uint8_t slen,
-		     uint32_t h)
+                     uint32_t h)
 {
 	uint16_t i;
 
@@ -827,7 +827,7 @@ static void put_opt(struct bctx *b, const struct dns_edns *e)
 	put16(p + 1, DNS_T_OPT);
 	put16(p + 3, e->udp_size);
 	put32(p + 5, (uint32_t)e->ext_rcode << 24 | (uint32_t)e->version << 16 |
-		     (e->do_bit ? 0x8000u : 0));
+	             (e->do_bit ? 0x8000u : 0));
 	put16(p + 9, 0);
 	b->len += DNS_OPT_LEN;
 }

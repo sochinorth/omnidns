@@ -51,7 +51,7 @@ typedef void (*resolve_cb)(void *ctx, const struct dns_msg *resp);
 /* query: parsed client query (its id/edns are ignored). Callback is never
  * invoked synchronously. */
 struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
-				  resolve_cb cb, void *ctx);
+                                  resolve_cb cb, void *ctx);
 /* No callback after cancel. */
 void resolve_cancel(struct resolve_req *r);
 

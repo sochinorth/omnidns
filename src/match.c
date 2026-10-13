@@ -35,7 +35,7 @@ static bool mnode_eq(const void *val, const void *key, void *ctx)
 }
 
 static struct mnode *mnode_get(const struct match_index *idx, const char *name,
-			       size_t len, uint64_t h)
+                               size_t len, uint64_t h)
 {
 	struct mkey k = { name, len };
 
@@ -113,7 +113,7 @@ void match_free(struct match_index *idx)
 }
 
 static uint16_t probe(const struct match_index *idx, const char *s, size_t len,
-		      bool full, uint16_t best)
+                      bool full, uint16_t best)
 {
 	const struct mnode *n;
 

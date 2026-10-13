@@ -368,13 +368,13 @@ static void fail_hook(void *priv, uint64_t ticket, int err)
 	}
 	if (n)
 		log_warn("fakeip: nft batch %llu failed (%d), dropped %u bindings",
-			 (unsigned long long)ticket, err, n);
+		         (unsigned long long)ticket, err, n);
 }
 
 /* ---- public ---- */
 
 static void set_pools(struct fakeip_db *db, const struct ip_prefix *p4,
-		      const struct ip_prefix *p6)
+                      const struct ip_prefix *p6)
 {
 	db->has4 = p4 != NULL;
 	db->has6 = p6 != NULL;
@@ -385,8 +385,8 @@ static void set_pools(struct fakeip_db *db, const struct ip_prefix *p4,
 }
 
 struct fakeip_db *fakeip_new(const struct ip_prefix *p4, const struct ip_prefix *p6,
-			     uint32_t max_bindings, uint32_t grace,
-			     const uint8_t secret[16], struct nft_ctx *nft)
+                             uint32_t max_bindings, uint32_t grace,
+                             const uint8_t secret[16], struct nft_ctx *nft)
 {
 	struct fakeip_db *db = calloc(1, sizeof(*db));
 
@@ -451,7 +451,7 @@ static uint32_t safe_until_for(const struct fakeip_db *db, uint32_t now, uint32_
  * *victim set to an evictable occupant (or NULL for a free slot), or -ENOSPC.
  */
 static int probe(struct fakeip_db *db, int family, uint64_t khash, uint32_t now,
-		 uint8_t *fake, struct binding **victim)
+                 uint8_t *fake, struct binding **victim)
 {
 	const struct ip_prefix *p = db_pool(db, family);
 	uint64_t usable = pool_usable(p, family), off;
@@ -481,7 +481,7 @@ static uint32_t evict_target(const struct fakeip_db *db)
 }
 
 static int find_slot(struct fakeip_db *db, int family, uint64_t khash, uint32_t now,
-		     uint8_t *fake, struct binding **victim)
+                     uint8_t *fake, struct binding **victim)
 {
 	if (!probe(db, family, khash, now, fake, victim))
 		return 0;
@@ -491,7 +491,7 @@ static int find_slot(struct fakeip_db *db, int family, uint64_t khash, uint32_t 
 }
 
 static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k,
-				      uint64_t khash, uint32_t now, uint32_t ttl, int *err)
+                                      uint64_t khash, uint32_t now, uint32_t ttl, int *err)
 {
 	struct binding *b, *victim;
 	uint8_t fake[16];
@@ -550,8 +550,8 @@ fail:
 }
 
 struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t mark,
-			    const uint8_t *endpoint, uint8_t endpoint_len,
-			    int family, const uint8_t *real, uint32_t ttl, int *err)
+                            const uint8_t *endpoint, uint8_t endpoint_len,
+                            int family, const uint8_t *real, uint32_t ttl, int *err)
 {
 	uint8_t ep[255];
 	struct bkey k = {
@@ -618,7 +618,7 @@ static bool fits_pool(const struct ip_prefix *p, const struct binding *b)
 }
 
 int fakeip_set_config(struct fakeip_db *db, const struct ip_prefix *p4,
-		      const struct ip_prefix *p6, uint32_t max_bindings, uint32_t grace)
+                      const struct ip_prefix *p6, uint32_t max_bindings, uint32_t grace)
 {
 	uint32_t now = omni_now(), it = 0;
 	struct binding *b;

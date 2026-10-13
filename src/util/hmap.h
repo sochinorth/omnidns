@@ -39,10 +39,10 @@ int hmap_reserve(struct hmap *m, uint32_t n);
 void hmap_free(struct hmap *m);	/* frees the table only, not the values */
 
 void *hmap_get(const struct hmap *m, uint64_t hash, const void *key,
-	       hmap_eq_fn eq, void *ctx);
+               hmap_eq_fn eq, void *ctx);
 int hmap_put(struct hmap *m, uint64_t hash, void *val);		/* 0 / -ENOMEM */
 void *hmap_del(struct hmap *m, uint64_t hash, const void *key,
-	       hmap_eq_fn eq, void *ctx);			/* removed val or NULL */
+               hmap_eq_fn eq, void *ctx);			/* removed val or NULL */
 /* Remove exactly this value pointer (identity compare). Returns true if found. */
 bool hmap_del_ptr(struct hmap *m, uint64_t hash, const void *val);
 

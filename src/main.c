@@ -51,7 +51,7 @@ static void add_mark(uint32_t *marks, uint32_t *n, uint32_t m)
  * changes) every mark installed before.
  */
 static int build_desired(const struct config *cfg, struct nft_desired *d, uint32_t *marks,
-			 bool keep_old)
+                         bool keep_old)
 {
 	uint32_t n = 0, i, nb;
 	int r;
@@ -130,8 +130,8 @@ static int reload(void)
 			"configuration", strerror(-ret));
 		/* bindings were allocated inside the old pools: reverting cannot fail */
 		fakeip_set_config(omni.fdb, old->has_pool4 ? &old->pool4 : NULL,
-				  old->has_pool6 ? &old->pool6 : NULL,
-				  old->fakeip_max_bindings, old->fakeip_grace);
+		                  old->has_pool6 ? &old->pool6 : NULL,
+		                  old->fakeip_max_bindings, old->fakeip_grace);
 		goto fail;
 	}
 	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
@@ -145,7 +145,7 @@ static int reload(void)
 	config_free(old);
 	nsc_sweep(&omni.nsc);
 	log_info("configuration reloaded (generation %llu, %u rules)",
-		 (unsigned long long)ncfg->gen, ncfg->nrules);
+	         (unsigned long long)ncfg->gen, ncfg->nrules);
 	return 0;
 
 fail:
@@ -237,9 +237,9 @@ int main(int argc, char **argv)
 	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
 	nkept_marks = d.nmarks;
 	omni.fdb = fakeip_new(omni.cfg->has_pool4 ? &omni.cfg->pool4 : NULL,
-			      omni.cfg->has_pool6 ? &omni.cfg->pool6 : NULL,
-			      omni.cfg->fakeip_max_bindings, omni.cfg->fakeip_grace,
-			      secret, omni.nft);
+	                      omni.cfg->has_pool6 ? &omni.cfg->pool6 : NULL,
+	                      omni.cfg->fakeip_max_bindings, omni.cfg->fakeip_grace,
+	                      secret, omni.nft);
 	omni.cache = cache_new(omni.cfg->cache_size, omni.cfg->cache_max_bytes, omni.fdb);
 	if (!omni.fdb || !omni.cache) {
 		log_err("out of memory");

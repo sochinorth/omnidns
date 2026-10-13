@@ -504,7 +504,7 @@ static struct uloop_fd spoof_fd;
 static int spoof_queries;
 
 static int spoof_build(const struct dns_msg *qm, uint16_t id, const char *qn,
-		       uint8_t *out)
+                       uint8_t *out)
 {
 	struct dns_msg m;
 	struct dns_name n;

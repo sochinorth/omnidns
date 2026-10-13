@@ -185,7 +185,7 @@ size_t cache_bytes(const struct cache *c)
 }
 
 static struct centry *find(struct cache *c, const uint8_t *qname, uint8_t qlen,
-			   uint16_t qtype, uint16_t qclass, uint64_t *hash)
+                           uint16_t qtype, uint16_t qclass, uint64_t *hash)
 {
 	struct ckey k = { .qname = qname, .qlen = qlen, .qtype = qtype, .qclass = qclass };
 
@@ -211,8 +211,8 @@ static bool deps_valid(const struct centry *e, const struct config *cfg)
 }
 
 int cache_lookup(struct cache *c, const struct config *cfg,
-		 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-		 struct dns_msg *out)
+                 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
+                 struct dns_msg *out)
 {
 	uint32_t now = omni_now(), age;
 	struct centry *e;
@@ -286,10 +286,10 @@ static struct centry *entry_new(const uint8_t *qname, uint8_t qlen,
 }
 
 int cache_insert(struct cache *c, const struct config *cfg,
-		 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-		 const struct dns_msg *resp, uint32_t lifetime,
-		 const struct cache_dep *deps, uint16_t ndeps,
-		 struct binding *const *binds, uint16_t nbinds)
+                 const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
+                 const struct dns_msg *resp, uint32_t lifetime,
+                 const struct cache_dep *deps, uint16_t ndeps,
+                 struct binding *const *binds, uint16_t nbinds)
 {
 	struct centry *e, *old;
 	uint64_t h;

@@ -560,7 +560,7 @@ static int build_query(struct exchange *ex)
 }
 
 static struct exchange *ex_new(struct upstream_set *u, const uint8_t *lname,
-			       uint8_t len, uint16_t qtype, uint64_t hash, int *err)
+                               uint8_t len, uint16_t qtype, uint64_t hash, int *err)
 {
 	struct exchange *ex = calloc(1, sizeof(*ex));
 
@@ -602,8 +602,8 @@ void upstream_set_timeouts(uint32_t try_timeout_ms, uint32_t total_timeout_ms)
 }
 
 struct upstream_query *upstream_query(struct upstream_set *u,
-				      const uint8_t *qname, uint8_t qlen, uint16_t qtype,
-				      upstream_cb cb, void *ctx)
+                                      const uint8_t *qname, uint8_t qlen, uint16_t qtype,
+                                      upstream_cb cb, void *ctx)
 {
 	uint8_t lname[DNS_MAX_NAME];
 	struct upstream_query *q;
