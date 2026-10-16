@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: MIT
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter/nf_tables.h>
+#include <libmnl/libmnl.h>
+#include <libnftnl/set.h>
+#include <libnftnl/common.h>
 #include <libubox/uloop.h>
 
 #include "test.h"
@@ -740,6 +746,259 @@ TEST(destroy)
 	CHECK_EQ(nft_destroy_table(n), 0);
 }
 
+/*
+ * ---- wire format of element batches ----
+ *
+ * mnl_socket_sendto() is interposed (this executable's definition wins over
+ * libmnl's for the statically linked nft.o) to capture the async batches.
+ * ref_batch() is a reference encoder built on libnftnl's set-element API,
+ * grouping and chunking elements the way nft.c did before it encoded them
+ * itself: the captured bytes must be identical.
+ */
+static struct {
+	bool on;
+	char *p;
+	size_t len, cap;
+	uint32_t nsend;
+	size_t off[64];		/* start of each captured send */
+} cap;
+
+ssize_t mnl_socket_sendto(const struct mnl_socket *nl, const void *buf, size_t len)
+{
+	static ssize_t (*real_sendto)(const struct mnl_socket *, const void *, size_t);
+
+	if (!real_sendto)
+		*(void **)&real_sendto = dlsym(RTLD_NEXT, "mnl_socket_sendto");
+	if (cap.on && cap.nsend < 64) {
+		if (cap.len + len > cap.cap) {
+			cap.cap = (cap.len + len) * 2;
+			cap.p = realloc(cap.p, cap.cap);
+		}
+		cap.off[cap.nsend++] = cap.len;
+		memcpy(cap.p + cap.len, buf, len);
+		cap.len += len;
+	}
+	return real_sendto(nl, buf, len);
+}
+
+static void cap_start(void)
+{
+	cap.len = 0;
+	cap.nsend = 0;
+	cap.on = true;
+}
+
+static const char *cap_send(uint32_t i, size_t *len)
+{
+	*len = (i + 1 < cap.nsend ? cap.off[i + 1] : cap.len) - cap.off[i];
+	return cap.p + cap.off[i];
+}
+
+struct rop {
+	int fam;		/* 4 or 6 */
+	bool add;
+	uint32_t mark;
+	uint8_t fake[16], real[16];
+};
+
+static const char *const ref_sets[4] = {
+	"fake2real_v4", "fake2mark_v4", "fake2real_v6", "fake2mark_v6",
+};
+
+/* one batch: BEGIN, per phase (destroys, adds) per set chunks of 256, END */
+static size_t ref_batch(char *buf, uint32_t seq, const struct rop *ops, uint32_t nops)
+{
+	size_t len = 0;
+	struct nlmsghdr *nlh;
+
+	nlh = nftnl_batch_begin(buf, seq++);
+	len += MNL_ALIGN(nlh->nlmsg_len);
+	for (int phase = 0; phase < 2; phase++) {
+		for (int s = 0; s < 4; s++) {
+			int fam = s < 2 ? 4 : 6, alen = fam == 4 ? 4 : 16;
+			bool mark = s & 1;
+			struct nftnl_set *set = NULL;
+			uint32_t cnt = 0;
+
+			for (uint32_t i = 0; i <= nops; i++) {
+				const struct rop *o = &ops[i];
+				struct nftnl_set_elem *e;
+				char chain[32];
+
+				if (set && (i == nops || cnt == 256)) {
+					int type = phase ? NFT_MSG_NEWSETELEM : NFT_MSG_DESTROYSETELEM;
+
+					nlh = nftnl_nlmsg_build_hdr(buf + len, type, NFPROTO_INET,
+					        (phase ? NLM_F_CREATE : 0) | NLM_F_ACK, seq++);
+					nftnl_set_elems_nlmsg_build_payload(nlh, set);
+					len += MNL_ALIGN(nlh->nlmsg_len);
+					nftnl_set_free(set);
+					set = NULL;
+					cnt = 0;
+				}
+				if (i == nops)
+					break;
+				if (o->fam != fam || (phase && !o->add))
+					continue;
+				if (!set) {
+					set = nftnl_set_alloc();
+					nftnl_set_set_str(set, NFTNL_SET_TABLE, TABLE);
+					nftnl_set_set_str(set, NFTNL_SET_NAME, ref_sets[s]);
+				}
+				e = nftnl_set_elem_alloc();
+				nftnl_set_elem_set(e, NFTNL_SET_ELEM_KEY, o->fake, alen);
+				if (phase && !mark) {
+					nftnl_set_elem_set(e, NFTNL_SET_ELEM_DATA, o->real, alen);
+				} else if (phase) {
+					snprintf(chain, sizeof(chain), "mark_%08x", o->mark);
+					nftnl_set_elem_set_u32(e, NFTNL_SET_ELEM_VERDICT, NFT_JUMP);
+					nftnl_set_elem_set_str(e, NFTNL_SET_ELEM_CHAIN, chain);
+				}
+				nftnl_set_elem_add(set, e);
+				cnt++;
+			}
+		}
+	}
+	nlh = nftnl_batch_end(buf + len, seq);
+	len += MNL_ALIGN(nlh->nlmsg_len);
+	return len;
+}
+
+static void hexdiff(const char *a, size_t alen, const char *b, size_t blen)
+{
+	size_t i = 0;
+
+	while (i < alen && i < blen && a[i] == b[i])
+		i++;
+	fprintf(stderr, "    batch differs at byte %zu (got %zu bytes, want %zu)\n",
+		i, alen, blen);
+}
+
+/* submit ops (which must fit in one batch), compare the wire bytes */
+static int wire_check(const struct rop *ops, uint32_t nops, uint32_t send)
+{
+	static char want[1 << 20];
+	const struct nlmsghdr *got;
+	size_t glen, wlen;
+
+	got = (const struct nlmsghdr *)cap_send(send, &glen);
+	wlen = ref_batch(want, got->nlmsg_seq, ops, nops);
+	if (glen == wlen && !memcmp(got, want, wlen))
+		return 1;
+	hexdiff((const char *)got, glen, want, wlen);
+	return 0;
+}
+
+static void rop_queue(const struct rop *o)
+{
+	if (o->add)
+		nft_elem_add(n, o->fam, o->fake, o->real, o->mark, false);
+	else
+		nft_elem_del(n, o->fam, o->fake);
+}
+
+static void rop_key(struct rop *o, int fam, uint32_t i)
+{
+	memset(o->fake, 0, sizeof(o->fake));
+	o->fam = fam;
+	if (fam == 4) {
+		o->fake[0] = 198; o->fake[1] = 18;
+		o->fake[2] = (uint8_t)(i >> 8); o->fake[3] = (uint8_t)i;
+	} else {
+		o->fake[0] = 0xfc;
+		o->fake[14] = (uint8_t)(i >> 8); o->fake[15] = (uint8_t)i;
+	}
+}
+
+static const uint32_t wire_marks[] = { 0x01000000, 0x02000000, 0xfe000000 };
+
+TEST(wire_v4v6_all_marks)
+{
+	struct nft_desired d = desired(true, true, wire_marks, 3);
+	struct rop ops[16];
+	uint32_t k = 0;
+	char *o;
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	nfails = 0;
+	for (int fam = 4; fam <= 6; fam += 2) {
+		for (uint32_t m = 0; m < 3; m++) {
+			struct rop *r = &ops[k++];
+
+			rop_key(r, fam, m + 1);
+			r->add = true;
+			r->mark = wire_marks[m];
+			memset(r->real, 0, sizeof(r->real));
+			r->real[0] = 10; r->real[3] = (uint8_t)(m + 1);
+		}
+	}
+	/* destroy + add of one key in the same batch, and a plain destroy */
+	rop_key(&ops[k], 4, 77); ops[k++].add = false;
+	ops[k] = ops[k - 1]; ops[k].add = true; ops[k].mark = 0xfe000000;
+	memcpy(ops[k++].real, "\x0a\x4d\x4d\x4d", 4);
+	rop_key(&ops[k], 6, 78); ops[k++].add = false;
+	cap_start();
+	for (uint32_t i = 0; i < k; i++)
+		rop_queue(&ops[i]);
+	nft_flush(n);
+	cap.on = false;
+	REQUIRE(cap.nsend == 1);
+	CHECK(wire_check(ops, k, 0));
+	CHECK_EQ(nft_drain(n), 0);
+	CHECK_EQ(nfails, 0);
+	o = list_table();
+	CHECK(has(o, "198.18.0.1 : jump mark_01000000"));
+	CHECK(has(o, "198.18.0.3 : jump mark_fe000000"));
+	CHECK(has(o, "198.18.0.77 : jump mark_fe000000"));
+	CHECK(has(o, "198.18.0.77 : 10.77.77.77"));
+	CHECK(has(o, "fc00::2 : jump mark_02000000"));
+	CHECK(has(o, "fc00::3 : a00:3::"));
+	free(o);
+}
+
+/* exactly NFT_BATCH_MAX ops: one batch; one more: a second batch */
+static void wire_burst(uint32_t nops)
+{
+	static struct rop ops[NFT_BATCH_MAX + 1];
+
+	for (uint32_t i = 0; i < nops; i++) {
+		struct rop *r = &ops[i];
+
+		/* mixed families and kinds, > 256 elements in several lists */
+		rop_key(r, i % 3 ? 4 : 6, i);
+		r->add = i % 5 != 0;
+		r->mark = wire_marks[i % 3];
+		memset(r->real, 0, sizeof(r->real));
+		r->real[0] = 10; r->real[2] = (uint8_t)(i >> 8); r->real[3] = (uint8_t)i;
+	}
+	cap_start();
+	for (uint32_t i = 0; i < nops; i++)
+		rop_queue(&ops[i]);
+	nft_flush(n);
+	cap.on = false;
+	REQUIRE(cap.nsend == (nops > NFT_BATCH_MAX ? 2u : 1u));
+	CHECK(wire_check(ops, nops > NFT_BATCH_MAX ? NFT_BATCH_MAX : nops, 0));
+	if (nops > NFT_BATCH_MAX)
+		CHECK(wire_check(ops + NFT_BATCH_MAX, nops - NFT_BATCH_MAX, 1));
+	CHECK_EQ(nft_drain(n), 0);
+	CHECK_EQ(nfails, 0);
+}
+
+TEST(wire_batch_max)
+{
+	struct nft_desired d = desired(true, true, wire_marks, 3);
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	nfails = 0;
+	wire_burst(NFT_BATCH_MAX);
+	/* adds: i % 5 != 0; v4: i % 3 != 0 */
+	CHECK_EQ(count_elems("fake2real_v4"), 546);
+	CHECK_EQ(count_elems("fake2mark_v6"), 273);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	wire_burst(NFT_BATCH_MAX + 1);
+	CHECK_EQ(count_elems("fake2real_v4"), 547);
+}
+
 int main(int argc, char **argv)
 {
 	test_require_netns(argv);
@@ -762,6 +1021,8 @@ int main(int argc, char **argv)
 	RUN(async_big_batch);
 	RUN(async_burst_inflight);
 	RUN(fakeip_failed_batch);
+	RUN(wire_v4v6_all_marks);
+	RUN(wire_batch_max);
 	RUN(packets);
 	RUN(destroy);
 	nft_close(n);
