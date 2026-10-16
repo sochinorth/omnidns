@@ -195,6 +195,7 @@ uint32_t cache_sweep_expired(struct cache *c)
 	if (now == c->swept)
 		return 0;
 	c->swept = now;
+	s3_ghost_trim(&c->s3, now);
 	while ((e = hmap_next(&c->map, &it))) {
 		if (now > e->inserted && now - e->inserted >= e->lifetime) {
 			entry_drop(c, e);

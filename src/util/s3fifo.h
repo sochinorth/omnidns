@@ -11,7 +11,7 @@
  * eviction and pinning support.
  *
  *  - small FIFO (~10% of capacity), main FIFO, ghost FIFO of key hashes
- *    (same length as main).
+ *    (90% of capacity, about the length of main).
  *  - insert: if key hash is in ghost -> main, else -> small.
  *  - hit: s3_touch() bumps freq (saturating at 3). No list movement.
  *  - eviction from small: freq>0 -> move to main (freq reset to 0),
@@ -52,14 +52,17 @@ struct s3fifo {
 	void *priv;
 	/*
 	 * ghost: ring of 32-bit hashes + small open-addressed set over the
-	 * ring. ghost_cap and ghost_set_mask are fixed by the capacity; the
+	 * ring. ghost_cap and ghost_slots are fixed by the capacity; the
 	 * tables themselves are allocated on the first ghost insertion (NULL
-	 * until then, or if that allocation failed).
+	 * until then, if that allocation failed, or after s3_ghost_trim()
+	 * released them).
 	 */
 	uint32_t *ghost_ring;
 	uint32_t ghost_cap, ghost_head, ghost_len;
-	uint32_t *ghost_set;		/* >= 2*ghost_cap slots, 0 = empty */
-	uint32_t ghost_set_mask;
+	uint32_t *ghost_set;		/* ghost_slots slots, 0 = empty */
+	uint32_t ghost_slots;		/* ghost_cap * 4/3 + 1 (<= 75% full) */
+	uint32_t ghost_adds;		/* insertions, for s3_ghost_trim() */
+	uint32_t ghost_seen, ghost_since;
 };
 
 /* Allocates nothing (ghost tables are lazy); always returns 0. */
@@ -81,6 +84,15 @@ void s3_remove(struct s3fifo *s, struct s3_node *n);	/* external unlink, no evic
 
 /* Evict until s3_count() <= target. Returns number evicted. */
 uint32_t s3_evict(struct s3fifo *s, uint32_t target);
+
+/*
+ * Release the ghost once it has recorded nothing for S3_GHOST_IDLE seconds
+ * (no eviction from small: the structure stays below capacity), so a past
+ * burst does not keep it. Call periodically with omni_now(); the ghost is
+ * reallocated by the next eviction, with empty history.
+ */
+#define S3_GHOST_IDLE 600
+void s3_ghost_trim(struct s3fifo *s, uint32_t now);
 
 /*
  * Watermark helper: if count > cap, evict down to cap * 7/8 in one batch.

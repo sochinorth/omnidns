@@ -21,7 +21,23 @@ static inline uint32_t ghost_key(uint32_t hash)
 	return hash ? hash : 1;
 }
 
-/* ghost set: linear probing with backward-shift deletion; may hold duplicates */
+/*
+ * ghost set: linear probing with backward-shift deletion; may hold
+ * duplicates. The table is not a power of two: a hash's home slot is
+ * (h * slots) >> 32, which only needs the probe sequence to wrap at
+ * `slots`. It holds at most ghost_cap hashes in ghost_cap * 4/3 + 1 slots
+ * (at most 75% full; a power of two of at least twice ghost_cap was 27-55%).
+ */
+
+static inline uint32_t ghost_home(const struct s3fifo *s, uint32_t h)
+{
+	return (uint32_t)(((uint64_t)h * s->ghost_slots) >> 32);
+}
+
+static inline uint32_t ghost_next(const struct s3fifo *s, uint32_t i)
+{
+	return ++i == s->ghost_slots ? 0 : i;
+}
 
 static bool ghost_has(const struct s3fifo *s, uint32_t h)
 {
@@ -29,7 +45,7 @@ static bool ghost_has(const struct s3fifo *s, uint32_t h)
 
 	if (!s->ghost_set)
 		return false;
-	for (i = h & s->ghost_set_mask; s->ghost_set[i]; i = (i + 1) & s->ghost_set_mask)
+	for (i = ghost_home(s, h); s->ghost_set[i]; i = ghost_next(s, i))
 		if (s->ghost_set[i] == h)
 			return true;
 	return false;
@@ -39,23 +55,23 @@ static void ghost_set_add(struct s3fifo *s, uint32_t h)
 {
 	uint32_t i;
 
-	for (i = h & s->ghost_set_mask; s->ghost_set[i]; i = (i + 1) & s->ghost_set_mask)
+	for (i = ghost_home(s, h); s->ghost_set[i]; i = ghost_next(s, i))
 		;
 	s->ghost_set[i] = h;
 }
 
 static void ghost_set_del(struct s3fifo *s, uint32_t h)
 {
-	uint32_t mask = s->ghost_set_mask, i, j, k;
+	uint32_t i, j, k;
 
-	for (i = h & mask; s->ghost_set[i] != h; i = (i + 1) & mask)
+	for (i = ghost_home(s, h); s->ghost_set[i] != h; i = ghost_next(s, i))
 		if (!s->ghost_set[i])
 			return;
 	for (j = i;;) {
-		j = (j + 1) & mask;
+		j = ghost_next(s, j);
 		if (!s->ghost_set[j])
 			break;
-		k = s->ghost_set[j] & mask;
+		k = ghost_home(s, s->ghost_set[j]);
 		/* entry at j may stay if its home lies cyclically in (i, j] */
 		if (i <= j ? (i < k && k <= j) : (i < k || k <= j))
 			continue;
@@ -77,14 +93,11 @@ static void ghost_free(struct s3fifo *s)
 /* Size the (not yet allocated) ghost for `cap`: ghost_cap ~ 90% of cap. */
 static void ghost_size(struct s3fifo *s, uint32_t cap)
 {
-	uint32_t gcap = cap - cap / 10, slots = 4;
+	uint32_t gcap = cap - cap / 10 ? cap - cap / 10 : 1;
+	uint64_t slots = (uint64_t)gcap + gcap / 3 + 1;
 
-	if (!gcap)
-		gcap = 1;
-	while (slots < 2 * (uint64_t)gcap)
-		slots <<= 1;
 	s->ghost_cap = gcap;
-	s->ghost_set_mask = slots - 1;
+	s->ghost_slots = slots > UINT32_MAX ? UINT32_MAX : (uint32_t)slots;
 }
 
 /* Record an evicted hash. Never fails: without memory, the ghost is skipped. */
@@ -94,12 +107,13 @@ static void ghost_add(struct s3fifo *s, uint32_t hash)
 
 	if (!s->ghost_ring) {
 		s->ghost_ring = calloc(s->ghost_cap, sizeof(*s->ghost_ring));
-		s->ghost_set = calloc((size_t)s->ghost_set_mask + 1, sizeof(*s->ghost_set));
+		s->ghost_set = calloc(s->ghost_slots, sizeof(*s->ghost_set));
 		if (!s->ghost_ring || !s->ghost_set) {
 			ghost_free(s);
 			return;
 		}
 	}
+	s->ghost_adds++;
 	if (s->ghost_len == s->ghost_cap) {
 		ghost_set_del(s, s->ghost_ring[s->ghost_head]);
 		s->ghost_ring[s->ghost_head] = h;
@@ -109,6 +123,18 @@ static void ghost_add(struct s3fifo *s, uint32_t hash)
 		s->ghost_len++;
 	}
 	ghost_set_add(s, h);
+}
+
+void s3_ghost_trim(struct s3fifo *s, uint32_t now)
+{
+	if (!s->ghost_ring)
+		return;
+	if (s->ghost_adds != s->ghost_seen) {
+		s->ghost_seen = s->ghost_adds;
+		s->ghost_since = now;
+	} else if (now - s->ghost_since >= S3_GHOST_IDLE) {
+		ghost_free(s);
+	}
 }
 
 int s3_init(struct s3fifo *s, uint32_t cap, const struct s3_ops *ops, void *priv)
@@ -122,6 +148,7 @@ int s3_init(struct s3fifo *s, uint32_t cap, const struct s3_ops *ops, void *priv
 	s->ghost_ring = NULL;
 	s->ghost_set = NULL;
 	s->ghost_head = s->ghost_len = 0;
+	s->ghost_adds = s->ghost_seen = s->ghost_since = 0;
 	ghost_size(s, cap);
 	return 0;
 }

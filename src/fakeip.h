@@ -135,7 +135,8 @@ uint32_t fakeip_live_count(struct fakeip_db *db);
  * change, whose old marks they still carry). Returns the number evicted. */
 uint32_t fakeip_evict_expired(struct fakeip_db *db);
 
-/* Evict expired, unreferenced bindings while over the capacity watermark. */
+/* Evict expired, unreferenced bindings while over the capacity watermark;
+ * called periodically (also releases an idle S3-FIFO ghost). */
 void fakeip_maybe_evict(struct fakeip_db *db);
 
 /*

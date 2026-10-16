@@ -770,6 +770,7 @@ void fakeip_maybe_evict(struct fakeip_db *db)
 	/* s3_maybe_evict()'s watermark, through the stall check */
 	if (s3_count(&db->s3) > db->max_bindings)
 		evict_to(db, evict_target(db));
+	s3_ghost_trim(&db->s3, omni_now());
 }
 
 uint32_t fakeip_evict_scans(const struct fakeip_db *db)

@@ -480,7 +480,10 @@ output_reject      (filter, output,     filter-1):  same
   30 s sweep drops expired entries so their bindings become reclaimable.
   Dropping a cache entry never deletes a binding.
 - **Eviction**: an S3-FIFO bounded by entry count and bytes, run in batches
-  down to 7/8 of the limit.
+  down to 7/8 of the limit. Its ghost (the hashes of the last keys evicted
+  from the small queue, 90% of the capacity, in a ring and a set at most
+  75% full: 4 + 5.3 bytes per key) is allocated by the first eviction and
+  released after 10 minutes without one; the binding table's is the same.
 - **Index**: the cache, like the binding table, indexes entries in an
   open-addressing hash map (`util/hmap`, linear probing, tombstones). The
   tombstones that churn leaves behind are purged in place, without

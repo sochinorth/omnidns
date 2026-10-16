@@ -93,7 +93,7 @@ TEST(init_destroy)
 	REQUIRE(s3_init(&s, 1000, &ops, (void *)&s) == 0);
 	CHECK_EQ(s.ghost_cap, 900);
 	CHECK(!s.ghost_ring && !s.ghost_set);
-	CHECK(s.ghost_set_mask + 1 >= 1800);
+	CHECK_EQ(s.ghost_slots, 1201);	/* 900 * 4/3 + 1: at most 75% full */
 	CHECK(s.priv == &s);
 	s3_destroy(&s);
 }
@@ -319,7 +319,7 @@ TEST(set_cap)
 	s3_set_cap(&s, 20);
 	CHECK_EQ(s.cap, 20);
 	CHECK_EQ(s.ghost_cap, 18);
-	CHECK_EQ(s.ghost_set_mask + 1, 64);
+	CHECK_EQ(s.ghost_slots, 25);
 	CHECK(!s.ghost_ring && !s.ghost_set);
 	CHECK_EQ(s.ghost_len, 0);
 	CHECK(!in_ghost(&s, g));
@@ -340,7 +340,7 @@ TEST(set_cap)
 	n = s3_count(&s);
 	s3_set_cap(&s, 300);
 	CHECK_EQ(s.ghost_cap, 270);
-	CHECK_EQ(s.ghost_set_mask + 1, 1024);
+	CHECK_EQ(s.ghost_slots, 361);
 	CHECK(!s.ghost_ring);
 	CHECK_EQ(s3_count(&s), n);
 	CHECK_EQ(s3_maybe_evict(&s), 0);
@@ -376,14 +376,15 @@ TEST(ghost_hash_edges)
 	CHECK(in_ghost(&s, 5 | hi));
 	CHECK(in_ghost(&s, 5));
 	CHECK(!in_ghost(&s, 6));
-	/* all share the home slot in the set (low bits equal) */
+	/* all share the home slot in the set (high bits equal, the home is
+	 * h * slots >> 32), and with 1 and 5 too */
 	for (uint32_t i = 2; i < 8; i++)
-		put(&s, &o[i], 7 + ((uint64_t)i << 24));
+		put(&s, &o[i], 7 + ((uint64_t)i << 8) + ((uint64_t)i << 40));
 	CHECK_EQ(s3_evict(&s, 0), 6);
 	for (uint32_t i = 2; i < 8; i++)
-		CHECK(in_ghost(&s, 7 + ((uint64_t)i << 24)));
+		CHECK(in_ghost(&s, 7 + ((uint64_t)i << 8)));
 	CHECK(!in_ghost(&s, 7));
-	CHECK(!in_ghost(&s, 7 + (9ULL << 24)));
+	CHECK(!in_ghost(&s, 7 + (9ULL << 8)));
 	CHECK_EQ(s.ghost_len, 8);
 	CHECK(!bad_evict);
 	s3_destroy(&s);
@@ -670,6 +671,95 @@ TEST(random_model)
 	s3_destroy(&s);
 }
 
+/* Is ghost_key(h) in the ring? (the reference for the set) */
+static bool in_ring(const struct s3fifo *s, uint32_t h)
+{
+	h = h ? h : 1;
+	for (uint32_t i = 0; i < s->ghost_len; i++)
+		if (s->ghost_ring[(s->ghost_head + i) % s->ghost_cap] == h)
+			return true;
+	return false;
+}
+
+/*
+ * The set answers exactly what the ring holds, through ring wraps
+ * (backward-shift deletions) with long clusters: hashes drawn from a few
+ * narrow bands share home slots, including the last slot (wrap-around).
+ */
+TEST(ghost_model)
+{
+	enum { CAP = 200, N = 400, OPS = 200000 };
+	static struct obj o[N];
+	struct s3fifo s;
+	uint32_t band[4] = { 0, 0x40000000u, 0xfffff000u, 0x7fff0000u };
+
+	reset(o, N);
+	REQUIRE(s3_init(&s, CAP, &ops_nopin, NULL) == 0);
+	for (uint32_t op = 0; op < OPS; op++) {
+		struct obj *x = &o[rnd(N)];
+		uint32_t h = band[rnd(4)] + rnd(4096);
+
+		if (!x->in) {
+			put(&s, x, h);
+			s3_maybe_evict(&s);
+		} else if (rnd(4) == 0) {
+			s3_touch(&x->node);
+		}
+		if (op % 101 == 0 && s.ghost_ring) {
+			uint32_t q = band[rnd(4)] + rnd(4096);
+
+			if (in_ghost(&s, q) != in_ring(&s, q)) {
+				CHECK(0);
+				break;
+			}
+			for (uint32_t i = 0; i < s.ghost_len; i++)
+				if (!in_ghost(&s, s.ghost_ring[i])) {
+					CHECK(0);
+					break;
+				}
+		}
+		if (test_cur_failed)
+			break;
+	}
+	CHECK_EQ(s.ghost_len, s.ghost_cap);
+	CHECK(!bad_evict);
+	s3_evict(&s, 0);
+	s3_destroy(&s);
+}
+
+/* The ghost is released after S3_GHOST_IDLE seconds without insertions. */
+TEST(ghost_trim)
+{
+	struct s3fifo s;
+	struct obj o[4];
+
+	reset(o, 4);
+	REQUIRE(s3_init(&s, 10, &ops, NULL) == 0);
+	s3_ghost_trim(&s, 100);			/* nothing allocated: no-op */
+	CHECK(!s.ghost_ring);
+	put(&s, &o[0], 1);
+	CHECK_EQ(s3_evict(&s, 0), 1);
+	CHECK(s.ghost_ring && in_ghost(&s, 1));
+	s3_ghost_trim(&s, 1000);		/* insertions seen: idle from 1000 */
+	s3_ghost_trim(&s, 1000 + S3_GHOST_IDLE - 1);
+	CHECK(s.ghost_ring && in_ghost(&s, 1));
+	put(&s, &o[1], 2);			/* used again: restarts the clock */
+	CHECK_EQ(s3_evict(&s, 0), 1);
+	s3_ghost_trim(&s, 1000 + S3_GHOST_IDLE);
+	CHECK(s.ghost_ring);
+	s3_ghost_trim(&s, 1000 + 2 * S3_GHOST_IDLE - 1);
+	CHECK(s.ghost_ring && in_ghost(&s, 2));
+	s3_ghost_trim(&s, 1000 + 2 * S3_GHOST_IDLE);
+	CHECK(!s.ghost_ring && !s.ghost_set);
+	CHECK_EQ(s.ghost_len, 0);
+	CHECK(!in_ghost(&s, 1) && !in_ghost(&s, 2));
+	/* reallocated by the next eviction from small */
+	put(&s, &o[2], 3);
+	CHECK_EQ(s3_evict(&s, 0), 1);
+	CHECK(s.ghost_ring && in_ghost(&s, 3) && s.ghost_len == 1);
+	s3_destroy(&s);
+}
+
 int main(void)
 {
 	RUN(init_destroy);
@@ -681,6 +771,8 @@ int main(void)
 	RUN(lazy_ghost);
 	RUN(set_cap);
 	RUN(ghost_hash_edges);
+	RUN(ghost_model);
+	RUN(ghost_trim);
 	RUN(pinned);
 	RUN(pinned_main_small_leftover);
 	RUN(pinned_hot_unpinned);
