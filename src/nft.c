@@ -1090,6 +1090,24 @@ void nft_flush(struct nft_ctx *n)
 	for (int phase = 0; phase < 2; phase++)
 		for (int i = 0; i < S_NUM; i++)
 			ebuf_move(n, &n->ebuf[i * 2 + phase], t);
+	if (!t->nmsg) {
+		/*
+		 * Unreachable today: a batch is opened only by an op that
+		 * queues elements before returning its ticket. Should it
+		 * happen, there is nothing to install and no message to carry
+		 * the ack (t->last_off would be stale): the batch succeeds
+		 * without a send, its waiters (if any) via the ready list.
+		 */
+		struct nft_waiter *w, *tmp;
+
+		list_for_each_entry_safe(w, tmp, &n->waiters, list)
+			if (w->ticket == b->ticket)
+				list_move_tail(&w->list, &n->ready);
+		if (!list_empty(&n->ready))
+			uloop_timeout_set(&n->ready_tmo, 0);
+		batch_free(n, b);
+		return;
+	}
 	/*
 	 * As for control-plane transactions (see ctl_commit()), only the last
 	 * message asks for an ack: the kernel reports a failing message, or a
