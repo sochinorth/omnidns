@@ -609,8 +609,24 @@ cached answers skip revalidation. The log still says
   - router-originated traffic;
   - reload semantics;
   - a garbage-packet flood.
-- **Memory**: `tests/integ/test_mem.py` runs an unsanitized build with 75k
-  synthetic patterns, fills the cache and 20k bindings, reloads, and compares
-  RSS per phase against `tests/integ/mem_baseline.json`.
+- **Memory**: `tests/integ/test_mem.py` runs an unsanitized Release build
+  with 75k synthetic patterns, fills the cache and 20k bindings, then reloads
+  six times, each rebuilding the match table. It fails if RssAnon grows
+  across the reloads, or if absolute RssAnon, VmHWM or the per-phase growth
+  exceed `tests/integ/mem_baseline.json`.
+- **Per-query cost**: `tests/integ/test_perf.py` runs the Release build with
+  an allocation counter preloaded (`tests/integ/mcount.c`). It fills the
+  cache past `cache_size`, then measures allocations and bytes per query for
+  cache hits (which must not reach an upstream), forward, CNAME and fake-IP
+  misses, and blocked names, against `tests/integ/perf_baseline.json`. A case
+  with no allocations in the baseline fails on any allocation. Throughput and
+  latency are printed but not gated.
+- **Gate**: `scripts/gate.sh` runs everything above in one go. It does a
+  clean sanitized build with the unit tests, `test_integ.py` against it, a
+  clean Release build in `build/rel`, then `test_mem.py` and `test_perf.py`
+  against that. It prints the compiler warning count of both builds and stops
+  at the first failure. `--quick` skips the two benchmarks. Re-record the
+  baselines (`--save-baseline`) only from a Release build of a committed
+  tree, and name that commit in the commit message.
 - **Fuzzing**: the DNS parser/builder and the SVCB rewriter have libFuzzer
   targets.
