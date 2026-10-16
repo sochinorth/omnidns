@@ -86,6 +86,8 @@ config rule 'catchall'
 	option upstream '{d}/isp.conf'
 """
 
+NAMESETS = {"ads.txt": "*.ads.test\n", "warp.txt": "*.warp.test\n"}
+
 failures = []
 tests = []
 
@@ -157,18 +159,17 @@ EOF""")
     def cl(self, cmd, check_rc=True):
         return sh("nsenter -t %d -n sh -c %s" % (self.client_pid, sh_quote(cmd)), check_rc)
 
-    def files(self):
+    def files(self, zone=ZONE, namesets=NAMESETS, config=CONFIG):
         d = self.dir
         with open(d + "/zone.json", "w") as f:
-            json.dump(ZONE, f)
+            json.dump(zone, f)
         for name, (ip, port) in UP.items():
             with open("%s/%s.conf" % (d, name), "w") as f:
                 f.write("nameserver %s#%d\n" % (ip, port))
-        with open(d + "/ads.txt", "w") as f:
-            f.write("*.ads.test\n")
-        with open(d + "/warp.txt", "w") as f:
-            f.write("*.warp.test\n")
-        self.write_config(CONFIG)
+        for fname, text in namesets.items():
+            with open("%s/%s" % (d, fname), "w") as f:
+                f.write(text)
+        self.write_config(config)
 
     def write_config(self, text):
         with open(self.dir + "/omnidns", "w") as f:
@@ -484,12 +485,21 @@ def v6_pool_via_reload(env):
           "removing the v6 pool with live v6 bindings must be rejected")
 
 
-def main():
+def enter_netns():
+    """Re-exec the running script under `unshare -rn` (once)."""
     if os.environ.get("OMNI_INTEG_NS") != "1":
         os.environ["OMNI_INTEG_NS"] = "1"
         os.execvp("unshare", ["unshare", "-rn", sys.executable] + sys.argv)
-    binary = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-")
-                             else os.path.join(ROOT, "build/host/omnidns"))
+
+
+def binary_arg(default="build/host/omnidns"):
+    return os.path.abspath(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-")
+                           else os.path.join(ROOT, default))
+
+
+def main():
+    enter_netns()
+    binary = binary_arg()
     only = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else None
     env = Env(binary)
     try:

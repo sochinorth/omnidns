@@ -25,7 +25,10 @@ zone.json:
                    "drop.example.com": "drop",
                    "fail.example.com": "servfail",
                    "refuse.example.com": "refused"},
-     "chase": true}   # follow CNAME/DNAME chains inside the zone (default true)
+     "chase": true,   # follow CNAME/DNAME chains inside the zone (default true)
+     "synth_a": "10.64.0.0/10", "synth_ttl": 3600}
+                      # optional: any name without records answers A with an
+                      # address derived from crc32(name) (NODATA for other types)
 
 Each received query is appended to --log as a JSON line
 {"name":..., "type":..., "proto": "udp"|"tcp"}.
@@ -41,6 +44,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 
 TYPES = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "PTR": 12, "MX": 15, "TXT": 16,
          "AAAA": 28, "SRV": 33, "DNAME": 39, "OPT": 41, "RRSIG": 46, "NSEC": 47,
@@ -284,6 +288,8 @@ class Zone:
                 self.names.add(".".join(parts[i:]))
         self.behaviors = {k.rstrip(".").lower(): v for k, v in spec.get("behaviors", {}).items()}
         self.chase = spec.get("chase", True)
+        self.synth = ipaddress.IPv4Network(spec["synth_a"]) if "synth_a" in spec else None
+        self.synth_ttl = spec.get("synth_ttl", 300)
 
     def find_dname(self, name):
         parts = name.split(".")
@@ -321,9 +327,14 @@ class Zone:
                     return 0, an, []
                 name = new
                 continue
+            if self.synth is not None:
+                if qtype == 1:
+                    ip = self.synth[zlib.crc32(name.encode()) % self.synth.num_addresses]
+                    an.append(enc_rr(name, 1, self.synth_ttl, ip.packed))
+                    return 0, an, []
             soa = enc_rr(name.split(".", 1)[-1] or name, 6, 300,
                          enc_rdata(6, "ns.test. host.test. 1 3600 600 86400 60"))
-            rcode = 0 if (name in self.names or an) else 3
+            rcode = 0 if (name in self.names or an or self.synth is not None) else 3
             return rcode, an, [soa]
         return 2, [], []
 
