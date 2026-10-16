@@ -60,7 +60,16 @@ synchronous netlink exchanges.
 | `nft` | nftables table: chains, maps, async element batches |
 | `cache` | cache of final answers, with dependency revalidation |
 | `dns/wire`, `dns/svcb` | bounded DNS message parser/builder, SVCB rewriting |
-| `util/*` | hash map, SipHash, S3-FIFO, clock |
+| `util/*` | hash map, SipHash, S3-FIFO, clock, object pools |
+
+A cache hit allocates nothing. A miss allocates its cache entry (and, for
+`fakeip`, its new bindings) and nothing else in steady state: per-query
+state (the server's pending query and client counter, the resolver's
+request, the upstream exchange and query) comes from small free lists, and
+the resolver's messages keep their storage across requests. Upstream
+responses are parsed into one message whose storage the request taking it
+over swaps for its own. Each list keeps at most 64 objects and gives back
+those left unused for 5 s, down to 4.
 
 ## Configuration model
 

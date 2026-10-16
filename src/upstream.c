@@ -14,6 +14,7 @@
 #include "upstream.h"
 #include "util/hash.h"
 #include "util/hmap.h"
+#include "util/pool.h"
 #include "util/time.h"
 
 #define UP_EDNS_SIZE		1232
@@ -24,7 +25,8 @@
 struct exchange;
 
 struct upstream_query {
-	struct list_head list;		/* ex->waiters, deferred or delivering */
+	struct list_head list;		/* ex->waiters, deferred or delivering; first:
+					   the pool's link while kept */
 	struct exchange *ex;		/* NULL once detached */
 	upstream_cb cb;
 	void *ctx;
@@ -42,6 +44,7 @@ struct upstream_query {
 #define EX_QNAME_OFF		(EX_MSG_OFF + 12)
 
 struct exchange {
+	void *pool_link;		/* first: the pool's while kept */
 	uint32_t hash;			/* low 32 bits, as kept by hmap */
 	uint8_t qnlen;			/* wire length of the name at qbuf + EX_QNAME_OFF */
 	uint16_t qtype;
@@ -83,6 +86,24 @@ static struct {
 };
 
 static uint8_t rbuf[DNS_MAX_MSG + 1];
+
+/*
+ * Exchanges and queries come from pools: at most 64 ended ones of each are
+ * kept for reuse, 4 once they go unused (util/pool.h). In use: at most
+ * UP_MAX_EXCHANGES exchanges, and one query per pending request.
+ */
+static struct pool ex_pool = POOL_INIT(struct exchange, 64, 4, NULL);
+static struct pool q_pool = POOL_INIT(struct upstream_query, 64, 4, NULL);
+
+/*
+ * Responses are parsed into one message whose storage is kept from one
+ * response to the next; the waiter that takes the message over swaps its
+ * old one in (see upstream_cb), so in steady state parsing allocates
+ * nothing. A response parsed while the message is being delivered (never
+ * expected: callbacks do not run the event loop) uses a message of its own.
+ */
+static struct dns_msg pmsg;
+static bool pmsg_busy;
 
 static void ex_try(struct exchange *ex);
 static void ex_next(struct exchange *ex, int err);
@@ -153,11 +174,25 @@ static bool ex_eq(const void *val, const void *key, void *ctx)
 
 /* ---- callbacks ---- */
 
+static struct upstream_query *q_new(upstream_cb cb, void *ctx)
+{
+	struct upstream_query *q;
+	bool fresh;
+
+	q = pool_get(&q_pool, &fresh);
+	if (!q)
+		return NULL;
+	memset(q, 0, sizeof(*q));
+	q->cb = cb;
+	q->ctx = ctx;
+	return q;
+}
+
 static void fire(struct upstream_query *q, int err, struct dns_msg *m)
 {
 	q->in_cb = true;
 	q->cb(q->ctx, err, m);
-	free(q);
+	pool_put(&q_pool, q);
 }
 
 /*
@@ -196,12 +231,10 @@ static void defer_cb(struct uloop_timeout *t)
 
 static struct upstream_query *defer_err(upstream_cb cb, void *ctx, int err)
 {
-	struct upstream_query *q = calloc(1, sizeof(*q));
+	struct upstream_query *q = q_new(cb, ctx);
 
 	if (!q)
 		return NULL;
-	q->cb = cb;
-	q->ctx = ctx;
 	q->err = err;
 	q->defer.cb = defer_cb;
 	list_add_tail(&q->list, &U.deferred);
@@ -230,7 +263,7 @@ static void ex_free(struct exchange *ex)
 	hmap_del_ptr(&U.map, ex->hash, ex);
 	upstream_set_put(ex->set);
 	U.nex--;
-	free(ex);
+	pool_put(&ex_pool, ex);
 }
 
 /* Detach all waiters, free the exchange, then run the callbacks. */
@@ -291,41 +324,56 @@ static void ex_start_tcp(struct exchange *ex);
  * Returns true if the response was consumed (the exchange may be gone),
  * false if it was ignored as spoofed.
  */
+/* Done with a parsed message (pmsg or one of its own). */
+static void msg_done(struct dns_msg *m)
+{
+	if (m == &pmsg) {
+		dns_msg_recycle(m);
+		pmsg_busy = false;
+	} else {
+		dns_msg_free(m);
+	}
+}
+
 static bool ex_on_resp(struct exchange *ex, const uint8_t *b, size_t len)
 {
-	struct dns_msg m;
+	struct dns_msg own, *m = &pmsg;
 	bool tcp = ex->tcp;
 
 	if (!hdr_ok(ex, b, len))
 		goto spoofed;
-	dns_msg_init(&m);
-	if (dns_parse_query(&m, b, len)) {
-		dns_msg_free(&m);
+	if (pmsg_busy) {
+		dns_msg_init(&own);
+		m = &own;
+	}
+	pmsg_busy = true;
+	if (dns_parse_query(m, b, len)) {
+		msg_done(m);
 		ex_next(ex, -EIO);
 		return true;
 	}
-	if (!q_ok(ex, &m)) {
-		dns_msg_free(&m);
+	if (!q_ok(ex, m)) {
+		msg_done(m);
 		goto spoofed;
 	}
-	if (dns_parse(&m, b, len)) {
-		dns_msg_free(&m);
+	if (dns_parse(m, b, len)) {
+		msg_done(m);
 		ex_next(ex, -EIO);
 		return true;
 	}
-	if ((m.flags & DNS_F_TC) && !tcp) {
-		dns_msg_free(&m);
+	if ((m->flags & DNS_F_TC) && !tcp) {
+		msg_done(m);
 		ex_start_tcp(ex);
-	} else if (m.flags & DNS_F_TC) {
+	} else if (m->flags & DNS_F_TC) {
 		/* truncated even over TCP: never deliver (or cache) a partial answer */
-		dns_msg_free(&m);
+		msg_done(m);
 		ex_next(ex, -EIO);
-	} else if (rcode_fail(dns_msg_rcode(&m))) {
-		dns_msg_free(&m);
+	} else if (rcode_fail(dns_msg_rcode(m))) {
+		msg_done(m);
 		ex_next(ex, -EIO);
 	} else {
-		ex_finish(ex, 0, &m);
-		dns_msg_free(&m);
+		ex_finish(ex, 0, m);
+		msg_done(m);
 	}
 	return true;
 spoofed:
@@ -607,15 +655,18 @@ static int build_query(struct exchange *ex, const uint8_t *lname, uint8_t len)
 static struct exchange *ex_new(struct upstream_set *u, const uint8_t *lname,
                                uint8_t len, uint16_t qtype, uint64_t hash, int *err)
 {
-	struct exchange *ex = calloc(1, sizeof(*ex));
+	struct exchange *ex;
+	bool fresh;
 
 	*err = -ENOMEM;
+	ex = pool_get(&ex_pool, &fresh);
 	if (!ex)
 		return NULL;
+	memset(ex, 0, sizeof(*ex));
 	ex->qtype = qtype;
 	*err = build_query(ex, lname, len);
 	if (*err || (*err = hmap_put(&U.map, hash, ex))) {
-		free(ex);
+		pool_put(&ex_pool, ex);
 		return NULL;
 	}
 	ex->hash = (uint32_t)hash;
@@ -671,15 +722,13 @@ struct upstream_query *upstream_query(struct upstream_set *u,
 		if (!ex)
 			return defer_err(cb, ctx, err);
 	}
-	q = calloc(1, sizeof(*q));
+	q = q_new(cb, ctx);
 	if (!q) {
 		if (!ex->nwait)
 			ex_free(ex);
 		return NULL;
 	}
 	q->ex = ex;
-	q->cb = cb;
-	q->ctx = ctx;
 	list_add_tail(&q->list, &ex->waiters);
 	ex->nwait++;
 	return q;
@@ -694,7 +743,7 @@ void upstream_cancel(struct upstream_query *q)
 	ex = q->ex;
 	list_del(&q->list);
 	uloop_timeout_cancel(&q->defer);
-	free(q);
+	pool_put(&q_pool, q);
 	if (ex && --ex->nwait == 0)
 		ex_free(ex);
 }
@@ -707,7 +756,7 @@ static void free_queries(struct list_head *h)
 		list_del_init(&q->list);
 		uloop_timeout_cancel(&q->defer);
 		if (!q->in_cb)
-			free(q);
+			pool_put(&q_pool, q);
 	}
 }
 
@@ -724,6 +773,10 @@ void upstream_shutdown(void)
 	free_queries(&U.deferred);
 	free_queries(&U.delivering);
 	hmap_free(&U.map);
+	pool_drain(&q_pool);
+	pool_drain(&ex_pool);
+	if (!pmsg_busy)
+		dns_msg_free(&pmsg);
 }
 
 const struct upstream_stats *upstream_get_stats(void)

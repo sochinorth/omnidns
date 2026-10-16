@@ -35,8 +35,11 @@ struct upstream_query;
 
 /*
  * resp is valid only during the callback, but it belongs to this caller
- * alone: the callback may take it over by moving it out (`*mine = *resp;
- * dns_msg_init(resp);`). Whatever is left in it is freed after the callback.
+ * alone: the callback may take it over, preferably by swapping it with an
+ * empty message of its own (dns_msg_swap(), so that the storage of that one
+ * is reused for a later response), or by moving it out (`*mine = *resp;
+ * dns_msg_init(resp);`). Whatever is left in it is reset or freed after the
+ * callback.
  */
 typedef void (*upstream_cb)(void *ctx, int err, struct dns_msg *resp);
 

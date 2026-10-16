@@ -20,6 +20,7 @@
 #include "server.h"
 #include "util/hash.h"
 #include "util/hmap.h"
+#include "util/pool.h"
 
 #define UDP_BUDGET		64	/* datagrams per wakeup */
 #define TCP_IDLE_MS		10000
@@ -75,8 +76,13 @@ struct tcp_conn {
 	bool read_closed;
 };
 
+/*
+ * A pending query. The question is not kept: the answer resolve delivers
+ * carries the query's question bytes (case as sent) at offset 12.
+ */
 struct creq {
-	struct list_head list;		/* all_reqs or conn->reqs */
+	struct list_head list;		/* all_reqs or conn->reqs; first: the pool's
+					   link while kept */
 	struct omni *o;
 	struct resolve_req *rr;
 	struct client_cnt *cc;
@@ -90,7 +96,6 @@ struct creq {
 	bool have_local;
 	uint16_t id;
 	uint16_t rdcd;			/* RD|CD bits copied from the query */
-	struct dns_name qname;
 	bool edns;
 	uint16_t udp_size;
 };
@@ -105,6 +110,15 @@ static uint16_t cur_port;
 static uint32_t n_conns;
 static uint8_t udp_buf[65536];
 static uint8_t out_buf[65536];
+
+/*
+ * Pending queries and per-client counters come from pools: at most 64 ended
+ * queries (a UDP read pass takes up to UDP_BUDGET) and 32 counters are kept
+ * for reuse, 4 of each once they go unused (util/pool.h). Pending ones are
+ * bounded by max_pending.
+ */
+static struct pool creq_pool = POOL_INIT(struct creq, UDP_BUDGET, 4, NULL);
+static struct pool client_pool = POOL_INIT(struct client_cnt, 32, 4, NULL);
 
 const struct server_stats *server_get_stats(void)
 {
@@ -152,14 +166,16 @@ static struct client_cnt *client_acquire(const struct sockaddr_storage *peer)
 	h = omni_hash(&key.family, CLIENT_KEY_LEN);
 	c = hmap_get(&clients, h, &key, client_eq, NULL);
 	if (!c) {
-		c = calloc(1, sizeof(*c));
+		bool fresh;
+
+		c = pool_get(&client_pool, &fresh);
 		if (!c)
 			return NULL;
 		*c = key;
 		c->hash = (uint32_t)h;
 		c->n = 0;
 		if (hmap_put(&clients, h, c)) {
-			free(c);
+			pool_put(&client_pool, c);
 			return NULL;
 		}
 	}
@@ -176,7 +192,7 @@ static void client_release(struct client_cnt *c)
 	if (--c->n)
 		return;
 	hmap_del_ptr(&clients, c->hash, c);	/* hmap only uses the low 32 bits */
-	free(c);
+	pool_put(&client_pool, c);
 }
 
 static void listener_put(struct listener *l)
@@ -299,18 +315,21 @@ static void tcp_update_events(struct tcp_conn *c);
 static void creq_done(void *ctx, const uint8_t *msg, size_t mlen)
 {
 	struct creq *q = ctx;
-	int len;
+	int qlen = mlen > 12 ? dns_name_check(msg + 12, mlen - 12) : -EBADMSG;
+	int len = -EINVAL;
 
 	q->rr = NULL;
 	if (q->conn) {
 		q->conn->inflight--;
-		len = render(msg, mlen, 0, q->id, q->rdcd, q->qname.data, q->qname.len, q->edns,
-		             out_buf, sizeof(out_buf));
+		if (qlen > 0)
+			len = render(msg, mlen, 0, q->id, q->rdcd, msg + 12, (uint8_t)qlen,
+			             q->edns, out_buf, sizeof(out_buf));
 		if (len > 0)
 			tcp_send(q->conn, out_buf, len);
 	} else {
-		len = render(msg, mlen, 0, q->id, q->rdcd, q->qname.data, q->qname.len, q->edns,
-		             out_buf, udp_limit(q->edns, q->udp_size));
+		if (qlen > 0)
+			len = render(msg, mlen, 0, q->id, q->rdcd, msg + 12, (uint8_t)qlen,
+			             q->edns, out_buf, udp_limit(q->edns, q->udp_size));
 		if (len > 0)
 			udp_send(q->udp_fd, &q->peer, q->peerlen, &q->local, q->have_local,
 			         q->ifindex, out_buf, len);
@@ -320,14 +339,14 @@ static void creq_done(void *ctx, const uint8_t *msg, size_t mlen)
 	if (q->conn) {
 		struct tcp_conn *c = q->conn;
 
-		free(q);
+		pool_put(&creq_pool, q);
 		if (c->read_closed && !c->inflight && list_empty(&c->outq))
 			tcp_close(c);
 		else
 			tcp_update_events(c);
 		return;
 	}
-	free(q);
+	pool_put(&creq_pool, q);
 }
 
 static void creq_free(struct creq *q)
@@ -336,7 +355,7 @@ static void creq_free(struct creq *q)
 		resolve_cancel(q->rr);
 	list_del(&q->list);
 	creq_release(q);
-	free(q);
+	pool_put(&creq_pool, q);
 }
 
 /*
@@ -353,6 +372,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 	struct creq *q;
 	struct client_cnt *cc;
 	int ret, rcode = -1;
+	bool fresh;
 
 	if (len < 12 || (buf[2] & 0x80))
 		return 0;			/* no header or a response: drop */
@@ -405,7 +425,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 			ret = 0;
 		goto out;
 	}
-	q = malloc(sizeof(*q));
+	q = pool_get(&creq_pool, &fresh);
 	if (!q) {
 		client_release(cc);
 		ret = 0;
@@ -417,8 +437,6 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 		q->lst->refcnt++;
 	q->id = m.id;
 	q->rdcd = m.flags & (DNS_F_RD | DNS_F_CD);
-	memcpy(q->qname.data, dns_msg_qname(&m), m.qlen);
-	q->qname.len = m.qlen;
 	q->edns = m.edns.present;
 	q->udp_size = m.edns.udp_size;
 	list_add_tail(&q->list, reqs);
@@ -431,7 +449,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 			q->conn->inflight--;
 		list_del(&q->list);
 		creq_release(q);
-		free(q);
+		pool_put(&creq_pool, q);
 		ret = build_error(buf, len, DNS_R_SERVFAIL, &m, m.edns.present, reply, reply_cap);
 		goto out;
 	}
@@ -892,6 +910,8 @@ void server_stop(void)
 	list_for_each_entry_safe(q, qtmp, &udp_reqs, list)
 		creq_free(q);
 	while ((v = hmap_next(&clients, &it)))
-		free(v);
+		pool_put(&client_pool, v);
 	hmap_free(&clients);
+	pool_drain(&creq_pool);
+	pool_drain(&client_pool);
 }

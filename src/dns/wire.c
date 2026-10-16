@@ -230,6 +230,18 @@ void dns_msg_reset(struct dns_msg *m)
 	m->buf_len = 0;
 }
 
+/* what dns_msg_recycle() keeps: a few kilobytes, for a handful of records */
+#define KEEP_BUF	2048
+#define KEEP_RRS	32
+
+void dns_msg_recycle(struct dns_msg *m)
+{
+	if (m->buf_ext || m->buf_cap > KEEP_BUF || m->rr_cap > KEEP_RRS)
+		dns_msg_free(m);
+	else
+		dns_msg_reset(m);
+}
+
 /*
  * Grow the buffer to hold `extra` more bytes. RR pointers are rebased onto
  * the new allocation while the old one is still valid (the question is

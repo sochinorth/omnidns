@@ -15,15 +15,19 @@
 #include "omnidns.h"
 #include "resolve.h"
 #include "upstream.h"
+#include "util/pool.h"
 
 #define PTR_TTL		60
 #define DNS_R_YXDOMAIN	6
 
+#define RULE_ID_INLINE	48
+
 struct latch {
 	bool on;
-	char *rule_id;
+	char *rule_id;			/* id_buf, or allocated when longer */
 	uint32_t mark;
 	struct upstream_set *up;
+	char id_buf[RULE_ID_INLINE];
 };
 
 #define DEPS_INLINE	128
@@ -33,8 +37,13 @@ struct dep_memo {
 	uint16_t rule;			/* index in the config of gen0 */
 };
 
+/*
+ * Requests come from a pool (see req_get()): a request that ended keeps its
+ * three messages' storage and its bindings array for the next one, so that
+ * a typical miss allocates none of them. Everything else is zeroed.
+ */
 struct resolve_req {
-	struct omni *o;
+	struct omni *o;			/* first: the pool's link while kept */
 	resolve_cb cb;
 	void *ctx;
 	struct uloop_timeout defer;
@@ -317,6 +326,49 @@ static uint32_t lifetime_of(const struct config *cfg, const struct dns_msg *m, i
 
 /* ---- request lifecycle ---- */
 
+/* Free what a kept request keeps (when the pool lets it go). */
+static void req_release(void *p)
+{
+	struct resolve_req *r = p;
+
+	dns_msg_free(&r->resp);
+	dns_msg_free(&r->prefix);
+	dns_msg_free(&r->out);
+	free(r->binds);
+}
+
+/*
+ * At most 64 ended requests are kept (a burst: a UDP read pass starts up to
+ * 64), with up to a few KB of message storage each, and 4 once they go
+ * unused (util/pool.h); requests in flight are bounded by max_pending.
+ */
+static struct pool req_pool = POOL_INIT(struct resolve_req, 64, 4, req_release);
+
+static struct resolve_req *req_get(void)
+{
+	struct dns_msg resp, prefix, out;
+	struct binding **binds;
+	uint16_t binds_cap;
+	struct resolve_req *r;
+	bool fresh;
+
+	r = pool_get(&req_pool, &fresh);
+	if (!r || fresh)
+		return r;
+	resp = r->resp;
+	prefix = r->prefix;
+	out = r->out;
+	binds = r->binds;
+	binds_cap = r->binds_cap;
+	memset(r, 0, sizeof(*r));
+	r->resp = resp;
+	r->prefix = prefix;
+	r->out = out;
+	r->binds = binds;
+	r->binds_cap = binds_cap;
+	return r;
+}
+
 static void req_free(struct resolve_req *r)
 {
 	uint16_t i;
@@ -327,16 +379,16 @@ static void req_free(struct resolve_req *r)
 	uloop_timeout_cancel(&r->defer);
 	for (i = 0; i < r->nbinds; i++)
 		fakeip_unref(r->o->fdb, r->binds[i]);
-	free(r->binds);
-	free(r->latch.rule_id);
+	if (r->latch.rule_id != r->latch.id_buf)
+		free(r->latch.rule_id);
 	upstream_set_put(r->latch.up);
 	upstream_set_put(r->cur_up);
-	dns_msg_free(&r->resp);
-	dns_msg_free(&r->prefix);
-	dns_msg_free(&r->out);
+	dns_msg_recycle(&r->resp);
+	dns_msg_recycle(&r->prefix);
+	dns_msg_recycle(&r->out);
 	if (r->deps != r->deps_inline)
 		free(r->deps);
-	free(r);
+	pool_put(&req_pool, r);
 }
 
 static void out_init(struct resolve_req *r, int rcode);
@@ -683,16 +735,16 @@ static bool can_pass_through(struct resolve_req *r)
 
 /*
  * The response becomes the answer: moved, not copied (nothing reads r->resp
- * after this). Only the header is ours: id 0, no OPT (which also drops an
- * extended rcode), our flags (AA and AD cleared) and the client's question.
+ * after this; it is left empty, with the storage out had). Only the header
+ * is ours: id 0, no OPT (which also drops an extended rcode), our flags (AA
+ * and AD cleared) and the client's question.
  */
 static int pass_through(struct resolve_req *r)
 {
 	int rcode = r->resp.flags & DNS_F_RCODE;
 
-	dns_msg_free(&r->out);
-	r->out = r->resp;
-	dns_msg_init(&r->resp);
+	dns_msg_swap(&r->out, &r->resp);
+	dns_msg_reset(&r->resp);
 	memset(&r->out.edns, 0, sizeof(r->out.edns));
 	r->out.id = 0;
 	r->out.flags = DNS_F_QR | DNS_F_RA | r->rd;
@@ -1023,10 +1075,12 @@ static void upstream_done(void *ctx, int err, struct dns_msg *resp)
 		servfail(r);
 		return;
 	}
-	/* take the message over; nothing references the previous one */
-	dns_msg_free(&r->resp);
-	r->resp = *resp;
-	dns_msg_init(resp);
+	/*
+	 * take the message over; nothing references the previous one, whose
+	 * storage the upstream client may reuse for its next response
+	 */
+	dns_msg_reset(&r->resp);
+	dns_msg_swap(&r->resp, resp);
 	r->nresp++;
 	walk(r, true);
 }
@@ -1041,9 +1095,12 @@ static void query(struct resolve_req *r)
 
 static int latch_set(struct resolve_req *r, const struct rule *rule)
 {
-	r->latch.rule_id = strdup(rule->id);
+	size_t n = strlen(rule->id) + 1;
+
+	r->latch.rule_id = n <= sizeof(r->latch.id_buf) ? r->latch.id_buf : malloc(n);
 	if (!r->latch.rule_id)
 		return -ENOMEM;
+	memcpy(r->latch.rule_id, rule->id, n);
 	r->latch.on = true;
 	r->latch.mark = rule->mark;
 	set_up(&r->latch.up, rule->up);
@@ -1249,7 +1306,7 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 
 	if (!query->has_q)
 		return NULL;
-	r = calloc(1, sizeof(*r));
+	r = req_get();
 	if (!r)
 		return NULL;
 	stats.requests++;
@@ -1267,9 +1324,6 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 	r->name = r->qname;
 	r->deps = r->deps_inline;
 	r->dcap = sizeof(r->deps_inline);
-	dns_msg_init(&r->resp);
-	dns_msg_init(&r->prefix);
-	dns_msg_init(&r->out);
 
 	if (r->qtype == DNS_T_ANY)
 		finish_rcode(r, DNS_R_NOTIMP);

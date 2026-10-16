@@ -1060,6 +1060,38 @@ TEST(question_storage)
 	dns_msg_free(&moved);
 }
 
+/* Recycling keeps small storage for reuse and frees large storage. */
+TEST(recycle)
+{
+	static uint8_t rd[3000];
+	struct dns_msg m, other;
+	const uint8_t *b;
+	struct pkt p;
+
+	dns_msg_init(&m);
+	build_cname_resp(&p);
+	REQUIRE(parse(&m, &p) == 0);
+	b = m.buf;
+	dns_msg_recycle(&m);
+	CHECK(m.buf == b && m.rr && !m.nrr && !m.buf_len && !m.has_q);
+	/* reused by the next parse without moving */
+	REQUIRE(parse(&m, &p) == 0);
+	CHECK(m.buf == b);
+	/* swapped away and back, storage and all */
+	dns_msg_init(&other);
+	dns_msg_swap(&m, &other);
+	CHECK(!m.buf && other.buf == b && other.nrr == 2);
+	CHECK(!memcmp(dns_msg_qname(&other), "\x03www", 4));
+	dns_msg_swap(&m, &other);
+	/* large storage is not kept */
+	REQUIRE(dns_msg_add_rr(&m, DNS_S_AR, (const uint8_t *)"\1a", 3, DNS_T_TXT, DNS_C_IN, 1,
+	                       rd, sizeof(rd)) == 0);
+	dns_msg_recycle(&m);
+	CHECK(!m.buf && !m.rr && !m.buf_cap);
+	dns_msg_free(&m);
+	dns_msg_free(&other);
+}
+
 /* Caller storage: a query parses without allocating; growth moves to the heap. */
 TEST(caller_storage)
 {
@@ -1256,6 +1288,7 @@ int main(void)
 	RUN(copy_compact);
 	RUN(question_storage);
 	RUN(caller_storage);
+	RUN(recycle);
 	RUN(growth_rebase);
 	RUN(rcode_and_types);
 	RUN(build_reuse);

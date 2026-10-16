@@ -162,6 +162,20 @@ void dns_msg_init(struct dns_msg *m);
 void dns_msg_init_buf(struct dns_msg *m, uint8_t *buf, uint32_t cap);
 void dns_msg_free(struct dns_msg *m);
 void dns_msg_reset(struct dns_msg *m);		/* drop RRs/storage, keep allocation */
+/*
+ * Reset for reuse, keeping the storage unless it is larger than a typical
+ * response needs (then it is freed): for messages kept across requests.
+ */
+void dns_msg_recycle(struct dns_msg *m);
+
+/* Exchange two messages, storage included (neither may use caller storage). */
+static inline void dns_msg_swap(struct dns_msg *a, struct dns_msg *b)
+{
+	struct dns_msg t = *a;
+
+	*a = *b;
+	*b = t;
+}
 
 /*
  * Parse a full message. Accepts both queries and responses.
