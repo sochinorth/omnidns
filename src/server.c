@@ -194,14 +194,15 @@ static int build_reply(const struct creq *q, const struct dns_msg *resp,
                        uint8_t *buf, size_t maxlen)
 {
 	struct dns_msg m;
-	int ret;
+	int ret, rcode;
 
-	dns_msg_init(&m);
+	/* Shallow copy: only the inline header/question/EDNS fields of m are
+	 * modified below; rr[] and buf stay borrowed from resp (read-only via
+	 * dns_build) and must not be freed here. */
 	if (resp) {
-		ret = dns_msg_copy(&m, resp);
-		if (ret)
-			goto out;
+		m = *resp;
 	} else {
+		dns_msg_init(&m);
 		m.flags = DNS_R_SERVFAIL;
 	}
 	m.id = q->id;
@@ -209,21 +210,15 @@ static int build_reply(const struct creq *q, const struct dns_msg *resp,
 	          DNS_F_QR | DNS_F_RA | q->rdcd;
 	ret = dns_msg_set_question(&m, q->qname.data, q->qname.len, q->qtype, q->qclass);
 	if (ret)
-		goto out;
-	{
-		int rcode = dns_msg_rcode(&m);
-
-		memset(&m.edns, 0, sizeof(m.edns));
-		if (q->edns) {
-			m.edns.present = true;
-			m.edns.udp_size = EDNS_MAX_UDP;
-		}
-		dns_msg_set_rcode(&m, rcode);
+		return ret;
+	rcode = dns_msg_rcode(&m);
+	memset(&m.edns, 0, sizeof(m.edns));
+	if (q->edns) {
+		m.edns.present = true;
+		m.edns.udp_size = EDNS_MAX_UDP;
 	}
-	ret = dns_build(&m, buf, maxlen);
-out:
-	dns_msg_free(&m);
-	return ret;
+	dns_msg_set_rcode(&m, rcode);
+	return dns_build(&m, buf, maxlen);
 }
 
 /* Minimal error reply when only the raw header (and maybe question) is known. */
