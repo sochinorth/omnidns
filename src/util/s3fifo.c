@@ -10,14 +10,11 @@ enum {
 };
 
 /*
- * Ghost hashes are 32 bits: the 64-bit key hash folded in half. A false
+ * Ghost hashes are 32 bits: the low half of the 64-bit key hash, the same
+ * bits util/hmap keeps, so owners may pass n->hash back to hmap. A false
  * ghost hit only places a new node in main instead of small. 0 marks an
  * empty set slot, so hash 0 is stored as 1 (0 and 1 alias in the ghost).
  */
-static inline uint32_t fold_hash(uint64_t hash)
-{
-	return (uint32_t)(hash ^ (hash >> 32));
-}
 
 static inline uint32_t ghost_key(uint32_t hash)
 {
@@ -153,7 +150,7 @@ void s3_set_cap(struct s3fifo *s, uint32_t cap)
 
 void s3_insert(struct s3fifo *s, struct s3_node *n, uint64_t hash)
 {
-	n->hash = fold_hash(hash);
+	n->hash = (uint32_t)hash;
 	n->freq = 0;
 	if (ghost_has(s, ghost_key(n->hash))) {
 		n->queue = S3_Q_MAIN;

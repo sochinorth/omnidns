@@ -29,7 +29,7 @@
 
 struct s3_node {
 	struct list_head list;
-	uint32_t hash;		/* folded key hash, for the ghost queue */
+	uint32_t hash;		/* low 32 bits of the key hash (= what hmap stores) */
 	uint8_t freq;
 	uint8_t queue;		/* internal: S3_Q_* */
 };

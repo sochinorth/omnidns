@@ -370,11 +370,12 @@ TEST(ghost_hash_edges)
 	CHECK(in_ghost(&s, 0));
 	CHECK(in_ghost(&s, 1));
 	CHECK(!in_ghost(&s, 2));
-	/* differ only in the high 32 bits: still distinct after folding */
+	/* only the low 32 bits are kept: high bits alone do not distinguish */
 	put(&s, &o[1], 5 | hi);
 	CHECK_EQ(s3_evict(&s, 0), 1);
 	CHECK(in_ghost(&s, 5 | hi));
-	CHECK(!in_ghost(&s, 5));
+	CHECK(in_ghost(&s, 5));
+	CHECK(!in_ghost(&s, 6));
 	/* all share the home slot in the set (low bits equal) */
 	for (uint32_t i = 2; i < 8; i++)
 		put(&s, &o[i], 7 + ((uint64_t)i << 24));
