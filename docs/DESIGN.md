@@ -216,6 +216,12 @@ still `block`, but they cannot change the routing decision.
   All other parameters (alpn, ech, …) are preserved byte for byte. A dropped
   hint is also removed from `mandatory`. Targets are never resolved
   proactively. If every record is dropped, the answer is NODATA.
+- **HTTPS/SVCB AliasMode**: whether followed (it joins the prefix) or
+  terminal (target `.`), the record is answered bare: priority and target,
+  its SvcParams stripped. RFC 9460 has clients ignore them, and their
+  hints would carry real addresses no policy looked at, under a latch
+  too. A response holding such a record is therefore never passed
+  through as received (see below).
 - **Other types** pass through unchanged after the walk.
 
 ### Answer assembly
@@ -246,7 +252,8 @@ upstream's 4-bit rcode. AA and AD are never set.
 
 When a single upstream response needed no change at all (no alias
 synthesized from a DNAME, no latch, no bindings, no address record to
-filter from the authority or additional section, nothing rewritten), and
+filter from the authority or additional section, no AliasMode record
+with SvcParams or unparsable in the answer section, nothing rewritten), and
 every record of its answer section belongs to the chain (owned by a name
 the walk evaluated, or a DNAME it followed and that DNAME's RRSIG), its
 records are passed through as received; only the header is replaced and

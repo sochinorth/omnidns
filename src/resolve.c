@@ -84,7 +84,7 @@ struct resolve_req {
 };
 
 enum { SCAN_ALIAS, SCAN_DONE, SCAN_QUERY };
-enum { ACT_SKIP = 0, ACT_KEEP, ACT_DROP, ACT_BIND, ACT_HINTS };
+enum { ACT_SKIP = 0, ACT_KEEP, ACT_DROP, ACT_BIND, ACT_HINTS, ACT_BARE };
 enum { LIFE_NONE, LIFE_POS, LIFE_NEG };
 
 struct plan {
@@ -162,6 +162,28 @@ static const struct dns_rr *find_dname(const struct dns_msg *m, const struct dns
 static bool is_svcb(uint16_t t)
 {
 	return t == DNS_T_SVCB || t == DNS_T_HTTPS;
+}
+
+/*
+ * SvcParams of an AliasMode record are to be ignored (RFC 9460 2.4.2), and
+ * hints there would carry real addresses no policy looked at: such a record
+ * is only ever emitted bare (priority and target, as parsed into sv), and an
+ * answer section holding one, or an unparsable one, is never passed through.
+ */
+static int add_bare_alias(struct dns_msg *m, const struct dns_rr *rr,
+                          const struct svcb_view *sv)
+{
+	return dns_msg_add_rr(m, DNS_S_AN, rr->owner, rr->owner_len, rr->type, rr->cls,
+	                      rr->ttl, rr->rdata, (uint16_t)(2 + sv->target_len));
+}
+
+static bool alias_params(const struct dns_rr *rr)
+{
+	struct svcb_view sv;
+
+	if (!is_svcb(rr->type) || rr->rdlen < 2 || rr->rdata[0] || rr->rdata[1])
+		return false;
+	return svcb_parse(rr->rdata, rr->rdlen, &sv) || sv.params_len;
 }
 
 static int afamily(uint16_t qtype)
@@ -755,10 +777,21 @@ static bool all_an_chain(const struct resolve_req *r)
 	return true;
 }
 
+static bool no_alias_params(const struct resolve_req *r)
+{
+	const struct dns_msg *m = &r->resp;
+	uint16_t i;
+
+	for (i = 0; i < m->nrr && m->rr[i].section == DNS_S_AN; i++)
+		if (alias_params(&m->rr[i]))
+			return false;
+	return true;
+}
+
 static bool can_pass_through(struct resolve_req *r)
 {
 	return r->nresp == 1 && !r->synth && !r->latch.on && !r->nbinds && all_an_chain(r) &&
-	       all_glue_ok(r);
+	       no_alias_params(r) && all_glue_ok(r);
 }
 
 /*
@@ -943,7 +976,11 @@ static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struc
 	                      rr->cls, ttl, b->fake, rr->rdlen);
 }
 
-/* Decide one ServiceMode RR (match its effective target). */
+/*
+ * Decide one ServiceMode RR (match its effective target). An AliasMode RR
+ * (to ".", or scan() would have followed it) is kept, bare if it has
+ * SvcParams.
+ */
 static int plan_svcb(struct resolve_req *r, struct plan *p)
 {
 	const struct rule *rule;
@@ -955,8 +992,11 @@ static int plan_svcb(struct resolve_req *r, struct plan *p)
 		return 0;
 	}
 	p->act = ACT_KEEP;
-	if (!p->sv.priority)
+	if (!p->sv.priority) {
+		if (p->sv.params_len)
+			p->act = ACT_BARE;
 		return 0;
+	}
 	t = svcb_target_is_root(&p->sv) ? r->name.data : p->sv.target;
 	tlen = svcb_target_is_root(&p->sv) ? r->name.len : p->sv.target_len;
 	rule = dep_match(r, t, tlen);
@@ -1054,6 +1094,10 @@ static int build_terminal(struct resolve_req *r, bool changed, bool *rewritten)
 			break;
 		case ACT_HINTS:
 			ret = emit_hints(r, &m->rr[i], &plan[i], rewritten);
+			break;
+		case ACT_BARE:
+			ret = add_bare_alias(&r->out, &m->rr[i], &plan[i].sv);
+			*rewritten = true;
 			break;
 		}
 	}
@@ -1250,12 +1294,13 @@ static const struct plan *find_svcb_alias(const struct resolve_req *r)
 
 static int scan_svcb_alias(struct resolve_req *r, const struct plan *p)
 {
-	const struct dns_rr *rr = &r->resp.rr[p - plan];
+	struct dns_rr rr = r->resp.rr[p - plan];
 	struct dns_name target;
 
 	memcpy(target.data, p->sv.target, p->sv.target_len);
 	target.len = p->sv.target_len;
-	if (prefix_add(r, rr)) {
+	rr.rdlen = (uint16_t)(2 + p->sv.target_len);	/* bare, as add_bare_alias() */
+	if (prefix_add(r, &rr)) {
 		servfail(r);
 		return SCAN_DONE;
 	}

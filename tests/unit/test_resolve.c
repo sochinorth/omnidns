@@ -1035,6 +1035,67 @@ TEST(m_https_alias_mode)
 	CHECK_EQ(count(DNS_S_AN), 1);
 }
 
+/* rdata of an AliasMode record without SvcParams: priority 0, the target */
+static bool alias_bare(const struct dns_rr *rr, const char *target)
+{
+	struct dns_name t = N(target);
+
+	return (rr->type == DNS_T_HTTPS || rr->type == DNS_T_SVCB) &&
+	       rr->rdlen == 2 + t.len && !rr->rdata[0] && !rr->rdata[1] &&
+	       !memcmp(rr->rdata + 2, t.data, t.len);
+}
+
+/*
+ * SvcParams of AliasMode records are to be ignored (RFC 9460 2.4.2), and
+ * their hints would carry real addresses past any policy: such records are
+ * answered with the SvcParams stripped, under a latch or not, followed or
+ * terminal, so they never pass through as received.
+ */
+TEST(z_alias_mode_params)
+{
+	const uint8_t *val;
+	uint16_t len;
+	int k;
+
+	setup(CFG_DEFAULT);
+	S("10.0.0.2", "a1.vpn.example", DNS_T_HTTPS, 0,
+	  "an a1.vpn.example 300 HTTPS 0 . alpn=h2 ipv4hint=5.5.5.5 ipv6hint=2001:db8::5");
+	S("10.0.0.2", "a2.vpn.example", DNS_T_HTTPS, 0,
+	  "an a2.vpn.example 300 HTTPS 0 t.vpn.example ipv4hint=5.5.5.6;"
+	  "an t.vpn.example 300 HTTPS 1 . ipv4hint=7.7.7.7");
+	S("10.0.0.1", "a3.plain.example", DNS_T_HTTPS, 0,
+	  "an a3.plain.example 300 HTTPS 0 . ipv4hint=5.5.5.7");
+	S("10.0.0.1", "a4.plain.example", DNS_T_HTTPS, 0,
+	  "an a4.plain.example 300 HTTPS 0 t.plain.example ipv4hint=5.5.5.8;"
+	  "an t.plain.example 300 HTTPS 1 . alpn=h2 ipv4hint=8.8.8.8");
+	for (k = 0; k < 2; k++) {	/* fresh, then cached */
+		/* terminal under a latch */
+		CHECK(run("a1.vpn.example", DNS_T_HTTPS));
+		CHECK_EQ(count(DNS_S_AN), 1);
+		CHECK(alias_bare(&res.rr[0], "."));
+		CHECK_EQ(res.rr[0].ttl, 300);
+
+		/* followed under a latch: the target's hints are fakes */
+		CHECK(run("a2.vpn.example", DNS_T_HTTPS));
+		CHECK_EQ(count(DNS_S_AN), 2);
+		CHECK(alias_bare(&res.rr[0], "t.vpn.example"));
+		CHECK(res.nrr > 1 && svcb_param(&res.rr[1], SVCB_KEY_IPV4HINT, &val, &len) &&
+		      is_fake(4, val, "7.7.7.7", MARK1, "t.vpn.example"));
+
+		/* no latch, a single response: assembled, not passed through */
+		CHECK(run("a3.plain.example", DNS_T_HTTPS));
+		CHECK_EQ(count(DNS_S_AN), 1);
+		CHECK(alias_bare(&res.rr[0], "."));
+
+		CHECK(run("a4.plain.example", DNS_T_HTTPS));
+		CHECK_EQ(count(DNS_S_AN), 2);
+		CHECK(alias_bare(&res.rr[0], "t.plain.example"));
+		CHECK(res.nrr > 1 && svcb_param(&res.rr[1], SVCB_KEY_IPV4HINT, &val, &len) &&
+		      len == 4 && !memcmp(val, "\x08\x08\x08\x08", 4));
+		CHECK(k == 0 || no_queries());
+	}
+}
+
 static void rev4(char *buf, const uint8_t *a)
 {
 	sprintf(buf, "%u.%u.%u.%u.in-addr.arpa", a[3], a[2], a[1], a[0]);
@@ -1735,6 +1796,7 @@ int main(int argc, char **argv)
 	RUN(x_authority_addresses);
 	RUN(y_pass_through_chain_only);
 	RUN(z_dname_owner_records);
+	RUN(z_alias_mode_params);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);
