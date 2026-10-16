@@ -248,10 +248,11 @@ When a single upstream response needed no change at all (no alias
 synthesized from a DNAME, no latch, no bindings, no address record to
 filter from the authority or additional section, nothing rewritten), and
 every record of its answer section belongs to the chain (owned by a name
-the walk evaluated, or by a DNAME it followed), its records are passed
-through as received; only the header is replaced and OPT dropped. An
-answer record of any other name was never matched against the rules, so
-such a response is assembled instead, which leaves the record out.
+the walk evaluated, or a DNAME it followed and that DNAME's RRSIG), its
+records are passed through as received; only the header is replaced and
+OPT dropped. Any other answer record, including other records of a DNAME's
+owner, belongs to a name never matched against the rules, so such a
+response is assembled instead, which leaves the record out.
 
 The finished answer is serialized once, with name compression, into the
 bytes the cache stores and every reply is rendered from (see

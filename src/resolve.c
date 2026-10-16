@@ -712,29 +712,44 @@ static int copy_prefix(struct resolve_req *r)
 	return 0;
 }
 
+/* rr is a DNAME of the prefix (one the walk followed), or an RRSIG over it. */
+static bool followed_dname(const struct resolve_req *r, const struct dns_rr *rr)
+{
+	bool sig = rr->type == DNS_T_RRSIG && rr->rdlen >= 2 &&
+	           (rr->rdata[0] << 8 | rr->rdata[1]) == DNS_T_DNAME;
+	uint16_t j;
+
+	if (rr->type != DNS_T_DNAME && !sig)
+		return false;
+	for (j = 0; j < r->prefix.nrr; j++) {
+		const struct dns_rr *d = &r->prefix.rr[j];
+
+		if (d->type == DNS_T_DNAME &&
+		    (sig ? dns_name_eq(d->owner, d->owner_len, rr->owner, rr->owner_len) :
+		           rr_same(d, rr)))
+			return true;
+	}
+	return false;
+}
+
 /*
  * Every answer record belongs to the chain: its owner is a name of this
  * walk (the qname or an alias target followed, all recorded as the first
- * nwalk dependencies), or the owner of a DNAME the walk followed (in the
- * prefix). Records of any other name, whose policy was never applied, must
- * not ride along in a passed-through answer.
+ * nwalk dependencies), or it is a DNAME the walk followed (in the prefix)
+ * or that DNAME's RRSIG. A DNAME owner is never matched against the rules,
+ * so any other record it owns, like records of any other name, must not
+ * ride along in a passed-through answer.
  */
 static bool all_an_chain(const struct resolve_req *r)
 {
 	const struct dns_msg *m = &r->resp;
-	uint16_t i, j;
+	uint16_t i;
 
 	for (i = 0; i < m->nrr && m->rr[i].section == DNS_S_AN; i++) {
 		const struct dns_rr *rr = &m->rr[i];
 
-		if (dep_find(r, rr->owner, rr->owner_len, r->nwalk) >= 0)
-			continue;
-		for (j = 0; j < r->prefix.nrr; j++)
-			if (r->prefix.rr[j].type == DNS_T_DNAME &&
-			    dns_name_eq(r->prefix.rr[j].owner, r->prefix.rr[j].owner_len,
-			                rr->owner, rr->owner_len))
-				break;
-		if (j == r->prefix.nrr)
+		if (dep_find(r, rr->owner, rr->owner_len, r->nwalk) < 0 &&
+		    !followed_dname(r, rr))
 			return false;
 	}
 	return true;

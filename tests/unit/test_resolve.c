@@ -204,9 +204,11 @@ static void build_rrs(struct dns_msg *m, const char *text)
 			x = N(strtok_r(NULL, " ", &s2));
 			memcpy(rd + 2, x.data, x.len);
 			n = 2 + x.len;
-		} else if (!strcmp(type, "RRSIG")) {
+		} else if (!strcmp(type, "RRSIG")) {	/* "RRSIG [covered type]" */
 			t = DNS_T_RRSIG;
 			memset(rd, 0, 24);
+			if (a)
+				put16(rd, !strcmp(a, "DNAME") ? DNS_T_DNAME : DNS_T_A);
 			n = 24;
 		} else {
 			fprintf(stderr, "bad type %s\n", type);
@@ -1469,6 +1471,64 @@ TEST(x_authority_addresses)
 }
 
 /*
+ * The owner of a followed DNAME is never matched against the rules (the walk
+ * goes from the qname to the substituted target), so of its records only the
+ * DNAME and the RRSIG covering it may ride along. Here the owner itself is
+ * blocked, then fakeip: its address must neither pass through nor be cached.
+ */
+TEST(z_dname_owner_records)
+{
+	const char *cfg = GLOBAL_HDR
+		"config rule 'oblk'\n\toption action 'block'\n\tlist nameset '@/oblk.txt'\n"
+		"config rule 'ovpn'\n\toption action 'fakeip'\n\toption upstream '@/up1.conf'\n"
+		"\toption fwmark '0x3'\n\tlist nameset '@/ovpn.txt'\n" RULES;
+	static const char *const owner[2] = { "d", "f" };
+	char q[64], rrs[512], leak[64];
+	int i, j, k;
+
+	wfile("oblk.txt", "d.plain.example\n");
+	wfile("ovpn.txt", "f.plain.example\n");
+	setup(cfg);
+	CHECK(run("d.plain.example", DNS_T_A));	/* the owner itself is blocked */
+	CHECK(no_queries());
+	CHECK_EQ(count(DNS_S_AN), 0);
+	for (i = 0; i < 2; i++) {
+		snprintf(q, sizeof(q), "www.%s.plain.example", owner[i]);
+		snprintf(rrs, sizeof(rrs),
+		         "an %s.plain.example 900 DNAME e.plain.example;"
+		         "an %s.plain.example 900 RRSIG DNAME;"
+		         "an %s 900 CNAME www.e.plain.example;"
+		         "an www.e.plain.example 300 A 3.3.3.3;"
+		         "an %s.plain.example 300 A 6.6.6.6;"
+		         "an %s.plain.example 300 RRSIG A",
+		         owner[i], owner[i], q, owner[i], owner[i]);
+		snprintf(leak, sizeof(leak), "%s.plain.example 300 A 6.6.6.6", owner[i]);
+		S("10.0.0.1", q, DNS_T_A, 0, rrs);
+		for (k = 0; k < 2; k++) {	/* fresh, then cached */
+			CHECK(run(q, DNS_T_A));
+			CHECK_EQ(rcode(), 0);
+			CHECK_EQ(count(DNS_S_AN), 3);
+			CHECK(strstr(R(0), " DNAME e.plain.example") != NULL);
+			CHECK(strstr(R(1), " CNAME www.e.plain.example") != NULL);
+			CHECK_STR(R(2), "www.e.plain.example 300 A 3.3.3.3");
+			for (j = 0; j < res.nrr; j++)
+				CHECK(strcmp(R(j), leak) != 0);
+			CHECK(k == 0 || no_queries());
+		}
+	}
+	/* a second DNAME at the owner was not followed: left out too */
+	S("10.0.0.1", "www.g.plain.example", DNS_T_A, 0,
+	  "an g.plain.example 900 DNAME e.plain.example;"
+	  "an g.plain.example 900 DNAME h.vpn.example;"
+	  "an www.g.plain.example 900 CNAME www.e.plain.example;"
+	  "an www.e.plain.example 300 A 3.3.3.3");
+	CHECK(run("www.g.plain.example", DNS_T_A));
+	CHECK_EQ(count(DNS_S_AN), 3);
+	CHECK_STR(R(0), "g.plain.example 900 DNAME e.plain.example");
+	CHECK_STR(R(2), "www.e.plain.example 300 A 3.3.3.3");
+}
+
+/*
  * Only answer records of the chain itself are passed through: a record
  * owned by any other name takes the assembled path, which carries over the
  * chain alone. Chains answered in one response (CNAME, DNAME, with their
@@ -1488,7 +1548,7 @@ TEST(y_pass_through_chain_only)
 	  "an d.plain.example 300 A 1.1.1.2;an d.plain.example 300 RRSIG;"
 	  "an e.vpn.example 300 CNAME d.plain.example");
 	S("10.0.0.1", "www.d.plain.example", DNS_T_A, 0,
-	  "an d.plain.example 900 DNAME e.plain.example;an d.plain.example 900 RRSIG;"
+	  "an d.plain.example 900 DNAME e.plain.example;an d.plain.example 900 RRSIG DNAME;"
 	  "an www.d.plain.example 900 CNAME www.e.plain.example;"
 	  "an www.e.plain.example 300 A 3.3.3.3;an www.e.plain.example 300 RRSIG");
 	for (k = 0; k < 2; k++) {	/* fresh, then cached */
@@ -1674,6 +1734,7 @@ int main(int argc, char **argv)
 	RUN(w_deps_dedup);
 	RUN(x_authority_addresses);
 	RUN(y_pass_through_chain_only);
+	RUN(z_dname_owner_records);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);
