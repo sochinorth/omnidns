@@ -676,6 +676,21 @@ TEST(deps_revalidation)
 	CHECK_EQ(cache_count(c), 0);
 	wfile("up2.conf", "nameserver 9.9.9.9\n");
 
+	/* a dep naming the qname costs only its fingerprint and length byte */
+	{
+		size_t b1, b2, b3;
+
+		CHECK_EQ(ins_deps(c, c4, "b.foo.example", "cdn.other.example", NULL), 0);
+		b1 = cache_bytes(c);
+		CHECK_EQ(ins_deps(c, c4, "b.foo.example", "B.Foo.Example", "cdn.other.example"), 0);
+		b2 = cache_bytes(c);
+		CHECK_EQ(ins_deps(c, c4, "b.foo.example", "c.foo.example", "cdn.other.example"), 0);
+		b3 = cache_bytes(c);
+		CHECK_EQ(b2 - b1, 9);
+		CHECK_EQ(b3 - b1, 9 + 15);
+		CHECK_EQ(look(c, c4, "b.foo.example", DNS_T_A, &out), 0);
+	}
+
 	dns_msg_free(&out);
 	cache_free(c);
 	config_free(c1);

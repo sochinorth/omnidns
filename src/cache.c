@@ -17,7 +17,8 @@
  *   struct centry              header (56 B on LP64, 48 B on ILP32)
  *   struct binding *binds[nbinds]
  *   struct crr rr[nrr]         compact RR records (16 B each)
- *   deps[dsz]                  packed (fingerprint u64, len u8, name)*
+ *   deps[dsz]                  packed (fingerprint u64, len u8, name)*,
+ *                              len 0 = the qname
  *   data[dlen]                 the key qname (case as inserted) at offset 0,
  *                              then every owner name and rdata, interned:
  *                              a byte string already present in data (an
@@ -246,7 +247,12 @@ static struct centry *find(struct cache *c, const uint8_t *qname, uint8_t qlen,
 	return hmap_get(&c->map, *hash, &k, key_eq, NULL);
 }
 
-/* Re-match every dep against cfg; true if all still map to the same rule. */
+/*
+ * Re-match every dep against cfg; true if all still map to the same rule.
+ * A dep stored with length 0 is the entry's qname (stored in its original
+ * case; match_lookup_wire renders names as lowercase text, so case does not
+ * matter).
+ */
 static bool deps_valid(const struct centry *e, const struct config *cfg)
 {
 	const uint8_t *p = e_deps(e);
@@ -255,7 +261,10 @@ static bool deps_valid(const struct centry *e, const struct config *cfg)
 
 	for (i = 0; i < e->ndeps; i++) {
 		memcpy(&fp, p, 8);
-		idx = match_lookup_wire(cfg->idx, p + 9, p[8]);
+		if (p[8])
+			idx = match_lookup_wire(cfg->idx, p + 9, p[8]);
+		else
+			idx = match_lookup_wire(cfg->idx, e_qname(e), e->qlen);
 		if (idx == MATCH_NONE || idx >= cfg->nrules || cfg->rules[idx].fingerprint != fp)
 			return false;
 		p += 9 + p[8];
@@ -366,28 +375,41 @@ int cache_lookup(struct cache *c, const struct config *cfg,
 	return 0;
 }
 
-static size_t deps_packed_len(const struct cache_dep *deps, uint16_t ndeps)
+/*
+ * Packed deps: (fingerprint u64, len u8, lowercased name[len])*. A dep
+ * naming the qname itself (usually the first one: the walk starts there)
+ * is stored with len 0.
+ */
+static bool dep_is_qname(const struct cache_dep *d, const uint8_t *qname, uint8_t qlen)
+{
+	return dns_name_eq(d->name.data, d->name.len, qname, qlen);
+}
+
+static size_t deps_packed_len(const struct cache_dep *deps, uint16_t ndeps,
+                              const uint8_t *qname, uint8_t qlen)
 {
 	size_t n = 0;
 	uint16_t i;
 
 	for (i = 0; i < ndeps; i++)
-		n += 9 + deps[i].name.len;
+		n += 9 + (dep_is_qname(&deps[i], qname, qlen) ? 0 : deps[i].name.len);
 	return n;
 }
 
-static uint8_t *pack_deps(uint8_t *p, const struct cache_dep *deps, uint16_t ndeps)
+static void pack_deps(uint8_t *p, const struct cache_dep *deps, uint16_t ndeps,
+                      const uint8_t *qname, uint8_t qlen)
 {
 	uint16_t i;
 
 	for (i = 0; i < ndeps; i++) {
+		uint8_t len = dep_is_qname(&deps[i], qname, qlen) ? 0 : deps[i].name.len;
+
 		memcpy(p, &deps[i].fingerprint, 8);
-		p[8] = deps[i].name.len;
-		memcpy(p + 9, deps[i].name.data, deps[i].name.len);
-		dns_name_lower(p + 9, deps[i].name.len);
-		p += 9 + deps[i].name.len;
+		p[8] = len;
+		memcpy(p + 9, deps[i].name.data, len);
+		dns_name_lower(p + 9, len);
+		p += 9 + len;
 	}
-	return p;
 }
 
 /* Interning searches at most this much of data: bounds the work for huge
@@ -425,7 +447,7 @@ static struct centry *entry_new(const uint8_t *qname, uint8_t qlen, const struct
 				const struct cache_dep *deps, uint16_t ndeps,
 				struct binding *const *binds, uint16_t nbinds, int *err)
 {
-	size_t bsz = (size_t)nbinds * sizeof(*binds), dsz = deps_packed_len(deps, ndeps);
+	size_t bsz = (size_t)nbinds * sizeof(*binds), dsz = deps_packed_len(deps, ndeps, qname, qlen);
 	size_t rsz = (size_t)resp->nrr * sizeof(struct crr), hsz, dmax = qlen, dlen;
 	struct centry *e, *n;
 	struct crr *crr;
@@ -446,7 +468,7 @@ static struct centry *entry_new(const uint8_t *qname, uint8_t qlen, const struct
 	e->nrr = resp->nrr;
 	e->ndeps = ndeps;
 	e->dsz = (uint16_t)dsz;
-	pack_deps((uint8_t *)e_deps(e), deps, ndeps);
+	pack_deps((uint8_t *)e_deps(e), deps, ndeps, qname, qlen);
 	crr = (struct crr *)e_rr(e);
 	data = (uint8_t *)e_data(e);
 	memcpy(data, qname, qlen);
