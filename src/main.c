@@ -97,6 +97,7 @@ static int reload(void)
 	ncfg = config_load(omni.config_path, &omni.nsc, err, sizeof(err));
 	if (!ncfg) {
 		log_err("reload: %s; keeping previous configuration", err);
+		nsc_sweep(&omni.nsc);	/* drop files parsed for the failed config */
 		return -EINVAL;
 	}
 	mask_changed = ncfg->fwmask != old->fwmask;
