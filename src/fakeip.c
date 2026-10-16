@@ -12,11 +12,19 @@
 #include "util/hash.h"
 #include "util/time.h"
 
-struct rule_str {
-	uint64_t hash;
+/*
+ * Policy: an interned (rule_id, mark) pair, refcounted by the bindings
+ * (attached or detached-but-referenced) whose b->policy is its id.
+ */
+struct policy {
+	uint32_t hash;		/* low 32 bits of policy_hash() (all hmap keeps) */
+	uint32_t mark;
 	uint32_t ref;
-	char s[];
+	uint16_t id;
+	char rule_id[];
 };
+
+#define POLICY_NONE UINT32_MAX	/* bkey.policy: pair not interned */
 
 struct fakeip_db {
 	bool has4, has6;
@@ -27,7 +35,12 @@ struct fakeip_db {
 	struct nft_ctx *nft;
 	struct hmap by_key;	/* key_hash() -> binding (= b->s3.hash) */
 	struct hmap by_fake;	/* fake_hash() -> binding */
-	struct hmap rules;	/* interned rule_id strings */
+	struct hmap policies;	/* policy_hash() -> struct policy */
+	struct policy **pol;	/* by id; NULL = free slot */
+	uint16_t *pol_free;	/* stack of free ids below pol_n */
+	uint32_t pol_n;		/* ids handed out so far (high-water mark) */
+	uint32_t pol_nfree;
+	uint32_t pol_cap;	/* allocated length of pol and pol_free */
 	struct s3fifo s3;
 };
 
@@ -35,6 +48,8 @@ struct fakeip_db {
 struct bkey {
 	const char *rule_id;
 	uint32_t mark;
+	uint32_t policy;	/* id of (rule_id, mark) or POLICY_NONE */
+	uint64_t phash;		/* policy_hash(rule_id, mark) */
 	uint8_t family;
 	uint8_t endpoint_len;
 	const uint8_t *endpoint;
@@ -200,11 +215,11 @@ static bool key_eq(const void *val, const void *key, void *ctx)
 	const struct binding *b = val;
 	const struct bkey *k = key;
 
-	return b->mark == k->mark && b->family == k->family &&
+	/* interned: equal ids <=> equal (rule_id, mark) */
+	return b->policy == k->policy && b->family == k->family &&
 	       b->endpoint_len == k->endpoint_len &&
 	       !memcmp(b->endpoint, k->endpoint, k->endpoint_len) &&
-	       !memcmp(b->real, k->real, alen(k->family)) &&
-	       !strcmp(b->rule_id, k->rule_id);
+	       !memcmp(b->real, k->real, alen(k->family));
 }
 
 static bool fake_eq(const void *val, const void *key, void *ctx)
@@ -215,52 +230,104 @@ static bool fake_eq(const void *val, const void *key, void *ctx)
 	return b->family == k->family && !memcmp(b->fake, k->fake, alen(k->family));
 }
 
-/* ---- rule_id interning ---- */
+/* ---- policy table ---- */
 
-static bool rule_eq(const void *val, const void *key, void *ctx)
+static uint64_t policy_hash(const char *rule_id, uint32_t mark)
 {
-	return !strcmp(((const struct rule_str *)val)->s, key);
+	return omni_hash(rule_id, strlen(rule_id)) ^ (uint64_t)mark * 0x9e3779b97f4a7c15ull;
 }
 
-static const char *rule_get(struct fakeip_db *db, const char *id)
+static bool policy_eq(const void *val, const void *key, void *ctx)
 {
-	uint64_t h = omni_hash(id, strlen(id));
-	struct rule_str *r = hmap_get(&db->rules, h, id, rule_eq, NULL);
+	const struct policy *p = val;
+	const struct bkey *k = key;
+
+	return p->mark == k->mark && !strcmp(p->rule_id, k->rule_id);
+}
+
+/* id of k's (rule_id, mark) or POLICY_NONE; does not take a reference */
+static uint32_t policy_find(const struct fakeip_db *db, const struct bkey *k)
+{
+	const struct policy *p = hmap_get(&db->policies, k->phash, k, policy_eq, NULL);
+
+	return p ? p->id : POLICY_NONE;
+}
+
+static int policy_grow(struct fakeip_db *db)
+{
+	uint32_t cap = db->pol_cap ? db->pol_cap * 2 : 16;
+	struct policy **pol;
+	uint16_t *fr;
+
+	if (cap > FAKEIP_MAX_POLICIES)
+		cap = FAKEIP_MAX_POLICIES;
+	pol = realloc(db->pol, cap * sizeof(*pol));
+	if (!pol)
+		return -ENOMEM;
+	db->pol = pol;
+	fr = realloc(db->pol_free, cap * sizeof(*fr));
+	if (!fr)
+		return -ENOMEM;
+	db->pol_free = fr;
+	db->pol_cap = cap;
+	return 0;
+}
+
+/* Take a reference on k's (rule_id, mark), interning it if new. Returns
+ * the id, or -ENOSPC (FAKEIP_MAX_POLICIES distinct pairs live) / -ENOMEM. */
+static int policy_get(struct fakeip_db *db, const struct bkey *k)
+{
+	uint32_t id = policy_find(db, k);	/* k->policy may be stale */
+	struct policy *p;
 	size_t len;
 
-	if (r) {
-		r->ref++;
-		return r->s;
+	if (id != POLICY_NONE) {
+		db->pol[id]->ref++;
+		return id;
 	}
-	len = strlen(id);
-	r = malloc(sizeof(*r) + len + 1);
-	if (!r)
-		return NULL;
-	r->hash = h;
-	r->ref = 1;
-	memcpy(r->s, id, len + 1);
-	if (hmap_put(&db->rules, h, r)) {
-		free(r);
-		return NULL;
+	if (!db->pol_nfree && db->pol_n == FAKEIP_MAX_POLICIES)
+		return -ENOSPC;
+	if (!db->pol_nfree && db->pol_n == db->pol_cap && policy_grow(db))
+		return -ENOMEM;
+	len = strlen(k->rule_id);
+	p = malloc(sizeof(*p) + len + 1);
+	if (!p)
+		return -ENOMEM;
+	id = db->pol_nfree ? db->pol_free[db->pol_nfree - 1] : db->pol_n;
+	p->hash = (uint32_t)k->phash;
+	p->mark = k->mark;
+	p->ref = 1;
+	p->id = id;
+	memcpy(p->rule_id, k->rule_id, len + 1);
+	if (hmap_put(&db->policies, k->phash, p)) {
+		free(p);
+		return -ENOMEM;
 	}
-	return r->s;
+	if (db->pol_nfree)
+		db->pol_nfree--;
+	else
+		db->pol_n++;
+	db->pol[id] = p;
+	return id;
 }
 
-static void rule_put(struct fakeip_db *db, const char *s)
+static void policy_put(struct fakeip_db *db, uint16_t id)
 {
-	struct rule_str *r = (struct rule_str *)(s - offsetof(struct rule_str, s));
+	struct policy *p = db->pol[id];
 
-	if (--r->ref)
+	if (--p->ref)
 		return;
-	hmap_del_ptr(&db->rules, r->hash, r);
-	free(r);
+	hmap_del_ptr(&db->policies, p->hash, p);
+	db->pol[id] = NULL;
+	db->pol_free[db->pol_nfree++] = id;	/* pol_nfree < pol_n <= pol_cap */
+	free(p);
 }
 
 /* ---- binding lifecycle ---- */
 
 static void binding_free(struct fakeip_db *db, struct binding *b)
 {
-	rule_put(db, b->rule_id);
+	policy_put(db, b->policy);
 	free(b);
 }
 
@@ -369,11 +436,13 @@ void fakeip_free(struct fakeip_db *db)
 	while ((b = hmap_next(&db->by_key, &it)))
 		free(b);
 	it = 0;
-	while ((v = hmap_next(&db->rules, &it)))
+	while ((v = hmap_next(&db->policies, &it)))
 		free(v);
 	hmap_free(&db->by_key);
 	hmap_free(&db->by_fake);
-	hmap_free(&db->rules);
+	hmap_free(&db->policies);
+	free(db->pol);
+	free(db->pol_free);
 	s3_destroy(&db->s3);
 	if (db->nft)
 		nft_set_fail_hook(db->nft, NULL, NULL);
@@ -441,26 +510,35 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 {
 	struct binding *b, *victim;
 	uint8_t fake[16];
-	int r;
+	int r, pid;
 
+	/*
+	 * Policy first: the evictions below may drop the last other binding
+	 * of this pair. A full table is rare (65535 distinct (rule, mark)
+	 * pairs need as many bindings): make room from expired bindings once.
+	 */
+	pid = policy_get(db, k);
+	if (pid == -ENOSPC && fakeip_evict_expired(db))
+		pid = policy_get(db, k);
+	if (pid < 0) {
+		r = pid;
+		goto fail;
+	}
 	r = find_slot(db, k->family, khash, now, fake, &victim);
 	if (r)
-		goto fail;
+		goto fail_policy;
 	if (!victim && hmap_len(&db->by_key) >= db->max_bindings) {
 		s3_evict(&db->s3, evict_target(db));
 		if (hmap_len(&db->by_key) >= db->max_bindings) {
 			r = -ENOSPC;
-			goto fail;
+			goto fail_policy;
 		}
 	}
 	r = -ENOMEM;
 	b = calloc(1, offsetof(struct binding, endpoint) + k->endpoint_len);
 	if (!b)
-		goto fail;
-	b->rule_id = rule_get(db, k->rule_id);
-	if (!b->rule_id)
-		goto fail_free;
-	b->mark = k->mark;
+		goto fail_policy;
+	b->policy = pid;
 	b->family = k->family;
 	memcpy(b->fake, fake, alen(k->family));
 	memcpy(b->real, k->real, alen(k->family));
@@ -468,22 +546,22 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	memcpy(b->endpoint, k->endpoint, k->endpoint_len);
 	b->safe_until = safe_until_for(db, now, ttl);
 	if (hmap_put(&db->by_key, khash, b))
-		goto fail_rule;
+		goto fail_free;
 	if (hmap_put(&db->by_fake, fake_hash(b->family, b->fake), b)) {
 		hmap_del_ptr(&db->by_key, khash, b);
-		goto fail_rule;
+		goto fail_free;
 	}
 	/* the victim is gone from the kernel by the replace below, no nft del */
 	if (victim)
 		binding_drop(db, victim, false);
 	s3_insert(&db->s3, &b->s3, khash);
-	b->ticket = nft_elem_add(db->nft, b->family, b->fake, b->real, b->mark, victim != NULL);
+	b->ticket = nft_elem_add(db->nft, b->family, b->fake, b->real, k->mark, victim != NULL);
 	return b;
 
-fail_rule:
-	rule_put(db, b->rule_id);
 fail_free:
 	free(b);
+fail_policy:
+	policy_put(db, pid);
 fail:
 	*err = r;
 	return NULL;
@@ -520,7 +598,10 @@ struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t 
 	memcpy(ep, endpoint, endpoint_len);
 	dns_name_lower(ep, endpoint_len);
 	khash = key_hash(db, &k);
-	b = hmap_get(&db->by_key, khash, &k, key_eq, NULL);
+	k.phash = policy_hash(rule_id, mark);
+	k.policy = policy_find(db, &k);
+	/* no binding can carry a pair that is not interned */
+	b = k.policy == POLICY_NONE ? NULL : hmap_get(&db->by_key, khash, &k, key_eq, NULL);
 	if (!b)
 		return binding_create(db, &k, khash, now, ttl, err);
 	s3_touch(&b->s3);
@@ -528,6 +609,29 @@ struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t 
 	if (su > b->safe_until)
 		b->safe_until = su;
 	return b;
+}
+
+const char *fakeip_rule_id(const struct fakeip_db *db, const struct binding *b)
+{
+	return db->pol[b->policy]->rule_id;
+}
+
+uint32_t fakeip_mark(const struct fakeip_db *db, const struct binding *b)
+{
+	return db->pol[b->policy]->mark;
+}
+
+uint32_t fakeip_policy_count(const struct fakeip_db *db)
+{
+	return hmap_len(&db->policies);
+}
+
+uint32_t fakeip_policy_refs(const struct fakeip_db *db, const char *rule_id, uint32_t mark)
+{
+	struct bkey k = { .rule_id = rule_id, .mark = mark, .phash = policy_hash(rule_id, mark) };
+	uint32_t id = policy_find(db, &k);
+
+	return id == POLICY_NONE ? 0 : db->pol[id]->ref;
 }
 
 void fakeip_ref(struct binding *b)

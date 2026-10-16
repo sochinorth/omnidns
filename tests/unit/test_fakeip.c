@@ -37,6 +37,7 @@ static uint64_t cur_ticket = 1;
 static void (*fail_fn)(void *priv, uint64_t ticket, int err);
 static void *fail_priv;
 static int nft_dummy;
+static bool kern_off;	/* skip the kernel model (linear) in huge tests */
 #define NFT ((struct nft_ctx *)&nft_dummy)
 
 static int alen(int family)
@@ -62,11 +63,14 @@ static void kern_remove(uint32_t i)
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
                       const uint8_t *real, uint32_t mark, bool replace)
 {
-	int i = kern_find(family, fake);
+	int i;
 
+	n_add++;
+	if (kern_off)
+		return cur_ticket;
+	i = kern_find(family, fake);
 	if (n != NFT || (family != 4 && family != 6))
 		kern_bad++;
-	n_add++;
 	if (replace) {
 		n_add_replace++;
 		if (i < 0)
@@ -92,9 +96,12 @@ uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
 
 uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 {
-	int i = kern_find(family, fake);
+	int i;
 
 	n_del++;
+	if (kern_off)
+		return cur_ticket;
+	i = kern_find(family, fake);
 	if (i < 0)
 		kern_bad++;
 	else
@@ -139,6 +146,7 @@ static void fail_batch(uint64_t ticket)
 static void reset(void)
 {
 	n_kern = n_add = n_add_replace = n_del = kern_bad = 0;
+	kern_off = false;
 	cur_ticket = 1;
 	time_override_set(1000);
 }
@@ -450,8 +458,13 @@ TEST(keys)
 		for (int j = i + 1; j < 5; j++)
 			CHECK(b[i] != b[j] && memcmp(b[i]->fake, b[j]->fake, 4));
 	CHECK_EQ(fakeip_count(db), 5);
-	CHECK(b[0]->rule_id == b[2]->rule_id);
-	CHECK_STR(b[1]->rule_id, "r2");
+	CHECK_STR(fakeip_rule_id(db, b[0]), "r1");
+	CHECK_STR(fakeip_rule_id(db, b[2]), "r1");
+	CHECK_EQ(fakeip_mark(db, b[2]), 2);
+	CHECK(b[0]->policy != b[2]->policy);
+	CHECK_STR(fakeip_rule_id(db, b[1]), "r2");
+	CHECK_EQ(fakeip_policy_count(db), 3);
+	CHECK_EQ(fakeip_policy_refs(db, "r1", 1), 3);
 	CHECK(!memcmp(b[0]->endpoint, "\3www\7example\3com", 17));
 	CHECK_EQ(b[0]->endpoint_len, 17);
 	CHECK(fakeip_in_pool(db, 4, b[0]->fake));
@@ -535,7 +548,8 @@ TEST(fail_hook)
 	CHECK_EQ(fakeip_count(db), 1);
 	CHECK(!fakeip_lookup(db, 4, afake));
 	CHECK(fakeip_lookup(db, 4, c->fake) == c);
-	CHECK_STR(a->rule_id, "r");	/* detached but still valid while referenced */
+	CHECK_STR(fakeip_rule_id(db, a), "r");
+	CHECK_EQ(fakeip_mark(db, a), 7);	/* detached but still valid while referenced */
 	a2 = bind4(db, "r", 7, "a.example", 1, 60, &err);
 	REQUIRE(a2);
 	CHECK(a2 != a);
@@ -683,7 +697,7 @@ static void check_invariants(struct fakeip_db *db, const struct ip_prefix *p4,
 		k = kern_find(b->family, b->fake);
 		CHECK(k >= 0);
 		if (k >= 0)
-			CHECK_EQ(kern[k].mark, b->mark);
+			CHECK_EQ(kern[k].mark, fakeip_mark(db, b));
 	}
 	CHECK_EQ(n, fakeip_count(db));
 	CHECK_EQ(n, n_kern);	/* distinct fakes, 1:1 with kernel elements */
@@ -691,6 +705,43 @@ static void check_invariants(struct fakeip_db *db, const struct ip_prefix *p4,
 }
 
 #define NHELD 64
+
+static const char *stress_rules[] = { "a", "b", "c" };
+
+/*
+ * Policy refcounts vs a model: every binding in the db, plus every distinct
+ * held binding that was detached (still referenced), holds its pair.
+ */
+static void check_policies(struct fakeip_db *db, struct binding *const *held, int nheld)
+{
+	uint32_t model[3][4] = { { 0 } }, it = 0, live = 0;
+	struct binding *b;
+
+	while ((b = fakeip_next(db, &it))) {
+		const char *r = fakeip_rule_id(db, b);
+		uint32_t m = fakeip_mark(db, b);
+
+		REQUIRE(r[0] >= 'a' && r[0] <= 'c' && !r[1] && m >= 1 && m <= 3);
+		model[r[0] - 'a'][m]++;
+	}
+	for (int h = 0; h < nheld; h++) {
+		bool dup = false;
+
+		b = held[h];
+		if (!b || fakeip_lookup(db, b->family, b->fake) == b)
+			continue;
+		for (int j = 0; j < h; j++)
+			dup |= held[j] == b;
+		if (!dup)
+			model[fakeip_rule_id(db, b)[0] - 'a'][fakeip_mark(db, b)]++;
+	}
+	for (int r = 0; r < 3; r++)
+		for (uint32_t m = 1; m <= 3; m++) {
+			CHECK_EQ(fakeip_policy_refs(db, stress_rules[r], m), model[r][m]);
+			live += model[r][m] > 0;
+		}
+	CHECK_EQ(fakeip_policy_count(db), live);
+}
 
 TEST(stress)
 {
@@ -719,10 +770,8 @@ TEST(stress)
 		} else if (r < 10) {
 			CHECK_EQ(fakeip_set_config(db, &p4, &p6, 600 + rnd(600), 3), 0);
 		} else {
-			static const char *rules[] = { "a", "b", "c" };
-
 			snprintf(name, sizeof(name), "N%u.example", rnd(60));
-			b = (rnd(3) ? bind4 : bind6)(db, rules[rnd(3)], 1 + rnd(3), name,
+			b = (rnd(3) ? bind4 : bind6)(db, stress_rules[rnd(3)], 1 + rnd(3), name,
 			                            rnd(8), rnd(20), &err);
 			if (!b) {
 				CHECK_EQ(err, -ENOSPC);
@@ -737,19 +786,212 @@ TEST(stress)
 				}
 			}
 		}
-		if (i % 500 == 0)
+		if (i % 500 == 0) {
 			check_invariants(db, &p4, &p6);
+			check_policies(db, held, NHELD);
+		}
 		if (test_cur_failed)
 			break;
 	}
 	check_invariants(db, &p4, &p6);
+	check_policies(db, held, NHELD);
 	for (int h = 0; h < NHELD; h++)
-		if (held[h])
+		if (held[h]) {
 			fakeip_unref(db, held[h]);
+			held[h] = NULL;
+		}
+	check_policies(db, held, NHELD);
 	fprintf(stderr, "  stress: %u ok, %u enospc, %u adds (%u replace), %u dels\n",
 		ok, fails, n_add, n_add_replace, n_del);
 	CHECK(n_add_replace > 0);
 	CHECK(n_del > 0);
+	fakeip_free(db);
+}
+
+/* policy churn: short TTLs, evictions and failed batches (which detach
+ * held bindings) against the refcount model */
+TEST(policy_stress)
+{
+	struct ip_prefix p4 = pfx("10.64.0.0", 24), p6 = pfx("fd00:64::", 120);
+	struct fakeip_db *db = fakeip_new(&p4, &p6, 200, 0, SECRET, NFT);
+	struct binding *held[NHELD] = { 0 }, *b;
+	uint32_t churn = 0;
+	int err;
+
+	reset();
+	for (int i = 0; i < 30000 && !test_cur_failed; i++) {
+		uint32_t r = rnd(100), h = rnd(NHELD);
+		char name[32];
+
+		if (r < 4) {
+			time_override_advance(rnd(3));
+		} else if (r < 10) {
+			if (held[h]) {
+				fakeip_unref(db, held[h]);
+				held[h] = NULL;
+			}
+		} else if (r < 11) {
+			if (!rnd(4))	/* rare: each failure logs a line */
+				fail_batch(cur_ticket);
+			cur_ticket++;
+		} else if (r < 13) {
+			churn += fakeip_evict_expired(db);
+		} else {
+			snprintf(name, sizeof(name), "n%u", rnd(40));
+			b = (rnd(2) ? bind4 : bind6)(db, stress_rules[rnd(3)], 1 + rnd(3), name,
+			                            rnd(4), rnd(3), &err);
+			if (!b)
+				CHECK_EQ(err, -ENOSPC);
+			else if (r < 25 && !held[h]) {
+				fakeip_ref(b);
+				held[h] = b;
+			}
+		}
+		if (i % 97 == 0)
+			check_policies(db, held, NHELD);
+	}
+	check_policies(db, held, NHELD);
+	for (int h = 0; h < NHELD; h++)
+		if (held[h]) {
+			fakeip_unref(db, held[h]);
+			held[h] = NULL;
+		}
+	check_policies(db, held, NHELD);
+	time_override_advance(10);
+	fakeip_evict_expired(db);
+	CHECK_EQ(fakeip_count(db), 0);
+	CHECK_EQ(fakeip_policy_count(db), 0);
+	CHECK(churn > 100);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
+TEST(policy_refcount)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db = fakeip_new(&p4, NULL, 10000, 0, SECRET, NFT);
+	struct binding *a, *b, *c, *d, *t, *x;
+	uint16_t idc, idd, maxid = 0;
+	char rule[16];
+	int err;
+
+	reset();
+	a = bind4(db, "r", 1, "a.example", 1, 5, &err);
+	b = bind4(db, "r", 1, "b.example", 1, 60, &err);
+	c = bind4(db, "r", 2, "a.example", 1, 5, &err);
+	d = bind4(db, "s", 1, "a.example", 1, 5, &err);
+	REQUIRE(a && b && c && d);
+	CHECK(a->policy == b->policy);
+	CHECK(a->policy != c->policy && a->policy != d->policy && c->policy != d->policy);
+	CHECK_EQ(fakeip_policy_count(db), 3);
+	CHECK_EQ(fakeip_policy_refs(db, "r", 1), 2);
+	CHECK_EQ(fakeip_policy_refs(db, "r", 2), 1);
+	CHECK_EQ(fakeip_policy_refs(db, "s", 1), 1);
+	CHECK_EQ(fakeip_policy_refs(db, "s", 2), 0);
+	CHECK_EQ(fakeip_policy_refs(db, "t", 1), 0);
+	/* renewal takes no extra reference */
+	CHECK(bind4(db, "r", 1, "a.example", 1, 5, &err) == a);
+	CHECK_EQ(fakeip_policy_refs(db, "r", 1), 2);
+	idc = c->policy;
+	idd = d->policy;
+
+	/* drop: the last binding of a pair frees it */
+	fakeip_ref(b);
+	time_override_advance(10);
+	CHECK_EQ(fakeip_evict_expired(db), 3);
+	CHECK_EQ(fakeip_policy_count(db), 1);
+	CHECK_EQ(fakeip_policy_refs(db, "r", 1), 1);
+	CHECK_EQ(fakeip_policy_refs(db, "r", 2), 0);
+	CHECK_EQ(fakeip_policy_refs(db, "s", 1), 0);
+
+	/* reuse: a new pair takes a freed id */
+	cur_ticket++;	/* not in b's batch, which fails below */
+	t = bind4(db, "t", 9, "a.example", 1, 5, &err);
+	REQUIRE(t);
+	CHECK(t->policy == idc || t->policy == idd);
+	CHECK_STR(fakeip_rule_id(db, t), "t");
+	CHECK_EQ(fakeip_mark(db, t), 9);
+	CHECK_EQ(fakeip_policy_count(db), 2);
+
+	/* a detached binding keeps its pair until the last unref */
+	fail_batch(b->ticket);
+	CHECK(!fakeip_lookup(db, 4, b->fake));
+	CHECK_EQ(fakeip_policy_refs(db, "r", 1), 1);
+	CHECK_STR(fakeip_rule_id(db, b), "r");
+	x = bind4(db, "r", 1, "b.example", 1, 60, &err);	/* same key, new binding */
+	REQUIRE(x && x != b && x->policy == b->policy);
+	CHECK_EQ(fakeip_policy_refs(db, "r", 1), 2);
+	fakeip_unref(db, b);
+	CHECK_EQ(fakeip_policy_refs(db, "r", 1), 1);
+	CHECK_EQ(fakeip_policy_count(db), 2);
+
+	/* many rules: accessors stay right, ids are reused, not grown */
+	time_override_advance(100);
+	fakeip_evict_expired(db);
+	CHECK_EQ(fakeip_policy_count(db), 0);
+	for (int round = 0; round < 3; round++) {
+		for (int i = 0; i < 1000; i++) {
+			snprintf(rule, sizeof(rule), "rule%d", i);
+			for (uint32_t m = 1; m <= 2; m++) {
+				x = bind4(db, rule, m, "h.example", round, 5, &err);
+				REQUIRE(x);
+				CHECK_STR(fakeip_rule_id(db, x), rule);
+				CHECK_EQ(fakeip_mark(db, x), m);
+				if (x->policy > maxid)
+					maxid = x->policy;
+			}
+		}
+		CHECK_EQ(fakeip_policy_count(db), 2000);
+		CHECK(maxid < 2000);
+		time_override_advance(10);
+		CHECK_EQ(fakeip_evict_expired(db), 2000);
+		CHECK_EQ(fakeip_policy_count(db), 0);
+	}
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
+/* at most FAKEIP_MAX_POLICIES pairs: then bind fails (never a real IP) */
+TEST(policy_exhaustion)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db = fakeip_new(&p4, NULL, 70000, 0, SECRET, NFT);
+	struct binding *b, *keep = NULL;
+	char rule[16];
+	int err;
+
+	reset();
+	kern_off = true;
+	for (uint32_t i = 0; i < FAKEIP_MAX_POLICIES; i++) {
+		snprintf(rule, sizeof(rule), "p%u", i);
+		b = bind4(db, rule, 1, "x.example", 1, i ? 5 : 60, &err);
+		REQUIRE(b);
+		if (!i)
+			keep = b;
+	}
+	CHECK_EQ(fakeip_policy_count(db), FAKEIP_MAX_POLICIES);
+	CHECK_EQ(fakeip_count(db), FAKEIP_MAX_POLICIES);
+	CHECK(!bind4(db, "overflow", 1, "x.example", 1, 5, &err));
+	CHECK_EQ(err, -ENOSPC);
+	CHECK(!bind4(db, "p7", 2, "x.example", 1, 5, &err));	/* new mark = new pair */
+	CHECK_EQ(err, -ENOSPC);
+	CHECK_EQ(fakeip_count(db), FAKEIP_MAX_POLICIES);
+	CHECK_EQ(fakeip_policy_count(db), FAKEIP_MAX_POLICIES);
+	/* existing pairs still bind */
+	b = bind4(db, "p7", 1, "y.example", 1, 5, &err);
+	REQUIRE(b);
+	CHECK_EQ(fakeip_policy_refs(db, "p7", 1), 2);
+	/* once bindings expire, a full table makes room from them */
+	fakeip_ref(keep);
+	time_override_advance(10);
+	b = bind4(db, "overflow", 1, "x.example", 1, 5, &err);
+	REQUIRE(b);
+	CHECK_STR(fakeip_rule_id(db, b), "overflow");
+	CHECK(b->policy < FAKEIP_MAX_POLICIES);
+	CHECK_EQ(fakeip_policy_count(db), 2);	/* keep (referenced) + overflow */
+	CHECK_EQ(fakeip_count(db), 2);
+	CHECK_STR(fakeip_rule_id(db, keep), "p0");
+	fakeip_unref(db, keep);
 	fakeip_free(db);
 }
 
@@ -931,6 +1173,9 @@ int main(void)
 	RUN(stale_mark);
 	RUN(capacity);
 	RUN(stress);
+	RUN(policy_stress);
+	RUN(policy_refcount);
+	RUN(policy_exhaustion);
 	RUN(pinned);
 	return test_summary();
 }
