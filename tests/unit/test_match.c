@@ -227,14 +227,13 @@ TEST(name_text)
 
 /* ---- naive matcher for differential testing ---- */
 
-static bool pat_hit(const char *e, const char *name, size_t len)
+static bool pat_hit(const char *p, bool suffix, const char *name, size_t len)
 {
-	const char *p = ns_name(e);
 	size_t plen = strlen(p);
 
 	if (len == plen && !memcmp(name, p, len))
 		return true;
-	if (!ns_is_suffix(e) || len <= plen)
+	if (!suffix || len <= plen)
 		return false;
 	return name[len - plen - 1] == '.' && !memcmp(name + len - plen, p, plen);
 }
@@ -253,9 +252,11 @@ static uint16_t naive(const struct rule *rules, uint16_t nrules, const char *nam
 		for (uint16_t j = 0; j < r->nfiles; j++) {
 			const struct nameset_file *f = r->files[j];
 
-			for (const char *e = f->blob; e < f->blob + f->blob_len; e = ns_next(e))
-				if (pat_hit(e, name, len))
-					return r->ord;
+			for (int sfx = 0; sfx < 2; sfx++)
+				for (const char *e = ns_begin(f, sfx); e < ns_end(f, sfx);
+				     e = ns_next(e))
+					if (pat_hit(e, sfx, name, len))
+						return r->ord;
 		}
 	}
 	return MATCH_NONE;
@@ -685,6 +686,8 @@ static void bench_set(char (*pats)[80], uint32_t npat, const char *what)
 	fprintf(stderr, "  %s build: %u nodes in %.1f ms, footprint %zu bytes (%.1f B/pattern)\n",
 		what, match_nodes(idx), (t1 - t0) * 1e3, match_footprint(idx),
 		(double)match_footprint(idx) / match_nodes(idx));
+	fprintf(stderr, "  %s blob: %u bytes (suffix region %u)\n", what,
+		rs.f[0]->blob_len, rs.f[0]->suffix_len);
 
 	for (int i = 0; i < NN; i++) {
 		const char *p = pats[((uint32_t)i * 2654435761u) % npat];
@@ -766,11 +769,13 @@ TEST(bulk_file)
 	fclose(fp);
 	REQUIRE(!nameset_parse(text, (size_t)len, 0, &f, &inval, path));
 	free(text);
+	fprintf(stderr, "  %s: %u patterns, %zu text bytes, blob %u bytes "
+	        "(suffix region %u)\n", path, f.npat, (size_t)len, f.blob_len, f.suffix_len);
 	pats = malloc(f.npat * sizeof(*pats));
-	for (const char *e = f.blob; e < f.blob + f.blob_len; e = ns_next(e))
-		if (strlen(ns_name(e)) < 77)
-			snprintf(pats[n++], sizeof(pats[0]), "%s%s", ns_is_suffix(e) ? "*." : "",
-			         ns_name(e));
+	for (int sfx = 0; sfx < 2; sfx++)
+		for (const char *e = ns_begin(&f, sfx); e < ns_end(&f, sfx); e = ns_next(e))
+			if (strlen(e) < 77)
+				snprintf(pats[n++], sizeof(pats[0]), "%s%s", sfx ? "*." : "", e);
 	bench_set(pats, n, path);
 	free(pats);
 	free(f.blob);

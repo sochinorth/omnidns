@@ -108,9 +108,11 @@ void upstream_set_put(struct upstream_set *u);
  * if it is a comment), so results only depend on the window size for lines
  * at least that long.
  *
- * Valid patterns are stored in f->blob as consecutive NUL-terminated
- * entries "[*.]name\0", f->blob_len bytes in total (blob NULL when
- * f->npat is 0). Returns 0 or -ENOMEM.
+ * Valid patterns are stored in f->blob as NUL-terminated names without
+ * "*.", f->blob_len bytes in total (blob NULL when f->npat is 0): the
+ * suffix patterns first (f->suffix_len bytes, in file order), then the exact
+ * ones (in reverse file order). Identical text always gives an identical
+ * blob. Returns 0 or -ENOMEM.
  */
 #define NAMESET_WINDOW	(64u << 10)
 
@@ -118,6 +120,10 @@ struct nameset_file;
 
 int nameset_parse(const char *text, size_t len, size_t window,
                   struct nameset_file *f, uint32_t *ninvalid, const char *path);
+/* The same, sizing the output for size_hint bytes of text as a file is sized
+ * by fstat(): size_hint < len acts like a file that grew while being read. */
+int nameset_parse_hint(const char *text, size_t len, size_t size_hint, size_t window,
+                       struct nameset_file *f, uint32_t *ninvalid, const char *path);
 
 struct nameset_file {
 	char *path;
@@ -127,20 +133,25 @@ struct nameset_file {
 	off_t size;
 	int refcnt;
 	uint32_t blob_len;
+	uint32_t suffix_len;	/* suffix region [0, suffix_len), exact the rest */
 	uint32_t npat;
 	char *blob;
 };
 
-/* Walking a blob: for (e = f->blob; e < f->blob + f->blob_len; e = ns_next(e)).
- * A leading "*." marks a suffix pattern ('*' is not a name character). */
-static inline bool ns_is_suffix(const char *e)
+/*
+ * Walking one region of a blob:
+ *   for (e = ns_begin(f, sfx); e < ns_end(f, sfx); e = ns_next(e))
+ * visits the suffix (sfx) or exact (!sfx) pattern names. Empty for a file
+ * without patterns.
+ */
+static inline const char *ns_begin(const struct nameset_file *f, bool suffix)
 {
-	return e[0] == '*';
+	return !f->blob ? NULL : suffix ? f->blob : f->blob + f->suffix_len;
 }
 
-static inline const char *ns_name(const char *e)
+static inline const char *ns_end(const struct nameset_file *f, bool suffix)
 {
-	return ns_is_suffix(e) ? e + 2 : e;
+	return !f->blob ? NULL : f->blob + (suffix ? f->suffix_len : f->blob_len);
 }
 
 static inline const char *ns_next(const char *e)

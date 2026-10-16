@@ -380,8 +380,13 @@ static const char *strip_comment(const char *s, const char *e)
  * Nameset parsing. The text is read window by window from a source at an
  * explicit offset; a window is parsed up to its last complete line and the
  * next one is read from that line's start, so no state crosses windows.
- * Each valid line is copied once, straight into the output blob, and
- * validated (and lowercased) there.
+ * Each valid line is copied once, straight into the output buffer, and
+ * validated (and lowercased) there: suffix names (without "*.") forward from
+ * the front, exact names backward from the end (each still a forward
+ * NUL-terminated string, so the exact region comes out in reverse line
+ * order). At the end the exact region is moved down to follow the suffix
+ * region. The result depends only on the text, not on the window size or on
+ * the buffer having to grow.
  */
 
 /* Reads up to len bytes at offset pos: count (< len only at EOF) or -errno. */
@@ -389,7 +394,7 @@ typedef ssize_t (*ns_read_fn)(void *ctx, char *buf, size_t len, uint64_t pos);
 
 struct ns_out {
 	char *buf;
-	size_t len, cap;
+	size_t front, back, cap;	/* suffix region [0, front), exact [back, cap) */
 	uint32_t npat, bad;
 	const char *path;
 };
@@ -404,33 +409,40 @@ static void ns_invalid(struct ns_out *o, uint32_t lineno, const char *s, size_t 
 /* One trimmed line [s, e). */
 static int ns_line(struct ns_out *o, const char *s, const char *e, uint32_t lineno)
 {
-	size_t l, skip;
+	size_t l, n;
+	bool suffix;
 	char *q;
 
 	if (s == e || *s == '#')
 		return 0;
 	e = strip_comment(s, e);
 	l = (size_t)(e - s);
-	skip = l >= 2 && s[0] == '*' && s[1] == '.' ? 2 : 0;
-	if (l - skip <= 253) {
-		if (o->cap - o->len < l + 1) {
+	suffix = l >= 2 && s[0] == '*' && s[1] == '.';
+	n = suffix ? l - 2 : l;		/* name length */
+	if (n <= 253) {
+		if (o->back - o->front < n + 1) {
 			/* only if the file grew after fstat() */
-			size_t cap = o->cap + o->cap / 2;
+			size_t cap = o->cap + o->cap / 2, tail = o->cap - o->back;
 			char *nb;
 
-			if (cap < o->len + l + 1)
-				cap = o->len + l + 1;
+			if (cap < o->front + tail + n + 1)
+				cap = o->front + tail + n + 1;
 			nb = realloc(o->buf, cap);
 			if (!nb)
 				return -ENOMEM;
+			memmove(nb + cap - tail, nb + o->back, tail);
 			o->buf = nb;
+			o->back = cap - tail;
 			o->cap = cap;
 		}
-		q = o->buf + o->len;
-		memcpy(q, s, l);
-		q[l] = 0;
-		if (pattern_valid(q + skip, l - skip)) {
-			o->len += l + 1;
+		q = suffix ? o->buf + o->front : o->buf + o->back - (n + 1);
+		memcpy(q, suffix ? s + 2 : s, n);
+		q[n] = 0;
+		if (pattern_valid(q, n)) {
+			if (suffix)
+				o->front += n + 1;
+			else
+				o->back -= n + 1;
 			o->npat++;
 			return 0;
 		}
@@ -457,7 +469,9 @@ static int64_t ns_skip_line(ns_read_fn rd, void *ctx, char *win, size_t window,
 	}
 }
 
-/* `size` is the expected text size; the blob never needs more than size + 1. */
+/* `size` is the expected text size; the blob never needs more than size + 1
+ * (an entry takes at most its line plus a NUL, and only the last line can
+ * lack a newline). */
 static int ns_parse(ns_read_fn rd, void *ctx, size_t window, size_t size,
                     struct nameset_file *f, uint32_t *ninvalid, const char *path)
 {
@@ -469,6 +483,7 @@ static int ns_parse(ns_read_fn rd, void *ctx, size_t window, size_t size,
 
 	if (!window)
 		window = NAMESET_WINDOW;
+	o.back = o.cap;
 	o.buf = malloc(o.cap);
 	win = malloc(window);
 	if (!o.buf || !win)
@@ -529,18 +544,20 @@ next:;
 		log_warn("%s: %u invalid patterns in total", path ? path : "nameset", o.bad);
 	if (ninvalid)
 		*ninvalid = o.bad;
+	f->suffix_len = (uint32_t)o.front;
+	f->blob_len = (uint32_t)(o.front + o.cap - o.back);
 	if (!o.npat) {
 		free(o.buf);
 		o.buf = NULL;
-		o.len = 0;
 	} else {
-		char *nb = realloc(o.buf, o.len);
+		char *nb;
 
+		memmove(o.buf + o.front, o.buf + o.back, o.cap - o.back);
+		nb = realloc(o.buf, f->blob_len);
 		if (nb)
 			o.buf = nb;
 	}
 	f->blob = o.buf;
-	f->blob_len = (uint32_t)o.len;
 	f->npat = o.npat;
 	o.buf = NULL;
 	ret = 0;
@@ -586,12 +603,18 @@ static ssize_t ns_read_fd(void *ctx, char *buf, size_t len, uint64_t pos)
 	return (ssize_t)n;
 }
 
-int nameset_parse(const char *text, size_t len, size_t window,
-                  struct nameset_file *f, uint32_t *ninvalid, const char *path)
+int nameset_parse_hint(const char *text, size_t len, size_t size_hint, size_t window,
+                       struct nameset_file *f, uint32_t *ninvalid, const char *path)
 {
 	struct ns_mem m = { text, len };
 
-	return ns_parse(ns_read_mem, &m, window, len, f, ninvalid, path);
+	return ns_parse(ns_read_mem, &m, window, size_hint, f, ninvalid, path);
+}
+
+int nameset_parse(const char *text, size_t len, size_t window,
+                  struct nameset_file *f, uint32_t *ninvalid, const char *path)
+{
+	return nameset_parse_hint(text, len, len, window, f, ninvalid, path);
 }
 
 /* ---- nameset cache ----
@@ -684,7 +707,7 @@ struct nameset_file *nsc_get(struct nameset_cache *c, const char *path, int *err
 	if (!f)
 		return NULL;
 	if (old && old->npat == f->npat && old->blob_len == f->blob_len &&
-	    (!f->blob_len || !memcmp(old->blob, f->blob, f->blob_len))) {
+	    old->suffix_len == f->suffix_len && (!f->blob_len || !memcmp(old->blob, f->blob, f->blob_len))) {
 		/* touched or replaced with identical patterns: keep the object,
 		 * so configs (and their match index) still compare equal */
 		old->dev = f->dev;

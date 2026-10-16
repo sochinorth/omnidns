@@ -331,6 +331,22 @@ TEST(nsc_reuse)
 	CHECK(!nsc_get(&nsc, P("ns/missing.txt"), &e));
 	CHECK_EQ(e, -ENOENT);
 
+	/* the same bytes with a different region boundary are different patterns */
+	wfile("ns/k.txt", "d.x\nd.x\n");
+	a = nsc_get(&nsc, P("ns/k.txt"), &e);
+	REQUIRE(a);
+	CHECK_EQ(a->suffix_len, 0);
+	wfile("ns/k.txt", "*.d.x\n*.d.x\n");
+	b = nsc_get(&nsc, P("ns/k.txt"), &e);
+	REQUIRE(b);
+	CHECK(b != a);
+	CHECK_EQ(b->blob_len, a->blob_len);
+	CHECK(!memcmp(b->blob, a->blob, a->blob_len));
+	CHECK_EQ(b->suffix_len, 8);
+	nsc_put(a);
+	nsc_put(b);
+	nsc_sweep(&nsc);
+
 	/* through config_load: unchanged files are shared between configs */
 	c1 = loadf(GLOBAL "config rule 'r'\n\toption action 'block'\n"
 	           "\tlist nameset '%s/ns/r.txt'\n" CATCHALL, dir, dir);
@@ -655,14 +671,38 @@ static uint32_t ns(const char *text, uint32_t *inval)
 	return ns_win(text, strlen(text), 0, inval);
 }
 
-/* i-th entry of nsr.blob */
-static const char *ent(uint32_t i)
+static uint32_t count(bool suffix)
 {
-	const char *e = nsr.blob;
+	uint32_t n = 0;
 
+	for (const char *e = ns_begin(&nsr, suffix); e < ns_end(&nsr, suffix); e = ns_next(e))
+		n++;
+	return n;
+}
+
+/* i-th entry of a region of nsr.blob, in file order ("" if none) */
+static const char *nth(bool suffix, uint32_t i)
+{
+	uint32_t n = count(suffix);
+	const char *e = ns_begin(&nsr, suffix);
+
+	if (i >= n)
+		return "";
+	if (!suffix)
+		i = n - 1 - i;	/* the exact region is in reverse file order */
 	while (i--)
 		e = ns_next(e);
 	return e;
+}
+
+static const char *sfx(uint32_t i)
+{
+	return nth(true, i);
+}
+
+static const char *exa(uint32_t i)
+{
+	return nth(false, i);
 }
 
 TEST(nameset_edge)
@@ -676,16 +716,16 @@ TEST(nameset_edge)
 	       "last.line", &inval);
 	REQUIRE(n == 5);
 	CHECK_EQ(inval, 8);
-	CHECK_STR(ent(0), "example.com");
-	CHECK(!ns_is_suffix(ent(0)));
-	CHECK_STR(ent(1), "*.ads.net");
-	CHECK(ns_is_suffix(ent(1)));
-	CHECK_STR(ns_name(ent(1)), "ads.net");
-	CHECK_STR(ent(2), "under_score-ok.x");
-	CHECK_STR(ent(3), "1.2.3.4");
-	CHECK_STR(ent(4), "last.line");	/* no trailing newline */
-	CHECK_EQ(nsr.blob_len, 12 + 10 + 17 + 8 + 10);	/* exact size */
-	CHECK(ns_next(ent(4)) == nsr.blob + nsr.blob_len);
+	CHECK_EQ(count(true), 1);
+	CHECK_EQ(count(false), 4);
+	CHECK_STR(sfx(0), "ads.net");
+	CHECK_STR(exa(0), "example.com");
+	CHECK_STR(exa(1), "under_score-ok.x");
+	CHECK_STR(exa(2), "1.2.3.4");
+	CHECK_STR(exa(3), "last.line");	/* no trailing newline */
+	CHECK_EQ(nsr.suffix_len, 8);
+	CHECK_EQ(nsr.blob_len, 8 + 12 + 17 + 8 + 10);	/* exact size, no "*." */
+	CHECK(ns_next(exa(0)) == nsr.blob + nsr.blob_len);
 
 	memset(l63, 'a', 63);
 	strcpy(l63 + 63, ".com\n");
@@ -704,7 +744,7 @@ TEST(nameset_edge)
 	}
 	big[253] = 0;
 	CHECK_EQ(ns(big, &inval), 1);
-	CHECK_EQ(strlen(ent(0)), 253);
+	CHECK_EQ(strlen(exa(0)), 253);
 	big[253] = 'b';
 	big[254] = 'b';
 	big[255] = 0;
@@ -720,8 +760,9 @@ TEST(nameset_edge)
 	big[0] = '*';
 	big[1] = '.';
 	CHECK_EQ(ns(big, &inval), 1);
-	CHECK(ns_is_suffix(ent(0)));
-	CHECK_EQ(nsr.blob_len, 256);
+	CHECK_EQ(strlen(sfx(0)), 253);
+	CHECK_EQ(nsr.suffix_len, 254);
+	CHECK_EQ(nsr.blob_len, 254);
 
 	CHECK_EQ(ns("", &inval), 0);
 	CHECK(nsr.blob == NULL);
@@ -731,17 +772,64 @@ TEST(nameset_edge)
 	CHECK(nsr.blob == NULL);
 	CHECK_EQ(ns("*.x\n*.x\n", &inval), 2);	/* dups are kept */
 	CHECK_EQ(ns("A.B\r\n*.C.D\r\nE\r", &inval), 3);	/* CRLF, lowercased */
-	CHECK_STR(ent(0), "a.b");
-	CHECK_STR(ent(1), "*.c.d");
-	CHECK_STR(ent(2), "e");
-	CHECK_EQ(nsr.blob_len, 4 + 6 + 2);
-	/* order kept around invalid / comment / blank lines */
+	CHECK_STR(exa(0), "a.b");
+	CHECK_STR(sfx(0), "c.d");
+	CHECK_STR(exa(1), "e");
+	CHECK_EQ(nsr.blob_len, 4 + 4 + 2);
+	/* order kept around invalid / comment / blank lines: suffix names in
+	 * file order, then the exact ones reversed */
 	CHECK_EQ(ns("bad!\none\n\n#c\ntwo  # c\n-x-..\n*.three\nb@d\nfour", &inval), 4);
 	CHECK_EQ(inval, 3);
-	CHECK_STR(ent(0), "one");
-	CHECK_STR(ent(1), "two");
-	CHECK_STR(ent(2), "*.three");
-	CHECK_STR(ent(3), "four");
+	CHECK_EQ(nsr.blob_len, 19);
+	CHECK(!memcmp(nsr.blob, "three\0four\0two\0one\0", 19));
+	CHECK_EQ(nsr.suffix_len, 6);
+}
+
+TEST(nameset_regions)
+{
+	static const char only_sfx[] = "*.a.x\n*.B.x\n# c\n*.c.x";
+	static const char only_exa[] = "a.x\nb.X\n\nc.x\n";
+	static const char mixed[] = "e1.x\n*.s1.x\ne2.x\n*.s2.x\n*.s3.x\ne3.x\n*.s4.x";
+	uint32_t inval;
+
+	CHECK_EQ(ns(only_sfx, &inval), 3);
+	CHECK_EQ(nsr.suffix_len, nsr.blob_len);
+	CHECK_EQ(nsr.blob_len, 12);
+	CHECK(!memcmp(nsr.blob, "a.x\0b.x\0c.x\0", 12));
+	CHECK_EQ(count(false), 0);
+
+	CHECK_EQ(ns(only_exa, &inval), 3);
+	CHECK_EQ(nsr.suffix_len, 0);
+	CHECK_EQ(nsr.blob_len, 12);
+	CHECK(!memcmp(nsr.blob, "c.x\0b.x\0a.x\0", 12));
+	CHECK_EQ(count(true), 0);
+
+	CHECK_EQ(ns(mixed, &inval), 7);
+	CHECK_EQ(inval, 0);
+	CHECK_EQ(count(true), 4);
+	CHECK_EQ(count(false), 3);
+	CHECK_EQ(nsr.suffix_len, 4 * 5);
+	CHECK_EQ(nsr.blob_len, 7 * 5);
+	CHECK(!memcmp(nsr.blob, "s1.x\0s2.x\0s3.x\0s4.x\0e3.x\0e2.x\0e1.x\0", 35));
+	for (uint32_t i = 0; i < 4; i++) {
+		char want[8];
+
+		snprintf(want, sizeof(want), "s%u.x", i + 1);
+		CHECK_STR(sfx(i), want);
+		if (i < 3) {
+			snprintf(want, sizeof(want), "e%u.x", i + 1);
+			CHECK_STR(exa(i), want);
+		}
+	}
+
+	CHECK_EQ(ns("", &inval), 0);
+	CHECK_EQ(nsr.suffix_len, 0);
+	CHECK_EQ(nsr.blob_len, 0);
+	CHECK(ns_begin(&nsr, true) == ns_end(&nsr, true));
+	CHECK(ns_begin(&nsr, false) == ns_end(&nsr, false));
+	CHECK_EQ(ns("bad!\n*.\n", &inval), 0);
+	CHECK_EQ(inval, 2);
+	CHECK(nsr.blob == NULL);
 }
 
 /* Lines longer than the window are invalid (comments: ignored) and skipped
@@ -762,56 +850,73 @@ TEST(nameset_long_lines)
 	o += (size_t)sprintf(t + o, "\nthird.x");
 	CHECK_EQ(ns_win(t, o, 0, &inval), 3);
 	CHECK_EQ(inval, 1);
-	CHECK_STR(ent(1), "second.x");
-	CHECK_STR(ent(2), "third.x");
+	CHECK_STR(exa(1), "second.x");
+	CHECK_STR(exa(2), "third.x");
 	/* small window: the comment line is ignored, the name lines fit */
 	CHECK_EQ(ns_win(t, o, 128, &inval), 3);
 	CHECK_EQ(inval, 1);
-	CHECK_STR(ent(2), "third.x");
+	CHECK_STR(exa(2), "third.x");
 	/* long line running into EOF, and one exactly filling the last window */
 	CHECK_EQ(ns_win("ok\nxxxxxxxxxxxxxxxxxxxx", 23, 8, &inval), 1);
 	CHECK_EQ(inval, 1);
 	CHECK_EQ(ns_win("ok\nabc.def", 10, 7, &inval), 2);
 	CHECK_EQ(inval, 0);
-	CHECK_STR(ent(1), "abc.def");
+	CHECK_STR(exa(1), "abc.def");
 	CHECK_EQ(ns_win("abc.def", 7, 7, &inval), 1);
 	/* a blank (whitespace-only) line filling the window is just blank */
 	CHECK_EQ(ns_win("        \nfoo.com\n", 17, 8, &inval), 1);
 	CHECK_EQ(inval, 0);
-	CHECK_STR(ent(0), "foo.com");
+	CHECK_STR(exa(0), "foo.com");
 	CHECK_EQ(ns_win(" \t\r     \r\nfoo.com", 17, 8, &inval), 1);
 	CHECK_EQ(inval, 0);
 	free(t);
 }
 
-/* Window boundaries anywhere must not change the result for lines that fit
- * in a window. */
+/* Parses like ns_win(), sizing the output for size_hint bytes of text. */
+static uint32_t ns_hint(const char *text, size_t len, size_t size_hint, size_t window,
+                        uint32_t *inval)
+{
+	free(nsr.blob);
+	memset(&nsr, 0, sizeof(nsr));
+	CHECK_EQ(nameset_parse_hint(text, len, size_hint, window, &nsr, inval, "test"), 0);
+	return nsr.npat;
+}
+
+static bool same_as(uint32_t n, uint32_t inval, uint32_t n0, uint32_t inval0,
+                    const struct nameset_file *f0)
+{
+	return n == n0 && inval == inval0 && nsr.blob_len == f0->blob_len &&
+	       nsr.suffix_len == f0->suffix_len &&
+	       (!f0->blob_len || !memcmp(nsr.blob, f0->blob, f0->blob_len));
+}
+
+/* Window boundaries anywhere, or the output buffer having to grow (a file
+ * that grew after fstat()), must not change the blob, byte for byte, for
+ * lines that fit in a window. */
 static void check_windows(const char *text, size_t minwin)
 {
 	size_t len = strlen(text);
-	uint32_t n0, inval0, inval;
-	char *blob0;
-	uint32_t len0;
+	uint32_t n0, inval0, inval, n;
+	struct nameset_file f0;
 	int bad = 0;
 
 	n0 = ns_win(text, len, len + 1, &inval0);	/* single pass */
-	blob0 = nsr.blob;
-	len0 = nsr.blob_len;
+	f0 = nsr;
 	nsr.blob = NULL;
 	for (size_t w = minwin; w <= len + 2; w++) {
-		bool same = ns_win(text, len, w, &inval) == n0 && inval == inval0 &&
-		            nsr.blob_len == len0 &&
-		            (!len0 || !memcmp(nsr.blob, blob0, len0));
-
-		if (!same && bad++ < 3)
+		n = ns_win(text, len, w, &inval);
+		if (!same_as(n, inval, n0, inval0, &f0) && bad++ < 3)
 			fprintf(stderr, "  window %zu differs\n", w);
 	}
-	CHECK_EQ(ns_win(text, len, 0, &inval), n0);
-	CHECK_EQ(inval, inval0);
-	CHECK_EQ(nsr.blob_len, len0);
-	CHECK(!len0 || !memcmp(nsr.blob, blob0, len0));
+	for (size_t h = 0; h < len; h++) {
+		n = ns_hint(text, len, h, h % 2 ? minwin : 0, &inval);
+		if (!same_as(n, inval, n0, inval0, &f0) && bad++ < 3)
+			fprintf(stderr, "  size hint %zu differs\n", h);
+	}
+	n = ns_win(text, len, 0, &inval);
+	CHECK(same_as(n, inval, n0, inval0, &f0));
 	CHECK_EQ(bad, 0);
-	free(blob0);
+	free(f0.blob);
 }
 
 TEST(nameset_windows)
@@ -916,6 +1021,7 @@ int main(void)
 	RUN(reload_fwmask_policy);
 	RUN(resolvconf);
 	RUN(nameset_edge);
+	RUN(nameset_regions);
 	RUN(nameset_long_lines);
 	RUN(nameset_windows);
 	RUN(prefix_mark);

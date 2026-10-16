@@ -161,23 +161,24 @@ static void add_file(struct match_index *idx, const struct nameset_file *f,
 {
 	uint16_t file = base_of(idx, f->blob);
 
-	for (const char *e = f->blob; e < f->blob + f->blob_len; e = ns_next(e)) {
-		const char *name = ns_name(e);
-		size_t len = strlen(name);
-		uint64_t h = omni_hash(name, len);
-		struct mslot *s = find(idx, name, len, h);
+	for (int sfx = 0; sfx < 2; sfx++) {
+		for (const char *e = ns_begin(f, sfx); e < ns_end(f, sfx); e = ns_next(e)) {
+			size_t len = strlen(e);
+			uint64_t h = omni_hash(e, len);
+			struct mslot *s = find(idx, e, len, h);
+			uint16_t *o;
 
-		if (s->file == MSLOT_EMPTY) {
-			s->off = (uint32_t)(name - f->blob);
-			s->file = file;
-			s->tag = (uint16_t)(h >> 48);
-			s->exact_ord = s->suffix_ord = MATCH_NONE;
-			idx->len++;
+			if (s->file == MSLOT_EMPTY) {
+				s->off = (uint32_t)(e - f->blob);
+				s->file = file;
+				s->tag = (uint16_t)(h >> 48);
+				s->exact_ord = s->suffix_ord = MATCH_NONE;
+				idx->len++;
+			}
+			o = sfx ? &s->suffix_ord : &s->exact_ord;
+			if (ord < *o)
+				*o = ord;
 		}
-		if (ns_is_suffix(e) && ord < s->suffix_ord)
-			s->suffix_ord = ord;
-		else if (!ns_is_suffix(e) && ord < s->exact_ord)
-			s->exact_ord = ord;
 	}
 }
 

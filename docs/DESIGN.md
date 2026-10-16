@@ -109,9 +109,16 @@ The lowest ordinal wins; if nothing matches, the catchall applies. A lookup
 costs one hash probe per label and never allocates.
 
 Each pattern is stored once. A nameset file is read through a fixed 64 KiB
-window into one exact-size blob of NUL-terminated entries (`*.` kept as the
-suffix flag); parsed files are cached across reloads, keyed by inode, mtime
-and size. The table is built once per configuration, sized for the patterns of
+window into one exact-size blob of NUL-terminated names. The pattern type is
+encoded by region, not per entry: suffix names (without `*.`) come first and
+exact names after them, with one boundary offset per file. The parser fills
+a single buffer from both ends, suffix names forward from the front and exact
+names backward from the back, then moves the exact region down and trims the
+buffer. The exact region thus comes out in reverse file order, which matching
+ignores, and identical text always gives an identical blob. Dropping the `*.`
+saves 2 bytes per suffix pattern, 389 KiB on HaGeZi Pro (all 199k patterns
+are `*.`; its blob shrinks from 4.17 to 3.77 MB). Parsed files are cached
+across reloads, keyed by inode, mtime and size. The table is built once per configuration, sized for the patterns of
 the distinct files, and never grows. Its 12-byte slots hold no names: they
 point into the blobs (file index and offset) and carry a 16-bit hash tag and
 the two ordinals. The configuration's references keep the files alive as long
