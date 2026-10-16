@@ -110,8 +110,8 @@ costs one hash probe per label and never allocates.
 Each pattern is stored once. A nameset file is read through a fixed 64 KiB
 window into one exact-size blob of NUL-terminated entries (`*.` kept as the
 suffix flag); parsed files are cached across reloads, keyed by inode, mtime
-and size. The table is built once per configuration, sized for the total
-pattern count (at most 75% full), and never grows. Its 12-byte slots hold no
+and size. The table is built once per configuration, sized for the patterns of
+the distinct files (at most 75% full), and never grows. Its 12-byte slots hold no
 names: they point into the blobs (file index and offset) and carry a 16-bit
 hash tag and the two ordinals. The configuration's references keep the
 files alive as long as the table. 100k patterns build in about 4 ms with a
@@ -328,7 +328,10 @@ output_reject      (filter, output,     filter-1):  same
 - **Key**: lowercased qname, qtype, qclass. Upstream queries always use DO=0,
   so the DO bit is not part of the key.
 - **Value**:
-  - a compact copy of the final message;
+  - a compact copy of the final message: 16-byte records whose owner and
+    rdata names are stored once per entry, in a single allocation with the
+    rest of the entry (about 280 bytes for a CNAME plus three A records).
+    Answers too large for its 16-bit offsets are not cached;
   - insert time and lifetime;
   - the walk's dependencies;
   - references to the bindings in the answer;
@@ -449,5 +452,8 @@ interface comes up, since WAN reconnects rewrite `resolv.conf.auto`.
   - router-originated traffic;
   - reload semantics;
   - a garbage-packet flood.
+- **Memory**: `tests/integ/test_mem.py` runs an unsanitized build with 75k
+  synthetic patterns, fills the cache and 20k bindings, reloads, and compares
+  RSS per phase against `tests/integ/mem_baseline.json`.
 - **Fuzzing**: the DNS parser/builder and the SVCB rewriter have libFuzzer
   targets.
