@@ -27,9 +27,24 @@ static bool destroy_on_exit;
 static bool log_to_stderr;
 
 /*
- * Mark chains installed so far. They are kept across reloads until the
- * fwmask changes: walks in flight across a reload may still bind with a
- * mark the new config no longer uses, and chains are tiny.
+ * Mark chains installed so far (= the nft shadow's marks). They are kept
+ * across reloads until the fwmask changes: walks in flight across a reload
+ * may still bind with a mark the new config no longer uses, and chains are
+ * tiny.
+ *
+ * Invariant: at reconcile time every binding's mark is in kept_marks (or
+ * the binding DB is empty), so the desired state never has to consult the
+ * DB. reload() drains all element batches first; a failed batch drops its
+ * bindings (fakeip fail hook) and a batch only succeeds if its mark chains
+ * exist, i.e. were in the desired state of the last successful reconcile,
+ * which is kept_marks. Waiter callbacks run during the drain only answer
+ * or fail queries and never create bindings. Without an fwmask change
+ * kept_marks is carried into the new desired state, so no chain a binding
+ * uses is deleted. An fwmask change is only accepted once the DB is empty
+ * (live bindings reject it, expired ones are evicted). A walk that latched
+ * a mark before the change and binds after it cannot break this either:
+ * its batch fails (the chain is gone) and is drained before the next
+ * reconcile.
  */
 static uint32_t kept_marks[MAX_MARKS];
 static uint32_t nkept_marks;
@@ -47,20 +62,15 @@ static void add_mark(uint32_t *marks, uint32_t *n, uint32_t m)
 
 /*
  * Desired dataplane: pools and fwmask from cfg, marks = marks of fakeip
- * rules in cfg, marks still referenced by bindings and (unless the mask
- * changes) every mark installed before.
+ * rules in cfg and (unless the mask changes) every mark installed before,
+ * which covers every mark still referenced by a binding (see kept_marks).
  */
 static int build_desired(const struct config *cfg, struct nft_desired *d, uint32_t *marks,
                          bool keep_old)
 {
-	uint32_t n = 0, i, nb;
+	uint32_t n = 0, i;
 	int r;
 
-	if (omni.fdb) {
-		nb = fakeip_marks_in_use(omni.fdb, marks, MAX_MARKS);
-		for (i = 0; i < nb; i++)
-			add_mark(marks, &n, marks[i]);
-	}
 	for (r = 0; r < cfg->nrules; r++)
 		if (cfg->rules[r].action == RULE_FAKEIP)
 			add_mark(marks, &n, cfg->rules[r].mark);

@@ -109,10 +109,6 @@ int fakeip_set_config(struct fakeip_db *db, const struct ip_prefix *p4,
 /* Number of non-evictable bindings (used to reject fwmask changes). */
 uint32_t fakeip_live_count(struct fakeip_db *db);
 
-/* Distinct marks referenced by any binding (shifted values). Returns count
- * written (at most max). */
-uint32_t fakeip_marks_in_use(struct fakeip_db *db, uint32_t *out, uint32_t max);
-
 /* Evict ALL expired, unreferenced bindings now (e.g. before an fwmask
  * change, whose old marks they still carry). Returns the number evicted. */
 uint32_t fakeip_evict_expired(struct fakeip_db *db);

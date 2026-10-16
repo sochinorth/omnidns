@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include "dns/wire.h"
 #include "fakeip.h"
 #include "log.h"
 #include "nft.h"
@@ -17,11 +18,6 @@ struct rule_str {
 	char s[];
 };
 
-struct mark_cnt {
-	uint32_t mark;
-	uint32_t cnt;
-};
-
 struct fakeip_db {
 	bool has4, has6;
 	struct ip_prefix p4, p6;
@@ -32,7 +28,6 @@ struct fakeip_db {
 	struct hmap by_key;	/* key_hash() -> binding (= b->s3.hash) */
 	struct hmap by_fake;	/* fake_hash() -> binding */
 	struct hmap rules;	/* interned rule_id strings */
-	struct hmap marks;	/* mark -> count */
 	struct s3fifo s3;
 };
 
@@ -63,11 +58,6 @@ static int norm_family(int family)
 	if (family == 6 || family == AF_INET6)
 		return 6;
 	return 0;
-}
-
-static inline uint8_t lower(uint8_t c)
-{
-	return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
 }
 
 static bool binding_evictable(const struct binding *b, uint32_t now)
@@ -266,45 +256,6 @@ static void rule_put(struct fakeip_db *db, const char *s)
 	free(r);
 }
 
-/* ---- mark refcounts ---- */
-
-static bool mark_eq(const void *val, const void *key, void *ctx)
-{
-	return ((const struct mark_cnt *)val)->mark == *(const uint32_t *)key;
-}
-
-static int mark_inc(struct fakeip_db *db, uint32_t mark)
-{
-	uint64_t h = omni_hash(&mark, sizeof(mark));
-	struct mark_cnt *m = hmap_get(&db->marks, h, &mark, mark_eq, NULL);
-
-	if (m) {
-		m->cnt++;
-		return 0;
-	}
-	m = malloc(sizeof(*m));
-	if (!m)
-		return -ENOMEM;
-	m->mark = mark;
-	m->cnt = 1;
-	if (hmap_put(&db->marks, h, m)) {
-		free(m);
-		return -ENOMEM;
-	}
-	return 0;
-}
-
-static void mark_dec(struct fakeip_db *db, uint32_t mark)
-{
-	uint64_t h = omni_hash(&mark, sizeof(mark));
-	struct mark_cnt *m = hmap_get(&db->marks, h, &mark, mark_eq, NULL);
-
-	if (!m || --m->cnt)
-		return;
-	hmap_del_ptr(&db->marks, h, m);
-	free(m);
-}
-
 /* ---- binding lifecycle ---- */
 
 static void binding_free(struct fakeip_db *db, struct binding *b)
@@ -313,12 +264,11 @@ static void binding_free(struct fakeip_db *db, struct binding *b)
 	free(b);
 }
 
-/* Remove from the maps (not from s3) and release the mark. */
+/* Remove from the maps (not from s3). */
 static void binding_unmap(struct fakeip_db *db, struct binding *b)
 {
 	hmap_del_ptr(&db->by_key, b->s3.hash, b);
 	hmap_del_ptr(&db->by_fake, fake_hash(b->family, b->fake), b);
-	mark_dec(db, b->mark);
 }
 
 /* Full removal; the binding is freed unless still referenced. */
@@ -421,13 +371,9 @@ void fakeip_free(struct fakeip_db *db)
 	it = 0;
 	while ((v = hmap_next(&db->rules, &it)))
 		free(v);
-	it = 0;
-	while ((v = hmap_next(&db->marks, &it)))
-		free(v);
 	hmap_free(&db->by_key);
 	hmap_free(&db->by_fake);
 	hmap_free(&db->rules);
-	hmap_free(&db->marks);
 	s3_destroy(&db->s3);
 	if (db->nft)
 		nft_set_fail_hook(db->nft, NULL, NULL);
@@ -514,8 +460,6 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	b->rule_id = rule_get(db, k->rule_id);
 	if (!b->rule_id)
 		goto fail_free;
-	if (mark_inc(db, k->mark))
-		goto fail_rule;
 	b->mark = k->mark;
 	b->family = k->family;
 	memcpy(b->fake, fake, alen(k->family));
@@ -524,10 +468,10 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	memcpy(b->endpoint, k->endpoint, k->endpoint_len);
 	b->safe_until = safe_until_for(db, now, ttl);
 	if (hmap_put(&db->by_key, khash, b))
-		goto fail_mark;
+		goto fail_rule;
 	if (hmap_put(&db->by_fake, fake_hash(b->family, b->fake), b)) {
 		hmap_del_ptr(&db->by_key, khash, b);
-		goto fail_mark;
+		goto fail_rule;
 	}
 	/* the victim is gone from the kernel by the replace below, no nft del */
 	if (victim)
@@ -536,8 +480,6 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	b->ticket = nft_elem_add(db->nft, b->family, b->fake, b->real, b->mark, victim != NULL);
 	return b;
 
-fail_mark:
-	mark_dec(db, k->mark);
 fail_rule:
 	rule_put(db, b->rule_id);
 fail_free:
@@ -559,15 +501,14 @@ struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t 
 	uint32_t now = omni_now(), su;
 	struct binding *b;
 	uint64_t khash;
-	int i;
 
 	k.family = norm_family(family);
 	if (!db_pool(db, k.family)) {
 		*err = -EAFNOSUPPORT;
 		return NULL;
 	}
-	for (i = 0; i < endpoint_len; i++)
-		ep[i] = lower(endpoint[i]);
+	memcpy(ep, endpoint, endpoint_len);
+	dns_name_lower(ep, endpoint_len);
 	khash = key_hash(db, &k);
 	b = hmap_get(&db->by_key, khash, &k, key_eq, NULL);
 	if (!b)
@@ -643,16 +584,6 @@ uint32_t fakeip_live_count(struct fakeip_db *db)
 
 	while ((b = hmap_next(&db->by_key, &it)))
 		n += !binding_evictable(b, now);
-	return n;
-}
-
-uint32_t fakeip_marks_in_use(struct fakeip_db *db, uint32_t *out, uint32_t max)
-{
-	struct mark_cnt *m;
-	uint32_t it = 0, n = 0;
-
-	while (n < max && (m = hmap_next(&db->marks, &it)))
-		out[n++] = m->mark;
 	return n;
 }
 

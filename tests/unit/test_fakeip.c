@@ -505,7 +505,6 @@ TEST(fail_hook)
 	struct ip_prefix p4 = pfx("198.18.0.0", 15);
 	struct fakeip_db *db = fakeip_new(&p4, NULL, 100, 0, SECRET, NFT);
 	struct binding *a, *b, *c, *a2;
-	uint32_t marks[4];
 	int err;
 
 	reset();
@@ -528,8 +527,6 @@ TEST(fail_hook)
 	CHECK_EQ(fakeip_count(db), 1);
 	CHECK(!fakeip_lookup(db, 4, afake));
 	CHECK(fakeip_lookup(db, 4, c->fake) == c);
-	CHECK_EQ(fakeip_marks_in_use(db, marks, 4), 1);
-	CHECK_EQ(marks[0], 7);
 	CHECK_STR(a->rule_id, "r");	/* detached but still valid while referenced */
 	a2 = bind4(db, "r", 7, "a.example", 1, 60, &err);
 	REQUIRE(a2);
@@ -609,31 +606,6 @@ TEST(set_config)
 	fakeip_free(db);
 }
 
-TEST(marks)
-{
-	struct ip_prefix p4 = pfx("198.18.0.0", 15);
-	struct fakeip_db *db = fakeip_new(&p4, NULL, 100, 0, SECRET, NFT);
-	uint32_t m[8];
-	int err;
-
-	reset();
-	CHECK_EQ(fakeip_marks_in_use(db, m, 8), 0);
-	bind4(db, "r", 0x100, "a", 1, 10, &err);
-	bind4(db, "r", 0x200, "b", 1, 1000, &err);
-	bind4(db, "q", 0x100, "c", 1, 1000, &err);
-	CHECK_EQ(fakeip_marks_in_use(db, m, 8), 2);
-	CHECK((m[0] == 0x100 && m[1] == 0x200) || (m[0] == 0x200 && m[1] == 0x100));
-	CHECK_EQ(fakeip_marks_in_use(db, m, 1), 1);
-	time_override_advance(2000);
-	/* force eviction of everything */
-	CHECK_EQ(fakeip_set_config(db, &p4, NULL, 1, 0), 0);
-	fakeip_maybe_evict(db);
-	CHECK_EQ(fakeip_count(db), 0);
-	CHECK_EQ(fakeip_marks_in_use(db, m, 8), 0);
-	CHECK_EQ(n_del, 3);
-	fakeip_free(db);
-}
-
 TEST(capacity)
 {
 	struct ip_prefix p4 = pfx("198.18.0.0", 15);
@@ -675,22 +647,21 @@ static uint32_t rnd(uint32_t n)
 static void check_invariants(struct fakeip_db *db, const struct ip_prefix *p4,
                              const struct ip_prefix *p6)
 {
-	uint32_t it = 0, n = 0, nm = 0, marks[16], seen = 0;
+	uint32_t it = 0, n = 0;
 	struct binding *b;
+	int k;
 
 	while ((b = fakeip_next(db, &it))) {
 		n++;
 		CHECK(allocatable(b->family == 4 ? p4 : p6, b));
 		CHECK(fakeip_lookup(db, b->family, b->fake) == b);
-		CHECK(kern_find(b->family, b->fake) >= 0);
-		seen |= 1u << (b->mark & 15);
+		k = kern_find(b->family, b->fake);
+		CHECK(k >= 0);
+		if (k >= 0)
+			CHECK_EQ(kern[k].mark, b->mark);
 	}
 	CHECK_EQ(n, fakeip_count(db));
 	CHECK_EQ(n, n_kern);	/* distinct fakes, 1:1 with kernel elements */
-	nm = fakeip_marks_in_use(db, marks, 16);
-	CHECK_EQ(nm, __builtin_popcount(seen));
-	for (uint32_t i = 0; i < nm; i++)
-		CHECK(seen & (1u << (marks[i] & 15)));
 	CHECK_EQ(kern_bad, 0);
 }
 
@@ -932,7 +903,6 @@ int main(void)
 	RUN(v6_pools);
 	RUN(fail_hook);
 	RUN(set_config);
-	RUN(marks);
 	RUN(capacity);
 	RUN(stress);
 	RUN(pinned);
