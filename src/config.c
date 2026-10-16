@@ -288,8 +288,10 @@ struct upstream_set *upstream_set_load(const char *path, char *err, size_t errle
 	struct upstream_server srv[UPSTREAM_MAX_SERVERS];
 	struct upstream_set *u;
 	struct stat st;
-	size_t len;
-	char *text;
+	/* read_file sets both whenever it returns 0; gcc cannot see that
+	 * `return -errno` is never 0 and warns at -O2 */
+	size_t len = 0;
+	char *text = NULL;
 	int n, skipped, ret;
 
 	ret = read_file(path, &text, &len, &st);
