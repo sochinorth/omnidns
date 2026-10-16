@@ -1,18 +1,27 @@
 {
  "startup": {
-  "VmRSS": 10504,
-  "RssAnon": 8128
+  "VmRSS": 5500,
+  "RssAnon": 3108,
+  "VmHWM": 5500
  },
  "cache 10k": {
-  "VmRSS": 16080,
-  "RssAnon": 13704
+  "VmRSS": 7212,
+  "RssAnon": 4820,
+  "VmHWM": 7212
  },
  "bindings 20k": {
-  "VmRSS": 21360,
-  "RssAnon": 18984
+  "VmRSS": 10604,
+  "RssAnon": 8212,
+  "VmHWM": 10604
  },
  "reload": {
-  "VmRSS": 24716,
-  "RssAnon": 22340
+  "VmRSS": 10728,
+  "RssAnon": 8336,
+  "VmHWM": 10728
+ },
+ "reload x5": {
+  "VmRSS": 10792,
+  "RssAnon": 8400,
+  "VmHWM": 10792
  }
 }
