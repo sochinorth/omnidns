@@ -547,6 +547,85 @@ def v6_pool_via_reload(env):
           "removing the v6 pool with live v6 bindings must be rejected")
 
 
+@test
+def mark_chain_overflow_rejects_reload(env):
+    """Mark chains are kept across reloads; past their cap a reload must be
+    rejected (clearly, keeping the previous configuration), never drop a
+    chain that live bindings still jump to."""
+    table, port, nrules = TABLE + "m", 5399, 1000
+    d = env.dir + "/marks"
+    os.makedirs(d, exist_ok=True)
+    with open(d + "/none.txt", "w") as f:
+        f.write("*.none.test\n")
+
+    def config(k):
+        rules = "".join("config rule 'r%d'\n\toption action 'fakeip'\n"
+                        "\toption upstream '%s/cf.conf'\n\toption fwmark '%d'\n"
+                        "\tlist nameset '%s/%s'\n\n"
+                        % (i, env.dir, k * nrules + i + 1, d if i < nrules - 1 else env.dir,
+                           "none.txt" if i < nrules - 1 else "warp.txt")
+                        for i in range(nrules))
+        with open(d + "/omnidns", "w") as f:
+            f.write("config omnidns 'main'\n\toption port '%d'\n\tlist listen_addr '%s'\n"
+                    "\toption fwmask '0x00ffffff'\n\toption fakeip_v4 '100.64.0.0/16'\n\n"
+                    "%sconfig rule 'catchall'\n\toption action 'forward'\n"
+                    "\toption upstream '%s/isp.conf'\n" % (port, LAN, rules, env.dir))
+
+    def log():
+        with open(d + "/daemon.log") as f:
+            return f.read()
+
+    def hup():
+        n = len(log())
+        p.send_signal(signal.SIGHUP)
+        for _ in range(100):
+            new = log()[n:]
+            if "reloaded" in new or "keeping previous" in new:
+                return new
+            time.sleep(0.1)
+        raise AssertionError("reload did not finish:\n" + log()[-800:])
+
+    config(0)
+    lf = open(d + "/daemon.log", "a")
+    p = subprocess.Popen([env.binary, "-f", "-t", table, "-x", "-c", d + "/omnidns"],
+                         stdout=lf, stderr=lf)
+    try:
+        for _ in range(100):
+            try:
+                r = dnsmini.query(LAN, port, "warp.test", "A", timeout=0.2)
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("second daemon did not come up:\n" + log()[-800:])
+        fake = answers(r, "A")[0]
+        check(fake.startswith("100.64."), "no fake: %r" % r)
+        mark = "mark_%08x" % nrules  # rule r999 of config 0, installed last
+        # a reload adds 1000 new mark chains and keeps the old ones
+        config(1)
+        out = hup()
+        check("reloaded" in out, "reload failed:\n" + out)
+        config(2)  # would need 3000 mark chains (the cap is 2048)
+        out = hup()
+        check("fwmark chains needed" in out, "overflow not reported:\n" + out)
+        check("reloaded" not in out, "overflowing reload accepted:\n" + out)
+        elems = sh("nft list map inet %s fake2mark_v4" % table)
+        check(fake in elems and mark in elems, "binding lost:\n" + elems)
+        check(mark in sh("nft list chain inet %s %s" % (table, mark)), "mark chain deleted")
+        # config 1 still in force: a new name binds with its mark
+        fake2 = answers(dnsmini.query(LAN, port, "inner.warp.test", "A"), "A")[0]
+        elems = sh("nft list map inet %s fake2mark_v4" % table)
+        check("%s : jump mark_%08x" % (fake2, 2 * nrules) in elems,
+              "previous configuration not kept:\n" + elems)
+        # a config within the kept chains still reloads
+        config(0)
+        out = hup()
+        check("reloaded" in out, "reload after overflow failed:\n" + out)
+    finally:
+        p.terminate()
+        p.wait(10)
+
+
 def enter_netns():
     """Re-exec the running script under `unshare -rn` (once)."""
     if os.environ.get("OMNI_INTEG_NS") != "1":

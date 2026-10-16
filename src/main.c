@@ -19,7 +19,13 @@
 #include "upstream.h"
 #include "util/hash.h"
 
-#define MAX_MARKS 4096
+/*
+ * Mark chains installed at once. restore_marks' vmap goes to the kernel in
+ * one element message, whose 16-bit nest length holds about 3780 marks;
+ * stay well below. A config has at most CONFIG_MAX_RULES marks of its own.
+ */
+#define MAX_MARKS 2048
+_Static_assert(CONFIG_MAX_RULES <= MAX_MARKS, "a config's own marks must fit");
 
 static struct omni omni;
 static const char *nft_table;
@@ -48,21 +54,25 @@ static bool log_to_stderr;
 static uint32_t kept_marks[MAX_MARKS];
 static uint32_t nkept_marks;
 
-static void add_mark(uint32_t *marks, uint32_t *n, uint32_t m)
+static int add_mark(uint32_t *marks, uint32_t *n, uint32_t m)
 {
 	uint32_t i;
 
 	for (i = 0; i < *n; i++)
 		if (marks[i] == m)
-			return;
-	if (*n < MAX_MARKS)
-		marks[(*n)++] = m;
+			return 0;
+	if (*n == MAX_MARKS)
+		return -E2BIG;
+	marks[(*n)++] = m;
+	return 0;
 }
 
 /*
  * Desired dataplane: pools and fwmask from cfg, marks = marks of fakeip
  * rules in cfg and (unless the mask changes) every mark installed before,
  * which covers every mark still referenced by a binding (see kept_marks).
+ * -E2BIG if that is more than MAX_MARKS: no mark may be left out, since a
+ * kept one may still be in use.
  */
 static int build_desired(const struct config *cfg, struct nft_desired *d, uint32_t *marks,
                          bool keep_old)
@@ -71,11 +81,12 @@ static int build_desired(const struct config *cfg, struct nft_desired *d, uint32
 	int r;
 
 	for (r = 0; r < cfg->nrules; r++)
-		if (cfg->rules[r].action == RULE_FAKEIP)
-			add_mark(marks, &n, cfg->rules[r].mark);
+		if (cfg->rules[r].action == RULE_FAKEIP && add_mark(marks, &n, cfg->rules[r].mark))
+			return -E2BIG;
 	if (keep_old)
 		for (i = 0; i < nkept_marks; i++)
-			add_mark(marks, &n, kept_marks[i]);
+			if (add_mark(marks, &n, kept_marks[i]))
+				return -E2BIG;
 	memset(d, 0, sizeof(*d));
 	d->fwmask = cfg->fwmask;
 	d->has_pool4 = cfg->has_pool4;
@@ -110,6 +121,13 @@ static int reload(void)
 		return -EINVAL;
 	}
 	mask_changed = ncfg->fwmask != old->fwmask;
+	ret = build_desired(ncfg, &d, marks, !mask_changed);
+	if (ret) {
+		log_err("reload: more than %d fwmark chains needed (marks of this "
+			"configuration plus those kept from earlier ones); keeping previous "
+			"configuration (a restart drops unused chains)", MAX_MARKS);
+		goto fail;
+	}
 	if (mask_changed) {
 		/* cached answers pin bindings and all embed the old marks */
 		cache_flush(omni.cache);
@@ -133,7 +151,6 @@ static int reload(void)
 	/* element deletes of evicted bindings must land before their chains go */
 	nft_flush(omni.nft);
 	nft_drain(omni.nft);
-	build_desired(ncfg, &d, marks, !mask_changed);
 	ret = nft_reconcile(omni.nft, &d);
 	if (ret) {
 		log_err("reload: nftables reconciliation failed (%s); keeping previous "
@@ -243,8 +260,7 @@ int main(int argc, char **argv)
 		log_err("cannot open nftables netlink socket");
 		goto out_loop;
 	}
-	build_desired(omni.cfg, &d, marks, false);
-	if (nft_bootstrap(omni.nft, &d)) {
+	if (build_desired(omni.cfg, &d, marks, false) || nft_bootstrap(omni.nft, &d)) {
 		log_err("nftables bootstrap failed");
 		goto out_nft;
 	}
