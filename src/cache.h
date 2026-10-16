@@ -31,6 +31,9 @@
 
 #define CACHE_MAX_DEPS 32
 #define CACHE_MAX_BINDS 64
+/* Accounted per entry on top of its allocation: hmap slot, s3 ghost slot,
+ * allocator slack. */
+#define CACHE_ENTRY_OVERHEAD 64
 
 struct cache;
 struct fakeip_db;
@@ -45,8 +48,9 @@ struct cache *cache_new(uint32_t max_entries, size_t max_bytes, struct fakeip_db
 void cache_free(struct cache *c);
 void cache_set_limits(struct cache *c, uint32_t max_entries, size_t max_bytes);
 
-/* Returns 0 on hit (out filled, out->id/edns untouched, qname case as
- * stored) or -ENOENT. `out` must be initialized; it is reset first. */
+/* Returns 0 on hit (out filled with id 0, no EDNS, the question as
+ * inserted) or -ENOENT. `out` must be initialized; it is reset first, and
+ * its rr/buf allocations are reused when large enough. */
 int cache_lookup(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
                  struct dns_msg *out);
