@@ -218,10 +218,19 @@ void dns_msg_init(struct dns_msg *m)
 	memset(m, 0, sizeof(*m));
 }
 
+void dns_msg_init_buf(struct dns_msg *m, uint8_t *buf, uint32_t cap)
+{
+	dns_msg_init(m);
+	m->buf = buf;
+	m->buf_cap = cap;
+	m->buf_ext = true;
+}
+
 void dns_msg_free(struct dns_msg *m)
 {
 	free(m->rr);
-	free(m->buf);
+	if (!m->buf_ext)
+		free(m->buf);
 	dns_msg_init(m);
 }
 
@@ -229,7 +238,8 @@ void dns_msg_reset(struct dns_msg *m)
 {
 	m->id = m->flags = 0;
 	m->has_q = false;
-	m->qname.len = 0;
+	m->qlen = 0;
+	m->qoff = 0;
 	m->qtype = m->qclass = 0;
 	memset(&m->edns, 0, sizeof(m->edns));
 	m->nrr = 0;
@@ -238,11 +248,12 @@ void dns_msg_reset(struct dns_msg *m)
 
 /*
  * Grow the buffer to hold `extra` more bytes. RR pointers are rebased onto
- * the new allocation while the old one is still valid.
+ * the new allocation while the old one is still valid (the question is
+ * kept as an offset, so it needs no rebasing).
  */
 static int buf_reserve(struct dns_msg *m, size_t extra)
 {
-	size_t need = m->buf_len + extra, cap;
+	size_t need = (size_t)m->buf_len + extra, cap;
 	uint8_t *nb, *ob = m->buf;
 	uint16_t i;
 
@@ -251,6 +262,8 @@ static int buf_reserve(struct dns_msg *m, size_t extra)
 	cap = m->buf_cap ? m->buf_cap : 256;
 	while (cap < need)
 		cap *= 2;
+	if (cap > UINT32_MAX)
+		return -ENOMEM;
 	nb = malloc(cap);
 	if (!nb)
 		return -ENOMEM;
@@ -260,9 +273,11 @@ static int buf_reserve(struct dns_msg *m, size_t extra)
 		m->rr[i].owner = nb + (m->rr[i].owner - ob);
 		m->rr[i].rdata = nb + (m->rr[i].rdata - ob);
 	}
-	free(ob);
+	if (!m->buf_ext)
+		free(ob);
 	m->buf = nb;
-	m->buf_cap = cap;
+	m->buf_cap = (uint32_t)cap;
+	m->buf_ext = false;
 	return 0;
 }
 
@@ -305,7 +320,7 @@ static int push_rr(struct dns_msg *m, uint8_t sec,
 	memcpy(p, owner, olen);
 	if (rdlen)
 		memcpy(p + olen, rdata, rdlen);
-	m->buf_len += (size_t)olen + rdlen;
+	m->buf_len += (uint32_t)olen + rdlen;
 	rr = &m->rr[m->nrr++];
 	rr->owner = p;
 	rr->owner_len = olen;
@@ -336,48 +351,75 @@ int dns_msg_add_rr(struct dns_msg *m, enum dns_section sec,
 	return push_rr(m, sec, owner, owner_len, type, cls, ttl, rdata, rdlen);
 }
 
+/*
+ * Store the question name (a valid wire name) in m's storage: over the
+ * current one when it fits there (the same name in another case, typically),
+ * else appended. qname may point into m's own storage.
+ */
+static int put_qname(struct dns_msg *m, const uint8_t *qname, uint8_t qlen)
+{
+	uint8_t tmp[DNS_MAX_NAME];
+	int r;
+
+	if (m->has_q && qlen <= m->qlen) {
+		memmove(m->buf + m->qoff, qname, qlen);
+	} else {
+		memcpy(tmp, qname, qlen);	/* buf_reserve() may move it */
+		r = buf_reserve(m, qlen);
+		if (r)
+			return r;
+		m->qoff = m->buf_len;
+		memcpy(m->buf + m->buf_len, tmp, qlen);
+		m->buf_len += qlen;
+	}
+	m->qlen = qlen;
+	m->has_q = true;
+	return 0;
+}
+
 int dns_msg_set_question(struct dns_msg *m, const uint8_t *qname, uint8_t qlen,
                          uint16_t qtype, uint16_t qclass)
 {
+	int r;
+
 	if (dns_name_check(qname, qlen) != qlen)
 		return -EINVAL;
-	memcpy(m->qname.data, qname, qlen);
-	m->qname.len = qlen;
+	r = put_qname(m, qname, qlen);
+	if (r)
+		return r;
 	m->qtype = qtype;
 	m->qclass = qclass;
-	m->has_q = true;
 	return 0;
 }
 
 int dns_msg_copy(struct dns_msg *dst, const struct dns_msg *src)
 {
 	struct dns_rr *rr = NULL;
-	uint8_t *buf, *p;
-	size_t total = 0;
+	uint8_t *buf = NULL, *p;
+	size_t total = src->has_q ? src->qlen : 0;
 	uint16_t i;
 
 	if (dst == src)
 		return 0;
 	for (i = 0; i < src->nrr; i++)
 		total += (size_t)src->rr[i].owner_len + src->rr[i].rdlen;
-	if (!total) {
-		dns_msg_free(dst);
-		*dst = *src;
-		dst->rr = NULL;
-		dst->rr_cap = dst->nrr = 0;
-		dst->buf = NULL;
-		dst->buf_len = dst->buf_cap = 0;
-		return 0;
+	if (total) {
+		buf = malloc(total);
+		if (!buf)
+			return -ENOMEM;
 	}
-	buf = malloc(total);
-	if (!buf)
-		return -ENOMEM;
-	rr = malloc(src->nrr * sizeof(*rr));
-	if (!rr) {
-		free(buf);
-		return -ENOMEM;
+	if (src->nrr) {
+		rr = malloc(src->nrr * sizeof(*rr));
+		if (!rr) {
+			free(buf);
+			return -ENOMEM;
+		}
 	}
 	p = buf;
+	if (src->has_q) {
+		memcpy(p, dns_msg_qname(src), src->qlen);
+		p += src->qlen;
+	}
 	for (i = 0; i < src->nrr; i++) {
 		const struct dns_rr *s = &src->rr[i];
 
@@ -392,11 +434,12 @@ int dns_msg_copy(struct dns_msg *dst, const struct dns_msg *src)
 	}
 	dns_msg_free(dst);
 	*dst = *src;
+	dst->qoff = 0;
 	dst->rr = rr;
 	dst->rr_cap = src->nrr;
 	dst->buf = buf;
-	dst->buf_len = total;
-	dst->buf_cap = total;
+	dst->buf_len = dst->buf_cap = (uint32_t)total;
+	dst->buf_ext = false;
 	return 0;
 }
 
@@ -496,19 +539,22 @@ static int parse_header(struct dns_msg *m, struct pctx *c, uint16_t cnt[4])
 
 static int parse_question(struct dns_msg *m, struct pctx *c, uint16_t qd)
 {
+	struct dns_name n;
 	int r;
 
 	if (!qd)
 		return 0;
-	r = read_name(c, &c->off, c->len, &m->qname);
+	r = read_name(c, &c->off, c->len, &n);
 	if (r)
 		return -EBADMSG;
 	if (c->len - c->off < 4)
 		return -EBADMSG;
+	r = put_qname(m, n.data, n.len);
+	if (r)
+		return r;
 	m->qtype = get16(c->p + c->off);
 	m->qclass = get16(c->p + c->off + 2);
 	c->off += 4;
-	m->has_q = true;
 	return 0;
 }
 
@@ -874,7 +920,7 @@ int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
 	b->nent = 0;
 	ctab_rehead(b);
 	if (m->has_q) {
-		r = put_name(b, m->qname.data, m->qname.len);
+		r = put_name(b, dns_msg_qname(m), m->qlen);
 		if (!r)
 			r = put_u16(b, m->qtype);
 		if (!r)

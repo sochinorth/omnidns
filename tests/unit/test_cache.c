@@ -15,6 +15,15 @@
 #include "util/hash.h"
 #include "util/time.h"
 
+/* A copy of a message's question name. */
+static inline struct dns_name qname_of(const struct dns_msg *m)
+{
+	struct dns_name n = { .len = m->qlen };
+
+	memcpy(n.data, dns_msg_qname(m), m->qlen);
+	return n;
+}
+
 /* ---- nft stubs (fakeip needs them; tickets complete immediately) ---- */
 
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
@@ -144,8 +153,8 @@ static int ins_resp(struct cache *c, const struct config *cfg, const struct dns_
 
 	if (n < 0)
 		return n;
-	return cache_insert(c, cfg, resp->qname.data, resp->qname.len, resp->qtype, DNS_C_IN,
-	                    cache_hash(resp->qname.data, resp->qname.len, resp->qtype, DNS_C_IN),
+	return cache_insert(c, cfg, dns_msg_qname(resp), resp->qlen, resp->qtype, DNS_C_IN,
+	                    cache_hash(dns_msg_qname(resp), resp->qlen, resp->qtype, DNS_C_IN),
 	                    wbuf, (size_t)n, life, deps, dsz, nd, b, nb);
 }
 
@@ -228,7 +237,7 @@ TEST(basic)
 	CHECK_EQ(out.nrr, 1);
 	CHECK_EQ(out.rr[0].ttl, 300);
 	CHECK_EQ(out.rr[0].type, DNS_T_A);
-	CHECK(!memcmp(out.qname.data, "\x01" "x" "\x03" "FOO", 5));	/* the client's case */
+	CHECK(!memcmp(dns_msg_qname(&out), "\x01" "x" "\x03" "FOO", 5));	/* the client's case */
 	CHECK_EQ(out.flags, DNS_F_QR | DNS_F_RA);
 	CHECK_EQ(look(c, cfg, "x.foo.example", DNS_T_AAAA, &out), -ENOENT);
 
@@ -584,11 +593,12 @@ TEST(round_trip)
 
 	for (age = 0; age <= 45; age += 45) {
 		for (i = 0; i < 4; i++) {
-			int n = look_raw(c, cfg, &m[i].qname, m[i].qtype, &a);
+			struct dns_name q = qname_of(&m[i]);
+			int n = look_raw(c, cfg, &q, m[i].qtype, &a);
 
 			REQUIRE(n > 0);
 			CHECK_EQ(a, age);
-			check_hit(n, &m[i], &m[i].qname, age);
+			check_hit(n, &m[i], &q, age);
 		}
 		time_override_advance(45);
 	}
@@ -614,6 +624,7 @@ TEST(huge_answer)
 	struct config *cfg = load(HDR RULE_FA RULE_ALL);
 	struct cache *c = cache_new(100, 1 << 20, NULL);
 	struct dns_msg m, out;
+	struct dns_name q;
 	uint8_t rd[255];
 	size_t b0;
 	int i, n;
@@ -633,8 +644,9 @@ TEST(huge_answer)
 	CHECK_EQ(cache_count(c), 1);
 	b0 = cache_bytes(c);
 	CHECK(b0 < 200 + CACHE_ENTRY_OVERHEAD);
-	n = look_raw(c, cfg, &m.qname, DNS_T_TXT, NULL);
-	check_hit(n, &m, &m.qname, 0);
+	q = qname_of(&m);
+	n = look_raw(c, cfg, &q, DNS_T_TXT, NULL);
+	check_hit(n, &m, &q, 0);
 	REQUIRE(look(c, cfg, "big.example", DNS_T_TXT, &out) == 0);
 	CHECK(out.flags & DNS_F_TC);
 	CHECK_EQ(out.nrr, 0);
@@ -649,8 +661,9 @@ TEST(huge_answer)
 	CHECK_EQ(ins_msg(c, cfg, &m, 60), 0);
 	CHECK_EQ(cache_count(c), 1);
 	CHECK(cache_bytes(c) > 240 * 267);
-	n = look_raw(c, cfg, &m.qname, DNS_T_TXT, NULL);
-	check_hit(n, &m, &m.qname, 0);
+	q = qname_of(&m);
+	n = look_raw(c, cfg, &q, DNS_T_TXT, NULL);
+	check_hit(n, &m, &q, 0);
 	dns_msg_free(&m);
 
 	dns_msg_free(&out);
@@ -712,7 +725,7 @@ static bool same_msg_nocase(const uint8_t *a, size_t alen, const uint8_t *b, siz
 	dns_msg_init(&y);
 	ok = !dns_parse(&x, a, alen) && !dns_parse(&y, b, blen) && x.flags == y.flags &&
 	     x.nrr == y.nrr && x.edns.present == y.edns.present &&
-	     dns_name_eq(x.qname.data, x.qname.len, y.qname.data, y.qname.len);
+	     dns_name_eq(dns_msg_qname(&x), x.qlen, dns_msg_qname(&y), y.qlen);
 	for (i = 0; ok && i < x.nrr; i++) {
 		const struct dns_rr *r = &x.rr[i], *t = &y.rr[i];
 		uint16_t k;
@@ -901,7 +914,7 @@ TEST(randomized_replies)
 			for (k = rnd() % 3 ? (int)(rnd() % (nrr + 1)) : 0; k > 0; k--)
 				rnd_rr(&m, (enum dns_section)sec);
 		/* the client asks with the same name in its own case */
-		q = m.qname;
+		q = qname_of(&m);
 		for (k = 0; k < q.len; k++)
 			if (((q.data[k] | 0x20) >= 'a' && (q.data[k] | 0x20) <= 'z') && rnd() % 2)
 				q.data[k] ^= 0x20;

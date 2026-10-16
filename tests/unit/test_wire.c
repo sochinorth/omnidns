@@ -117,8 +117,8 @@ static bool msg_equal(const struct dns_msg *a, const struct dns_msg *b)
 	    a->nrr != b->nrr || a->edns.present != b->edns.present)
 		return false;
 	if (a->has_q && (a->qtype != b->qtype || a->qclass != b->qclass ||
-	                 a->qname.len != b->qname.len ||
-	                 memcmp(a->qname.data, b->qname.data, a->qname.len)))
+	                 a->qlen != b->qlen ||
+	                 memcmp(dns_msg_qname(a), dns_msg_qname(b), a->qlen)))
 		return false;
 	if (a->edns.present && (a->edns.udp_size != b->edns.udp_size ||
 				a->edns.do_bit != b->edns.do_bit ||
@@ -376,7 +376,7 @@ TEST(oversize_names)
 	p_u16(&p, 1);
 	p_u16(&p, 1);
 	CHECK_EQ(parse(&m, &p), 0);
-	CHECK_EQ(m.qname.len, 255);
+	CHECK_EQ(m.qlen, 255);
 	/* 256 bytes */
 	p_hdr(&p, 0, 1, 0, 0, 0);
 	for (i = 0; i < 3; i++) {
@@ -958,7 +958,7 @@ TEST(names)
 	CHECK_EQ(dns_name_check((const uint8_t *)"\x40", 1), -EBADMSG);
 }
 
-TEST(copy_footprint)
+TEST(copy_compact)
 {
 	struct dns_msg m, c;
 	struct pkt p;
@@ -967,17 +967,18 @@ TEST(copy_footprint)
 	dns_msg_init(&c);
 	build_cname_resp(&p);
 	REQUIRE(parse(&m, &p) == 0);
-	CHECK(dns_msg_footprint(&m) >= m.buf_len);
 	REQUIRE(dns_msg_copy(&c, &m) == 0);
 	CHECK(msg_equal(&m, &c));
 	CHECK(c.buf != m.buf);
 	CHECK_EQ(c.buf_cap, c.buf_len);
+	CHECK(c.buf_len <= m.buf_len);
 	CHECK_EQ(c.rr_cap, c.nrr);
-	CHECK(dns_msg_footprint(&c) <= dns_msg_footprint(&m));
+	CHECK_EQ(c.qoff, 0);
 	CHECK_EQ(dns_msg_footprint(&c), c.buf_len + c.nrr * sizeof(struct dns_rr));
 	/* source can go away */
 	dns_msg_free(&m);
 	CHECK(c.rr[1].rdata[3] == 1);
+	CHECK(!memcmp(dns_msg_qname(&c), "\x03www\x07" "example\x03" "com", 17));
 	/* copy into a non-empty destination */
 	build_cname_resp(&p);
 	REQUIRE(parse(&m, &p) == 0);
@@ -985,7 +986,115 @@ TEST(copy_footprint)
 	CHECK(msg_equal(&m, &c));
 	dns_msg_free(&m);
 	dns_msg_free(&c);
-	CHECK_EQ(dns_msg_footprint(&c), 0);
+	CHECK(!c.buf && !c.rr && !c.has_q);
+	/* a question alone */
+	dns_msg_set_question(&m, (const uint8_t *)"\1a", 3, DNS_T_A, DNS_C_IN);
+	REQUIRE(dns_msg_copy(&c, &m) == 0);
+	CHECK_EQ(c.buf_len, 3);
+	CHECK(msg_equal(&m, &c));
+	dns_msg_free(&m);
+	dns_msg_free(&c);
+}
+
+/*
+ * The question name lives in the message's storage, at an offset: it stays
+ * valid when the struct is moved, when the storage grows, and when it is set
+ * again (in place when it fits, else appended).
+ */
+TEST(question_storage)
+{
+	static const uint8_t q1[] = "\x03www\x07" "Example\x03" "com";
+	static const uint8_t q2[] = "\x03WWW\x07" "example\x03" "COM";
+	static const uint8_t lng[] = "\x0alonger-one\x07" "example\x03" "com";
+	uint8_t rd[200];
+	struct dns_msg m, moved;
+	const uint8_t *b0;
+	uint32_t used;
+	int i;
+
+	dns_msg_init(&m);
+	CHECK(dns_msg_qname(&m) == NULL);
+	REQUIRE(dns_msg_set_question(&m, q1, 17, DNS_T_A, DNS_C_IN) == 0);
+	CHECK(m.has_q && m.qlen == 17 && m.qoff == 0 && m.buf_len == 17);
+	/* RRs after it, enough to regrow the storage several times */
+	memset(rd, 'x', sizeof(rd));
+	b0 = m.buf;
+	for (i = 0; i < 20; i++)
+		REQUIRE(dns_msg_add_rr(&m, DNS_S_AN, q1, 17, DNS_T_TXT, DNS_C_IN, 1, rd,
+		                       sizeof(rd)) == 0);
+	CHECK(m.buf != b0);
+	CHECK(!memcmp(dns_msg_qname(&m), q1, 17));
+	/* moved like r->out = r->resp */
+	moved = m;
+	dns_msg_init(&m);
+	CHECK(!memcmp(dns_msg_qname(&moved), q1, 17));
+	/* the same name in another case: in place */
+	b0 = dns_msg_qname(&moved);
+	used = moved.buf_len;
+	REQUIRE(dns_msg_set_question(&moved, q2, 17, DNS_T_AAAA, DNS_C_IN) == 0);
+	CHECK(dns_msg_qname(&moved) == b0 && moved.buf_len == used);
+	CHECK(!memcmp(dns_msg_qname(&moved), q2, 17));
+	CHECK_EQ(moved.qtype, DNS_T_AAAA);
+	/* a longer one: appended, RRs untouched */
+	REQUIRE(dns_msg_set_question(&moved, lng, 24, DNS_T_A, DNS_C_IN) == 0);
+	CHECK_EQ(moved.qlen, 24);
+	CHECK_EQ(moved.qoff, used);
+	CHECK(!memcmp(dns_msg_qname(&moved), lng, 24));
+	CHECK(!memcmp(moved.rr[19].owner, q1, 17) && moved.rr[19].rdata[0] == 'x');
+	/* an invalid name changes nothing */
+	CHECK_EQ(dns_msg_set_question(&moved, (const uint8_t *)"\5ab", 3, DNS_T_A, DNS_C_IN),
+	         -EINVAL);
+	CHECK(!memcmp(dns_msg_qname(&moved), lng, 24));
+	/* from the message's own storage (an RR owner), growing it */
+	REQUIRE(dns_msg_set_question(&moved, (const uint8_t *)"\1a", 3, DNS_T_A, DNS_C_IN) == 0);
+	moved.buf_cap = moved.buf_len;	/* force the append to reallocate */
+	REQUIRE(dns_msg_set_question(&moved, moved.rr[0].owner, 17, DNS_T_A, DNS_C_IN) == 0);
+	CHECK(!memcmp(dns_msg_qname(&moved), q1, 17));
+	CHECK(!memcmp(moved.rr[0].owner, q1, 17));
+	/* a copy of a moved message, and a build of it, keep the question */
+	REQUIRE(dns_msg_copy(&m, &moved) == 0);
+	CHECK(msg_equal(&m, &moved));
+	dns_msg_free(&m);
+	/* reset drops it, keeping the storage */
+	b0 = moved.buf;
+	dns_msg_reset(&moved);
+	CHECK(!moved.has_q && !moved.buf_len && moved.buf == b0);
+	CHECK(dns_msg_qname(&moved) == NULL);
+	dns_msg_free(&moved);
+}
+
+/* Caller storage: a query parses without allocating; growth moves to the heap. */
+TEST(caller_storage)
+{
+	uint8_t store[64], rd[100];
+	struct dns_msg m;
+	struct pkt p;
+
+	build_cname_resp(&p);
+	dns_msg_init_buf(&m, store, 20);
+	REQUIRE(dns_parse_query(&m, p.b, p.n) == 0);
+	CHECK(m.buf == store && m.buf_ext);
+	CHECK(!memcmp(dns_msg_qname(&m), "\x03www\x07" "example\x03" "com", 17));
+	/* a full parse needs more: the storage moves to the heap, rebased */
+	REQUIRE(dns_parse(&m, p.b, p.n) == 0);
+	CHECK(m.buf != store && !m.buf_ext);
+	CHECK(!memcmp(dns_msg_qname(&m), "\x03www\x07" "example\x03" "com", 17));
+	CHECK_EQ(m.nrr, 2);
+	dns_msg_free(&m);
+	/* growth while RRs point into the caller's storage */
+	dns_msg_init_buf(&m, store, sizeof(store));
+	memset(rd, 'y', sizeof(rd));
+	REQUIRE(dns_msg_set_question(&m, (const uint8_t *)"\1a", 3, DNS_T_A, DNS_C_IN) == 0);
+	REQUIRE(dns_msg_add_rr(&m, DNS_S_AN, (const uint8_t *)"\1b", 3, DNS_T_TXT,
+	                       DNS_C_IN, 1, rd, 40) == 0);
+	CHECK(m.buf == store);
+	REQUIRE(dns_msg_add_rr(&m, DNS_S_AN, (const uint8_t *)"\1c", 3, DNS_T_TXT,
+	                       DNS_C_IN, 1, rd, sizeof(rd)) == 0);
+	CHECK(m.buf != store);
+	memset(store, 0, sizeof(store));	/* nothing refers to it any more */
+	CHECK(!memcmp(dns_msg_qname(&m), "\1a", 3));
+	CHECK(!memcmp(m.rr[0].owner, "\1b", 3) && m.rr[0].rdata[39] == 'y');
+	dns_msg_free(&m);
 }
 
 TEST(growth_rebase)
@@ -1016,7 +1125,7 @@ TEST(growth_rebase)
 	}
 	REQUIRE(parse(&m, &p) == 0);
 	CHECK_EQ(m.nrr, 300);
-	CHECK(m.buf_len == 300 * 2 * 193);
+	CHECK(m.buf_len == m.qlen + 300u * 2 * 193);
 	for (i = 0; i < 300; i++) {
 		CHECK(m.rr[i].owner >= m.buf && m.rr[i].owner < m.buf + m.buf_len);
 		CHECK(!memcmp(m.rr[i].rdata, m.rr[i].owner, 193));
@@ -1147,7 +1256,9 @@ int main(void)
 	RUN(compress_nocase);
 	RUN(reply_render);
 	RUN(names);
-	RUN(copy_footprint);
+	RUN(copy_compact);
+	RUN(question_storage);
+	RUN(caller_storage);
 	RUN(growth_rebase);
 	RUN(rcode_and_types);
 	RUN(build_reuse);

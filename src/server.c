@@ -202,10 +202,10 @@ static void creq_release(struct creq *q)
  * aged TTLs, OPT iff the query had one, the size limit.
  */
 static int render(const uint8_t *msg, size_t len, uint32_t age, uint16_t id, uint16_t rdcd,
-                  const struct dns_name *qname, bool edns, uint8_t *buf, size_t maxlen)
+                  const uint8_t *qname, uint8_t qlen, bool edns, uint8_t *buf, size_t maxlen)
 {
 	struct dns_reply rp = {
-		.id = id, .rdcd = rdcd, .qname = qname->data, .qlen = qname->len,
+		.id = id, .rdcd = rdcd, .qname = qname, .qlen = qlen,
 		.edns = edns, .edns_udp = EDNS_MAX_UDP, .age = age,
 	};
 
@@ -216,16 +216,17 @@ static int render(const uint8_t *msg, size_t len, uint32_t age, uint16_t id, uin
 static int build_error(const uint8_t *query, size_t qlen, int rcode,
                        const struct dns_msg *parsed, bool edns, uint8_t *buf, size_t cap)
 {
+	uint8_t store[DNS_MAX_NAME];
 	struct dns_msg m;
 	int ret;
 
 	if (qlen < 12)
 		return -EINVAL;
-	dns_msg_init(&m);
+	dns_msg_init_buf(&m, store, sizeof(store));
 	m.id = (query[0] << 8) | query[1];
 	m.flags = DNS_F_QR | (((query[2] << 8) | query[3]) & (DNS_F_OPCODE | DNS_F_RD | DNS_F_CD));
 	if (parsed && parsed->has_q)
-		dns_msg_set_question(&m, parsed->qname.data, parsed->qname.len,
+		dns_msg_set_question(&m, dns_msg_qname(parsed), parsed->qlen,
 		                     parsed->qtype, parsed->qclass);
 	if (edns) {
 		m.edns.present = true;
@@ -303,12 +304,12 @@ static void creq_done(void *ctx, const uint8_t *msg, size_t mlen)
 	q->rr = NULL;
 	if (q->conn) {
 		q->conn->inflight--;
-		len = render(msg, mlen, 0, q->id, q->rdcd, &q->qname, q->edns,
+		len = render(msg, mlen, 0, q->id, q->rdcd, q->qname.data, q->qname.len, q->edns,
 		             out_buf, sizeof(out_buf));
 		if (len > 0)
 			tcp_send(q->conn, out_buf, len);
 	} else {
-		len = render(msg, mlen, 0, q->id, q->rdcd, &q->qname, q->edns,
+		len = render(msg, mlen, 0, q->id, q->rdcd, q->qname.data, q->qname.len, q->edns,
 		             out_buf, udp_limit(q->edns, q->udp_size));
 		if (len > 0)
 			udp_send(q->udp_fd, &q->peer, q->peerlen, &q->local, q->have_local,
@@ -346,6 +347,7 @@ static void creq_free(struct creq *q)
 static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 			struct list_head *reqs, uint8_t *reply, size_t reply_cap)
 {
+	uint8_t store[512];		/* the query's storage: its question, normally */
 	struct cache_hit hit;
 	struct dns_msg m;
 	struct creq *q;
@@ -355,7 +357,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 	if (len < 12 || (buf[2] & 0x80))
 		return 0;			/* no header or a response: drop */
 
-	dns_msg_init(&m);
+	dns_msg_init_buf(&m, store, sizeof(store));
 	ret = dns_parse(&m, buf, len);
 	if (ret == -ENOMEM) {
 		ret = 0;
@@ -387,7 +389,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 	 */
 	if (!resolve_lookup(tmpl->o, &m, &hit)) {
 		ret = render(hit.msg, hit.len, hit.age, m.id, m.flags & (DNS_F_RD | DNS_F_CD),
-		             &m.qname, m.edns.present, reply,
+		             dns_msg_qname(&m), m.qlen, m.edns.present, reply,
 		             tmpl->conn ? reply_cap : udp_limit(m.edns.present, m.edns.udp_size));
 		if (ret > 0)
 			goto out;
@@ -415,7 +417,8 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 		q->lst->refcnt++;
 	q->id = m.id;
 	q->rdcd = m.flags & (DNS_F_RD | DNS_F_CD);
-	q->qname = m.qname;
+	memcpy(q->qname.data, dns_msg_qname(&m), m.qlen);
+	q->qname.len = m.qlen;
 	q->edns = m.edns.present;
 	q->udp_size = m.edns.udp_size;
 	list_add_tail(&q->list, reqs);

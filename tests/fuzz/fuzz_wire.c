@@ -63,14 +63,14 @@ static void check_rr(const struct dns_msg *m, const struct dns_rr *rr)
 	ASSERT(dns_rr_target(rr, &t) == 0);
 	if (rr->type != DNS_T_DNAME || !m->has_q)
 		return;
-	r = dns_name_dname_subst(m->qname.data, m->qname.len, rr->owner,
+	r = dns_name_dname_subst(dns_msg_qname(m), m->qlen, rr->owner,
 	                         rr->owner_len, t.data, t.len, &s);
 	ASSERT(r == 0 || r == -EINVAL || r == -EOVERFLOW);
 	if (!r)
 		ASSERT(dns_name_check(s.data, s.len) == s.len);
 	if (r == -EINVAL)
-		ASSERT(m->qname.len <= rr->owner_len ||
-		       !dns_name_is_under(m->qname.data, m->qname.len,
+		ASSERT(m->qlen <= rr->owner_len ||
+		       !dns_name_is_under(dns_msg_qname(m), m->qlen,
 		                          rr->owner, rr->owner_len));
 }
 
@@ -85,12 +85,12 @@ static void check_msg(const struct dns_msg *m)
 	}
 	if (!m->has_q)
 		return;
-	ASSERT(dns_name_check(m->qname.data, m->qname.len) == m->qname.len);
-	memcpy(low, m->qname.data, m->qname.len);
-	dns_name_lower(low, m->qname.len);
-	ASSERT(dns_name_eq(low, m->qname.len, m->qname.data, m->qname.len));
-	ASSERT(dns_name_hash(low, m->qname.len) ==
-	       dns_name_hash(m->qname.data, m->qname.len));
+	ASSERT(m->qoff + m->qlen <= m->buf_len);
+	ASSERT(dns_name_check(dns_msg_qname(m), m->qlen) == m->qlen);
+	memcpy(low, dns_msg_qname(m), m->qlen);
+	dns_name_lower(low, m->qlen);
+	ASSERT(dns_name_eq(low, m->qlen, dns_msg_qname(m), m->qlen));
+	ASSERT(dns_name_hash(low, m->qlen) == dns_name_hash(dns_msg_qname(m), m->qlen));
 }
 
 /* b was built from a (possibly truncated) and re-parsed. */
@@ -108,8 +108,8 @@ static void check_rebuilt(const struct dns_msg *a, const struct dns_msg *b)
 		       a->edns.do_bit == b->edns.do_bit);
 	if (a->has_q)
 		ASSERT(a->qtype == b->qtype && a->qclass == b->qclass &&
-		       a->qname.len == b->qname.len &&
-		       !memcmp(a->qname.data, b->qname.data, a->qname.len));
+		       a->qlen == b->qlen &&
+		       !memcmp(dns_msg_qname(a), dns_msg_qname(b), a->qlen));
 	ASSERT(b->nrr <= a->nrr);
 	for (i = 0; i < a->nrr; i++)
 		if (a->rr[i].section != DNS_S_AR)
@@ -149,7 +149,8 @@ static void render_check(const struct dns_msg *a, uint32_t seed)
 	memset(&s.edns, 0, sizeof(s.edns));
 	n = dns_build(&s, out1, DNS_MAX_MSG);
 	ASSERT(n > 0);
-	q = a->qname;
+	q.len = a->qlen;
+	memcpy(q.data, dns_msg_qname(a), a->qlen);
 	for (i = 0; i < q.len; i++)
 		if ((q.data[i] | 0x20) >= 'a' && (q.data[i] | 0x20) <= 'z' && (seed >> (i % 32)) & 1)
 			q.data[i] ^= 0x20;
@@ -212,6 +213,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	check_msg(&m);
 	ASSERT(dns_msg_copy(&c, &m) == 0);
 	ASSERT(dns_msg_footprint(&c) <= dns_msg_footprint(&m));
+	ASSERT(c.buf_len == c.buf_cap && c.buf_len <= m.buf_len && c.rr_cap == c.nrr);
 	ASSERT(c.nrr == m.nrr);
 	check_rebuilt(&m, &c);
 	build_check(&m, DNS_MAX_MSG);

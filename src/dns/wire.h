@@ -27,7 +27,9 @@
  *    name, otherwise the message is rejected (-EBADMSG).
  *
  * A parsed message owns a single heap buffer; all rr owner/rdata pointers
- * point into it. Messages may also be constructed programmatically.
+ * point into it, and the question name is stored in it too (at an offset, so
+ * a message stays valid when its struct is copied or moved). Messages may
+ * also be constructed programmatically.
  */
 
 #define DNS_MAX_NAME		255
@@ -95,16 +97,24 @@ struct dns_msg {
 	uint16_t id;
 	uint16_t flags;			/* includes 4-bit rcode */
 	bool has_q;
-	struct dns_name qname;		/* original case as received */
+	uint8_t qlen;			/* question name: qlen bytes at buf + qoff */
 	uint16_t qtype, qclass;
 	struct dns_edns edns;		/* OPT is never kept in rr[] */
 	uint16_t nrr;			/* RRs in order: all AN, then NS, then AR */
 	uint16_t rr_cap;
+	uint32_t qoff;
 	struct dns_rr *rr;
 	/* storage */
 	uint8_t *buf;
-	size_t buf_len, buf_cap;
+	uint32_t buf_len, buf_cap;
+	bool buf_ext;			/* buf is the caller's (dns_msg_init_buf) */
 };
+
+/* The question name (original case as received); NULL without a question. */
+static inline const uint8_t *dns_msg_qname(const struct dns_msg *m)
+{
+	return m->has_q ? m->buf + m->qoff : NULL;
+}
 
 /* ---- names ---- */
 
@@ -144,6 +154,13 @@ int dns_name_check(const uint8_t *p, size_t avail);
 /* ---- messages ---- */
 
 void dns_msg_init(struct dns_msg *m);
+/*
+ * Start with the caller's storage (buf, cap bytes) instead of none, so that
+ * a small message (a query: its question) needs no allocation. Storage
+ * grows onto the heap past cap. The message must not outlive buf: it is
+ * for messages that stay local to the caller.
+ */
+void dns_msg_init_buf(struct dns_msg *m, uint8_t *buf, uint32_t cap);
 void dns_msg_free(struct dns_msg *m);
 void dns_msg_reset(struct dns_msg *m);		/* drop RRs/storage, keep allocation */
 

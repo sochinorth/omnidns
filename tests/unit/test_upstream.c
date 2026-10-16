@@ -593,7 +593,8 @@ static int spoof_build(const struct dns_msg *qm, uint16_t id, const char *qn,
 	if (qn) {
 		dns_name_from_text(&n, qn);
 	} else {
-		n = qm->qname;
+		n.len = qm->qlen;
+		memcpy(n.data, dns_msg_qname(qm), qm->qlen);
 		for (int i = 0; spoof_upcase && i < n.len; i++)
 			if (n.data[i] >= 'a' && n.data[i] <= 'z')
 				n.data[i] -= 32;

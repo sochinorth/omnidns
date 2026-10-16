@@ -641,7 +641,7 @@ TEST(a_plain_forward)
 	CHECK(res.flags & DNS_F_QR);
 	CHECK(res.flags & DNS_F_RA);
 	CHECK(!res.edns.present);
-	CHECK(!memcmp(res.qname.data, "\x03www\x05Plain", 9));
+	CHECK(!memcmp(dns_msg_qname(&res), "\x03www\x05Plain", 9));
 
 	/* cached */
 	time_override_advance(10);

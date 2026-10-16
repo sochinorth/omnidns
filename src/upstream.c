@@ -276,7 +276,7 @@ static bool hdr_ok(const struct exchange *ex, const uint8_t *b, size_t len)
 static bool q_ok(const struct exchange *ex, const struct dns_msg *m)
 {
 	return m->has_q && m->qtype == ex->qtype && m->qclass == DNS_C_IN &&
-	       dns_name_eq(m->qname.data, m->qname.len, ex->qbuf + EX_QNAME_OFF, ex->qnlen);
+	       dns_name_eq(dns_msg_qname(m), m->qlen, ex->qbuf + EX_QNAME_OFF, ex->qnlen);
 }
 
 static bool rcode_fail(int rc)

@@ -498,17 +498,17 @@ static int hexval(uint8_t c)
 }
 
 /* Parse a reverse name into an address; returns the family (4/6) or 0. */
-static int ptr_addr(const struct dns_name *n, uint8_t *addr)
+static int ptr_addr(const uint8_t *name, uint8_t len, uint8_t *addr)
 {
 	const uint8_t *lab[40];
 	int nl = 0, i, j, v;
 	uint8_t off = 0;
 
-	while (off < n->len && n->data[off]) {
+	while (off < len && name[off]) {
 		if (nl == 40)
 			return 0;
-		lab[nl++] = n->data + off;
-		off += 1 + n->data[off];
+		lab[nl++] = name + off;
+		off += 1 + name[off];
 	}
 	if (nl == 6 && label_is(lab[4], "in-addr") && label_is(lab[5], "arpa")) {
 		for (i = 0; i < 4; i++) {
@@ -538,14 +538,14 @@ static int ptr_addr(const struct dns_name *n, uint8_t *addr)
 }
 
 /* A PTR query for a fake-pool address: its family (addr filled), else 0. */
-static int ptr_fake(const struct fakeip_db *fdb, const struct dns_name *qname,
+static int ptr_fake(const struct fakeip_db *fdb, const uint8_t *qname, uint8_t qlen,
                     uint16_t qtype, uint8_t *addr)
 {
 	int fam;
 
 	if (qtype != DNS_T_PTR || !fdb)
 		return 0;
-	fam = ptr_addr(qname, addr);
+	fam = ptr_addr(qname, qlen, addr);
 	return fam && fakeip_in_pool(fdb, fam, addr) ? fam : 0;
 }
 
@@ -554,7 +554,7 @@ static bool try_ptr(struct resolve_req *r)
 	struct fakeip_db *fdb = r->o->fdb;
 	struct binding *b;
 	uint8_t addr[16];
-	int fam = ptr_fake(fdb, &r->qname, r->qtype, addr);
+	int fam = ptr_fake(fdb, r->qname.data, r->qname.len, r->qtype, addr);
 
 	if (!fam)
 		return false;
@@ -1197,7 +1197,7 @@ static int scan(struct resolve_req *r)
 		terminal(r);
 		return SCAN_DONE;
 	}
-	asked = m->has_q && dns_name_eq(m->qname.data, m->qname.len, r->name.data, r->name.len);
+	asked = m->has_q && dns_name_eq(dns_msg_qname(m), m->qlen, r->name.data, r->name.len);
 	if (rcode != DNS_R_NOERROR || asked || find_soa(m)) {
 		finish_negative(r);
 		return SCAN_DONE;
@@ -1227,15 +1227,15 @@ static void walk(struct resolve_req *r, bool scanning)
 
 int resolve_lookup(struct omni *o, const struct dns_msg *query, struct cache_hit *hit)
 {
+	const uint8_t *qname = dns_msg_qname(query);
 	uint8_t addr[16];
 
 	/* the precedence resolve_start() applies: ANY and fake PTR come first */
 	if (!o->cache || !query->has_q || query->qtype == DNS_T_ANY ||
-	    ptr_fake(o->fdb, &query->qname, query->qtype, addr))
+	    ptr_fake(o->fdb, qname, query->qlen, query->qtype, addr))
 		return -ENOENT;
-	if (cache_lookup(o->cache, o->cfg, query->qname.data, query->qname.len, query->qtype,
-	                 query->qclass, cache_hash(query->qname.data, query->qname.len,
-	                                           query->qtype, query->qclass), hit))
+	if (cache_lookup(o->cache, o->cfg, qname, query->qlen, query->qtype, query->qclass,
+	                 cache_hash(qname, query->qlen, query->qtype, query->qclass), hit))
 		return -ENOENT;
 	stats.requests++;
 	stats.cache_hits++;
@@ -1259,11 +1259,12 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 	r->defer.cb = defer_cb;
 	r->starting = true;
 	r->gen0 = o->cfg->gen;
-	r->qname = query->qname;
+	memcpy(r->qname.data, dns_msg_qname(query), query->qlen);
+	r->qname.len = query->qlen;
 	r->qtype = query->qtype;
 	r->qclass = query->qclass;
 	r->rd = query->flags & DNS_F_RD;
-	r->name = query->qname;
+	r->name = r->qname;
 	r->deps = r->deps_inline;
 	r->dcap = sizeof(r->deps_inline);
 	dns_msg_init(&r->resp);
