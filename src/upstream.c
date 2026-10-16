@@ -33,12 +33,14 @@ struct upstream_query {
 	struct uloop_timeout defer;
 };
 
+/* Header length; the (lowercased, uncompressed) question name follows it in qbuf. */
+#define EX_QNAME_OFF		12
+
 struct exchange {
-	struct list_head list;		/* all_ex */
-	uint64_t hash;
-	struct upstream_set *set;
-	struct dns_name qname;		/* lowercased */
+	uint32_t hash;			/* low 32 bits, as kept by hmap */
+	uint8_t qnlen;			/* wire length of the name at qbuf + EX_QNAME_OFF */
 	uint16_t qtype;
+	struct upstream_set *set;
 	struct list_head waiters;
 	int nwait;
 
@@ -64,7 +66,6 @@ struct exchange {
 static struct {
 	uint32_t try_ms, total_ms;
 	struct hmap map;
-	struct list_head all_ex;
 	struct list_head deferred;
 	struct list_head delivering;
 	uint32_t nex;
@@ -72,7 +73,6 @@ static struct {
 	uint16_t idpool[64];
 	unsigned idleft;
 } U = {
-	.all_ex = LIST_HEAD_INIT(U.all_ex),
 	.deferred = LIST_HEAD_INIT(U.deferred),
 	.delivering = LIST_HEAD_INIT(U.delivering),
 };
@@ -143,7 +143,7 @@ static bool ex_eq(const void *val, const void *key, void *ctx)
 	const struct ex_key *k = key;
 
 	return ex->set->id == k->set_id && ex->qtype == k->qtype &&
-	       ex->qname.len == k->len && !memcmp(ex->qname.data, k->name, k->len);
+	       ex->qnlen == k->len && !memcmp(ex->qbuf + EX_QNAME_OFF, k->name, k->len);
 }
 
 /* ---- callbacks ---- */
@@ -208,7 +208,6 @@ static void ex_free(struct exchange *ex)
 	ex_close(ex);
 	uloop_timeout_cancel(&ex->timer);
 	hmap_del_ptr(&U.map, ex->hash, ex);
-	list_del(&ex->list);
 	upstream_set_put(ex->set);
 	U.nex--;
 	free(ex);
@@ -257,7 +256,7 @@ static bool hdr_ok(const struct exchange *ex, const uint8_t *b, size_t len)
 static bool q_ok(const struct exchange *ex, const struct dns_msg *m)
 {
 	return m->has_q && m->qtype == ex->qtype && m->qclass == DNS_C_IN &&
-	       dns_name_eq(m->qname.data, m->qname.len, ex->qname.data, ex->qname.len);
+	       dns_name_eq(m->qname.data, m->qname.len, ex->qbuf + EX_QNAME_OFF, ex->qnlen);
 }
 
 static bool rcode_fail(int rc)
@@ -539,13 +538,13 @@ static void timer_cb(struct uloop_timeout *t)
 	ex_next(ex, -ETIMEDOUT);
 }
 
-static int build_query(struct exchange *ex)
+static int build_query(struct exchange *ex, const uint8_t *lname, uint8_t len)
 {
 	struct dns_msg m;
 	int n;
 
 	dns_msg_init(&m);
-	n = dns_msg_set_question(&m, ex->qname.data, ex->qname.len, ex->qtype, DNS_C_IN);
+	n = dns_msg_set_question(&m, lname, len, ex->qtype, DNS_C_IN);
 	if (!n) {
 		m.flags = DNS_F_RD;
 		m.edns.present = true;
@@ -555,6 +554,10 @@ static int build_query(struct exchange *ex)
 	dns_msg_free(&m);
 	if (n < 0)
 		return n;
+	/* the first name in a message is never compressed: qbuf holds it verbatim */
+	if (n < EX_QNAME_OFF + len || memcmp(ex->qbuf + EX_QNAME_OFF, lname, len))
+		return -EINVAL;
+	ex->qnlen = len;
 	ex->qlen = n;
 	return 0;
 }
@@ -567,21 +570,18 @@ static struct exchange *ex_new(struct upstream_set *u, const uint8_t *lname,
 	*err = -ENOMEM;
 	if (!ex)
 		return NULL;
-	memcpy(ex->qname.data, lname, len);
-	ex->qname.len = len;
 	ex->qtype = qtype;
-	*err = build_query(ex);
+	*err = build_query(ex, lname, len);
 	if (*err || (*err = hmap_put(&U.map, hash, ex))) {
 		free(ex);
 		return NULL;
 	}
-	ex->hash = hash;
+	ex->hash = (uint32_t)hash;
 	ex->set = upstream_set_get(u);
 	INIT_LIST_HEAD(&ex->waiters);
 	ex->ufd.fd = -1;
 	ex->ufd.cb = fd_cb;
 	ex->timer.cb = timer_cb;
-	list_add_tail(&ex->list, &U.all_ex);
 	U.nex++;
 	uloop_timeout_set(&ex->timer, 0);
 	return ex;
@@ -671,9 +671,11 @@ static void free_queries(struct list_head *h)
 
 void upstream_shutdown(void)
 {
-	struct exchange *ex, *tmp;
+	struct exchange *ex;
+	uint32_t it = 0;
 
-	list_for_each_entry_safe(ex, tmp, &U.all_ex, list) {
+	/* ex_free() removes ex from the map; hmap_next tolerates that */
+	while ((ex = hmap_next(&U.map, &it))) {
 		free_queries(&ex->waiters);
 		ex_free(ex);
 	}

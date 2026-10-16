@@ -502,6 +502,7 @@ TEST(reentrant)
 
 static struct uloop_fd spoof_fd;
 static int spoof_queries;
+static bool spoof_upcase;	/* echo the genuine question in upper case */
 
 static int spoof_build(const struct dns_msg *qm, uint16_t id, const char *qn,
                        uint8_t *out)
@@ -511,10 +512,14 @@ static int spoof_build(const struct dns_msg *qm, uint16_t id, const char *qn,
 	uint8_t ip[4] = { 203, 0, 113, 7 };
 	int len;
 
-	if (qn)
+	if (qn) {
 		dns_name_from_text(&n, qn);
-	else
+	} else {
 		n = qm->qname;
+		for (int i = 0; spoof_upcase && i < n.len; i++)
+			if (n.data[i] >= 'a' && n.data[i] <= 'z')
+				n.data[i] -= 32;
+	}
 	dns_msg_init(&m);
 	m.id = id;
 	m.flags = DNS_F_QR | DNS_F_RD | DNS_F_RA;
@@ -585,6 +590,42 @@ TEST(spoof)
 	upstream_set_put(u);
 }
 
+/* The question check is case-insensitive: an upper-cased echo of the
+ * (lowercased) query name is the genuine answer, not a spoof. */
+TEST(spoof_case)
+{
+	struct sockaddr_in sa = { .sin_family = AF_INET };
+	socklen_t sl = sizeof(sa);
+	struct upstream_set *u;
+	struct res r = { 0 };
+	uint64_t sp = upstream_get_stats()->spoofed;
+	uint16_t port;
+
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	spoof_fd.fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	REQUIRE(!bind(spoof_fd.fd, (void *)&sa, sizeof(sa)));
+	getsockname(spoof_fd.fd, (void *)&sa, &sl);
+	port = ntohs(sa.sin_port);
+	spoof_fd.cb = spoof_cb;
+	uloop_fd_add(&spoof_fd, ULOOP_READ);
+	u = mkset(8, 1, &port);
+	spoof_queries = 0;
+	spoof_upcase = true;
+
+	REQUIRE(q(u, "mixed.example.com", DNS_T_A, &r));
+	run_loop(1, 3000);
+	CHECK_EQ(r.called, 1);
+	CHECK_EQ(r.err, 0);
+	ip_is(&r, "203.0.113.7");
+	CHECK_EQ(spoof_queries, 1);
+	/* bad id, wrong name and QR=0 are still rejected */
+	CHECK(upstream_get_stats()->spoofed >= sp + 3);
+	spoof_upcase = false;
+	uloop_fd_delete(&spoof_fd);
+	close(spoof_fd.fd);
+	upstream_set_put(u);
+}
+
 TEST(shutdown_inflight)
 {
 	uint16_t ports[1] = { srv_a.port };
@@ -599,6 +640,37 @@ TEST(shutdown_inflight)
 	CHECK_EQ(u->refcnt, 1);
 	run_loop(1, 100);
 	CHECK(watchdog_fired);
+	upstream_set_put(u);
+}
+
+/* Many exchanges (some coalesced) in flight at shutdown: every waiter is
+ * freed without a callback, every set reference is dropped, and the module
+ * is usable again afterwards (LSan checks for leaks). */
+TEST(shutdown_many)
+{
+	uint16_t ports[1] = { srv_a.port };
+	struct upstream_set *u = mkset(9, 1, ports);
+	struct res r[40] = { 0 }, ok = { 0 };
+	char name[64];
+
+	for (int i = 0; i < 40; i++) {
+		snprintf(name, sizeof(name), "%sdrop%d.example.com",
+		         i & 1 ? "X" : "x", i / 2);
+		REQUIRE(q(u, name, DNS_T_A, &r[i]));
+	}
+	CHECK_EQ(u->refcnt, 21);	/* 20 exchanges, odd/even pairs coalesced */
+	upstream_shutdown();
+	CHECK_EQ(u->refcnt, 1);
+	run_loop(1, 100);
+	CHECK(watchdog_fired);
+	for (int i = 0; i < 40; i++)
+		CHECK_EQ(r[i].called, 0);
+
+	REQUIRE(q(u, "a.example.com", DNS_T_A, &ok));
+	run_loop(1, 3000);
+	CHECK_EQ(ok.called, 1);
+	CHECK_EQ(ok.err, 0);
+	ip_is(&ok, "192.0.2.1");
 	upstream_set_put(u);
 }
 
@@ -634,7 +706,9 @@ int main(void)
 	RUN(deadline);
 	RUN(reentrant);
 	RUN(spoof);
+	RUN(spoof_case);
 	RUN(shutdown_inflight);
+	RUN(shutdown_many);
 	upstream_shutdown();
 	uloop_done();
 	fake_stop(&srv_a);
