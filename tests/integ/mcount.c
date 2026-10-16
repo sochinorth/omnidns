@@ -5,7 +5,13 @@
  *   cc -O2 -shared -fPIC -o mcount.so mcount.c -ldl
  *   MCOUNT_FILE=/tmp/x LD_PRELOAD=./mcount.so prog
  *
- * Counts calls and requested bytes of the malloc family. The counters live
+ * Counts calls and requested bytes of the malloc family (malloc, calloc,
+ * realloc, reallocarray, posix_memalign, aligned_alloc, memalign, valloc,
+ * pvalloc) and calls to free. `bytes` is the sum of requested sizes, not of
+ * what the allocator hands out: a realloc adds its full new size (not the
+ * growth), so a buffer grown 64 -> 128 -> 256 counts 448 bytes. realloc(p, 0)
+ * with p != NULL frees p (glibc) and is counted as a free, not an allocation;
+ * realloc(NULL, n) counts as a realloc. The counters live
  * in a MAP_SHARED mapping of $MCOUNT_FILE, so a reader can snapshot them at
  * any time by reading the file (MCOUNT_NFIELDS native-endian uint64s, in the
  * order of struct counters) -- no signals, nothing runs inside the process.
@@ -37,6 +43,8 @@ static void (*real_free)(void *);
 static int (*real_posix_memalign)(void **, size_t, size_t);
 static void *(*real_aligned_alloc)(size_t, size_t);
 static void *(*real_memalign)(size_t, size_t);
+static void *(*real_valloc)(size_t);
+static void *(*real_pvalloc)(size_t);
 
 /* dlsym() may calloc before real_calloc is known: serve that from here */
 static _Alignas(16) char boot[8192];
@@ -56,6 +64,8 @@ static void resolve(void)
 	real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
 	real_aligned_alloc = dlsym(RTLD_NEXT, "aligned_alloc");
 	real_memalign = dlsym(RTLD_NEXT, "memalign");
+	real_valloc = dlsym(RTLD_NEXT, "valloc");
+	real_pvalloc = dlsym(RTLD_NEXT, "pvalloc");
 	real_malloc = dlsym(RTLD_NEXT, "malloc");
 	resolving = 0;
 }
@@ -121,6 +131,11 @@ void *calloc(size_t a, size_t b)
 void *realloc(void *p, size_t n)
 {
 	resolve();
+	if (p && !n) {
+		/* frees p and returns NULL, like glibc's realloc(p, 0) */
+		free(p);
+		return NULL;
+	}
 	ADD(realloc, 1);
 	ADD(bytes, n);
 	if (is_boot(p)) {
@@ -176,4 +191,20 @@ void *memalign(size_t align, size_t n)
 	ADD(memalign, 1);
 	ADD(bytes, n);
 	return real_memalign(align, n);
+}
+
+void *valloc(size_t n)
+{
+	resolve();
+	ADD(memalign, 1);
+	ADD(bytes, n);
+	return real_valloc(n);
+}
+
+void *pvalloc(size_t n)
+{
+	resolve();
+	ADD(memalign, 1);
+	ADD(bytes, n);
+	return real_pvalloc(n);
 }
