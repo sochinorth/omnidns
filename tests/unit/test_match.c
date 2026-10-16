@@ -440,7 +440,7 @@ TEST(shared_file_sizing)
 	CHECK_EQ(match_nodes(idx), 13);
 	CHECK_EQ(look(idx, "m.t"), 0);
 	CHECK_EQ(look(idx, "n.t"), 8);
-	/* 13 patterns -> 32 slots either way (104 counted per rule -> 256) */
+	/* 13 patterns -> 17 slots either way (104 counted per rule -> 130) */
 	CHECK_EQ(match_footprint(idx), match_footprint(one));
 	match_free(one);
 	match_free(idx);
@@ -464,7 +464,8 @@ TEST(no_prefix_matches)
 	for (i = 0; i < (1u << 28); i++) {
 		snprintf(longer, sizeof(longer), "example.co%x", i);
 		h = omni_hash(longer, strlen(longer));
-		if ((h >> 48) == (h0 >> 48) && (h & 15) == (h0 & 15))
+		/* 3 patterns -> 16 slots; home = fast range of the low word */
+		if ((h >> 48) == (h0 >> 48) && (uint32_t)h >> 28 == (uint32_t)h0 >> 28)
 			break;
 	}
 	REQUIRE(i < (1u << 28));
@@ -486,6 +487,63 @@ TEST(no_prefix_matches)
 	CHECK_EQ(look(idx, "ample.co"), 3);
 	match_free(idx);
 	free_rules(&rs);
+}
+
+/*
+ * Every table size from empty to 2000 patterns, checked against the known
+ * answer: pattern i is "p<i>.t", exact for even i, "*." for odd i. Also
+ * checks the capacity: above n, at least 16, at most 80% full.
+ */
+TEST(all_sizes)
+{
+	enum { MAXN = 2000 };
+	char *text = malloc((size_t)MAXN * 16 + 1), name[32];
+	size_t base = 0;
+	int bad = 0, badcap = 0;
+
+	for (uint32_t n = 0; n <= MAXN; n++) {
+		struct nameset_file *f;
+		struct nameset_file *fs[1];
+		struct rule r[2];
+		struct match_index *idx;
+		size_t o = 0, slots;
+
+		for (uint32_t i = 0; i < n; i++)
+			o += (size_t)sprintf(text + o, "%sp%u.t\n", i % 2 ? "*." : "", i);
+		text[o] = 0;
+		f = mkfile(text);
+		fs[0] = f;
+		memset(r, 0, sizeof(r));
+		r[0].files = fs;
+		r[0].nfiles = 1;
+		r[1].ord = 1;
+		r[1].catchall = true;
+		idx = match_build(r, 2);
+		REQUIRE(idx);
+		if (n == 0)
+			base = match_footprint(idx) - 16 * 12;	/* no bases */
+		slots = (match_footprint(idx) - base - (n ? sizeof(char *) : 0)) / 12;
+		if (match_nodes(idx) != n || slots <= n || slots < 16 || slots * 4 < (size_t)n * 5 ||
+		    (slots > 16 && slots > n + 1 && slots * 4 >= (size_t)n * 5 + 4))
+			badcap++;
+		for (uint32_t i = 0; i < n; i++) {
+			sprintf(name, "p%u.t", i);
+			bad += look(idx, name) != 0;
+			sprintf(name, "x.p%u.t", i);
+			bad += look(idx, name) != (i % 2 ? 0 : 1);
+		}
+		for (uint32_t i = n; i < n + 64; i++) {
+			sprintf(name, "p%u.t", i);
+			bad += look(idx, name) != 1;
+		}
+		bad += look(idx, "t") != 1;
+		bad += look(idx, "p0.t.x") != 1;
+		match_free(idx);
+		freefile(f);
+	}
+	free(text);
+	CHECK_EQ(badcap, 0);
+	CHECK_EQ(bad, 0);
 }
 
 static double now_s(void)
@@ -558,6 +616,166 @@ TEST(bulk_100k)
 	free_rules(&rs);
 }
 
+/* Deterministic label of 4-12 base-36 characters. */
+static int rand_label(char *buf, uint32_t *st)
+{
+	static const char al[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+	int n;
+
+	*st = *st * 1103515245u + 12345u;
+	n = 4 + (int)((*st >> 16) % 9);
+	for (int i = 0; i < n; i++) {
+		*st = *st * 1103515245u + 12345u;
+		buf[i] = al[(*st >> 16) % 36];
+	}
+	buf[n] = 0;
+	return n;
+}
+
+static double bench_ns(const struct match_index *idx, char (*names)[80], int nnames,
+                       int nq, int *hits, uint16_t none, const char *what)
+{
+	double t0, t1;
+	uint64_t sum = 0;
+
+	*hits = 0;
+	t0 = now_s();
+	for (int q = 0; q < nq; q++) {
+		const char *n = names[q % nnames];
+		uint16_t o = match_lookup(idx, n, strlen(n));
+
+		sum += o;
+		*hits += o != none;
+	}
+	t1 = now_s();
+	fprintf(stderr, "  %s: %.1f ns/lookup (hits %d of %d, sum %llu)", what,
+		(t1 - t0) * 1e9 / nq, *hits, nq, (unsigned long long)sum);
+	fprintf(stderr, "\n");
+	return (t1 - t0) * 1e9 / nq;
+}
+
+/*
+ * Lookups over one rule of npat patterns (pats[i] as written, "*." kept):
+ * hit-heavy queries are the patterns or names under them, miss-heavy ones
+ * random names with one or two labels in front, so every probe (including
+ * the TLD) misses.
+ */
+static void bench_set(char (*pats)[80], uint32_t npat, const char *what)
+{
+	enum { NN = 65536, NQ = 1000000 };
+	static const char *const tlds[] = { "com", "net", "org", "io", "ru", "de", "xyz", "info" };
+	struct ruleset rs = { .n = 0 };
+	struct match_index *idx;
+	size_t cap = (size_t)npat * 84 + 1, o = 0;
+	char *text = malloc(cap), (*names)[80] = malloc(NN * sizeof(*names)), l1[16];
+	uint32_t st = 4242;
+	double t0, t1;
+	int hits;
+
+	for (uint32_t i = 0; i < npat; i++)
+		o += (size_t)snprintf(text + o, cap - o, "%s\n", pats[i]);
+	add_rule(&rs, text);
+	add_rule(&rs, NULL);
+	free(text);
+
+	t0 = now_s();
+	idx = match_build(rs.r, rs.n);
+	t1 = now_s();
+	REQUIRE(idx);
+	fprintf(stderr, "  %s build: %u nodes in %.1f ms, footprint %zu bytes (%.1f B/pattern)\n",
+		what, match_nodes(idx), (t1 - t0) * 1e3, match_footprint(idx),
+		(double)match_footprint(idx) / match_nodes(idx));
+
+	for (int i = 0; i < NN; i++) {
+		const char *p = pats[((uint32_t)i * 2654435761u) % npat];
+
+		if (strncmp(p, "*.", 2))
+			snprintf(names[i], sizeof(names[i]), "%s", p);
+		else
+			snprintf(names[i], sizeof(names[i]), "%s%s", i % 2 ? "www" : "cdn.img",
+			         p + 1);
+	}
+	bench_ns(idx, names, NN, NQ, &hits, 1, "hit-heavy ");
+	CHECK(hits > NQ / 100 * 99);
+
+	for (int i = 0; i < NN; i++) {
+		rand_label(l1, &st);
+		snprintf(names[i], sizeof(names[i]), "%s%s.%s", i % 3 ? "www." : "a.cdn.",
+		         l1, tlds[st % 8]);
+	}
+	bench_ns(idx, names, NN, NQ, &hits, 1, "miss-heavy");
+	CHECK(hits < NQ / 100);
+	free(names);
+	match_free(idx);
+	free_rules(&rs);
+}
+
+/* Blocklist-shaped random names over a few TLDs, some with a subdomain. */
+static void bench_synthetic(uint32_t npat, int suffix_pct)
+{
+	static const char *const tlds[] = { "com", "net", "org", "io", "ru", "de", "xyz", "info" };
+	char (*pats)[80] = malloc(npat * sizeof(*pats)), l1[16], l2[16], what[32];
+	uint32_t st = 42;
+
+	for (uint32_t p = 0; p < npat; p++) {
+		const char *star = p % 100 < (uint32_t)suffix_pct ? "*." : "";
+
+		rand_label(l1, &st);
+		if (st % 4 == 0) {
+			rand_label(l2, &st);
+			snprintf(pats[p], sizeof(pats[p]), "%s%s.%s.%s", star, l2, l1, tlds[st % 8]);
+		} else {
+			snprintf(pats[p], sizeof(pats[p]), "%s%s.%s", star, l1, tlds[st % 8]);
+		}
+	}
+	snprintf(what, sizeof(what), "synthetic %u", npat);
+	bench_set(pats, npat, what);
+	free(pats);
+}
+
+TEST(bulk_75k_mix)
+{
+	bench_synthetic(75000, 50);
+}
+
+/* The size of a full wildcard blocklist (HaGeZi Pro): all suffix patterns. */
+TEST(bulk_200k_wildcard)
+{
+	bench_synthetic(199227, 100);
+}
+
+/* MATCH_BENCH_FILE=list.txt: the same benchmark over a real nameset file. */
+TEST(bulk_file)
+{
+	const char *path = getenv("MATCH_BENCH_FILE");
+	struct nameset_file f = { .refcnt = 1 };
+	char (*pats)[80], *text;
+	uint32_t inval, n = 0;
+	FILE *fp;
+	long len;
+
+	if (!path)
+		return;
+	fp = fopen(path, "rb");
+	REQUIRE(fp);
+	fseek(fp, 0, SEEK_END);
+	len = ftell(fp);
+	rewind(fp);
+	text = malloc((size_t)len);
+	REQUIRE(fread(text, 1, (size_t)len, fp) == (size_t)len);
+	fclose(fp);
+	REQUIRE(!nameset_parse(text, (size_t)len, 0, &f, &inval, path));
+	free(text);
+	pats = malloc(f.npat * sizeof(*pats));
+	for (const char *e = f.blob; e < f.blob + f.blob_len; e = ns_next(e))
+		if (strlen(ns_name(e)) < 77)
+			snprintf(pats[n++], sizeof(pats[0]), "%s%s", ns_is_suffix(e) ? "*." : "",
+			         ns_name(e));
+	bench_set(pats, n, path);
+	free(pats);
+	free(f.blob);
+}
+
 int main(void)
 {
 	hash_init();
@@ -572,6 +790,10 @@ int main(void)
 	RUN(multi_file_ords);
 	RUN(shared_file_sizing);
 	RUN(no_prefix_matches);
+	RUN(all_sizes);
 	RUN(bulk_100k);
+	RUN(bulk_75k_mix);
+	RUN(bulk_200k_wildcard);
+	RUN(bulk_file);
 	return test_summary();
 }

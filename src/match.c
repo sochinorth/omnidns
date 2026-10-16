@@ -27,40 +27,58 @@ _Static_assert(sizeof(struct mslot) == 12, "struct mslot must stay 12 bytes");
 struct match_index {
 	struct mslot *slots;
 	const char **bases;	/* distinct nameset blobs, sorted by address */
-	uint32_t mask, len;
+	uint32_t cap, len;
 	uint16_t nbases, catchall;
 	int refcnt;
 };
 
-/* The slot holding name, or the empty slot where it belongs. */
+/*
+ * Home slot: Lemire's fast range over the low 32 hash bits, so cap needn't be
+ * a power of two. It depends on bits 0-31 only, the tag on bits 48-63.
+ */
+static uint32_t home_of(const struct match_index *idx, uint64_t h)
+{
+	return (uint32_t)(((uint64_t)(uint32_t)h * idx->cap) >> 32);
+}
+
+/*
+ * The slot holding name, or the empty slot where it belongs. Terminates
+ * because cap_for() always leaves at least one slot empty.
+ */
 static struct mslot *find(const struct match_index *idx, const char *name,
                           size_t len, uint64_t h)
 {
 	uint16_t tag = (uint16_t)(h >> 48);
 
-	for (uint32_t i = (uint32_t)h & idx->mask;; i = (i + 1) & idx->mask) {
+	for (uint32_t i = home_of(idx, h);;) {
 		struct mslot *s = &idx->slots[i];
 		const char *n;
 
 		if (s->file == MSLOT_EMPTY)
 			return s;
-		if (s->tag != tag)
-			continue;
-		/* strnlen first: never read past the stored entry's NUL */
-		n = idx->bases[s->file] + s->off;
-		if (strnlen(n, len + 1) == len && !memcmp(n, name, len))
-			return s;
+		if (s->tag == tag) {
+			/* strnlen first: never read past the stored entry's NUL */
+			n = idx->bases[s->file] + s->off;
+			if (strnlen(n, len + 1) == len && !memcmp(n, name, len))
+				return s;
+		}
+		if (++i == idx->cap)
+			i = 0;
 	}
 }
 
-/* Same rule as util/hmap: power of two, at most 75% full, at least 16. */
+/*
+ * At most 80% full (n / 0.8, rounded up), at least 16, and always above n.
+ * Linear probing: a miss scans to the next empty slot, about
+ * (1 + 1/(1-a)^2) / 2 slots at load a: ~13 at 0.80, but ~23 at 0.85.
+ */
 static uint32_t cap_for(uint32_t n)
 {
-	uint32_t cap = 16;
+	uint64_t cap = ((uint64_t)n * 5 + 3) / 4;
 
-	while (cap < 0x80000000u && (uint64_t)n * 4 >= (uint64_t)cap * 3)
-		cap <<= 1;
-	return cap;
+	if (cap <= n)
+		cap = (uint64_t)n + 1;
+	return cap < 16 ? 16 : (uint32_t)cap;	/* n <= UINT32_MAX / 2: fits */
 }
 
 static int ptr_cmp(const void *a, const void *b)
@@ -166,6 +184,7 @@ static void add_file(struct match_index *idx, const struct nameset_file *f,
 struct match_index *match_build(const struct rule *rules, uint16_t nrules)
 {
 	struct match_index *idx = calloc(1, sizeof(*idx));
+	uint64_t bytes;
 	uint32_t n, cap;
 
 	if (!idx)
@@ -178,8 +197,11 @@ struct match_index *match_build(const struct rule *rules, uint16_t nrules)
 	if (n == UINT32_MAX)
 		goto fail;
 	cap = cap_for(n);
-	idx->mask = cap - 1;
-	idx->slots = malloc((size_t)cap * sizeof(*idx->slots));
+	bytes = (uint64_t)cap * sizeof(*idx->slots);
+	idx->cap = cap;
+	if ((size_t)bytes != bytes)	/* 32-bit size_t */
+		goto fail;
+	idx->slots = malloc((size_t)bytes);
 	if (!idx->slots)
 		goto fail;
 	for (uint32_t i = 0; i < cap; i++)
@@ -258,7 +280,7 @@ uint16_t match_lookup_wire(const struct match_index *idx, const uint8_t *wire, u
 /* The pattern strings belong to the nameset files and are not counted. */
 size_t match_footprint(const struct match_index *idx)
 {
-	return sizeof(*idx) + ((size_t)idx->mask + 1) * sizeof(struct mslot) +
+	return sizeof(*idx) + (size_t)idx->cap * sizeof(struct mslot) +
 	       (size_t)idx->nbases * sizeof(*idx->bases);
 }
 
@@ -266,3 +288,4 @@ uint32_t match_nodes(const struct match_index *idx)
 {
 	return idx->len;
 }
+
