@@ -1640,6 +1640,91 @@ TEST(y_pass_through_chain_only)
 	}
 }
 
+/* does the rendered reply carry the IPv4 address anywhere? */
+static bool carries4(const char *ip)
+{
+	uint8_t a[4];
+
+	inet_pton(AF_INET, ip, a);
+	return memmem(res_wire, (size_t)res_len, a, 4) != NULL;
+}
+
+/*
+ * ipv4hint/ipv6hint of an SVCB/HTTPS record are addresses of its effective
+ * target, which may be blocked or fakeip while the owner is a plain forward.
+ * Such hints leave only rewritten (planned at the final name) or when the
+ * target matched a plain forward rule: never through pass-through of other
+ * answer records, nor as additional-section glue.
+ */
+TEST(z_svcb_target_hints)
+{
+	const uint8_t *val;
+	uint16_t len;
+	int k;
+
+	setup(CFG_DEFAULT);
+	S("10.0.0.1", "s1.plain.example", DNS_T_HTTPS, 0,
+	  "an s1.plain.example 300 HTTPS 1 t.ads.example ipv4hint=9.9.9.1");
+	S("10.0.0.1", "s2.plain.example", DNS_T_HTTPS, 0,
+	  "an s2.plain.example 300 HTTPS 1 t.vpn.example ipv4hint=9.9.9.2");
+	S("10.0.0.1", "s3.plain.example", DNS_T_HTTPS, 0,
+	  "an s3.plain.example 300 CNAME s3b.plain.example;"
+	  "an s3.plain.example 300 HTTPS 1 t.vpn.example ipv4hint=9.9.9.3;"
+	  "an s3b.plain.example 300 HTTPS 1 . alpn=h2");
+	S("10.0.0.1", "s4.plain.example", DNS_T_A, 0,
+	  "an s4.plain.example 300 A 1.1.1.4;"
+	  "ar s4.plain.example 300 HTTPS 1 t.vpn.example ipv4hint=9.9.9.4;"
+	  "ar s4.plain.example 300 HTTPS 0 t.vpn.example ipv4hint=9.9.9.6");
+	S("10.0.0.1", "s5.plain.example", DNS_T_A, 0,
+	  "an s5.plain.example 300 A 1.1.1.5;"
+	  "an s5.plain.example 300 HTTPS 1 t.ads.example ipv4hint=9.9.9.5");
+	S("10.0.0.1", "s6.plain.example", DNS_T_A, 0,
+	  "an s6.plain.example 300 A 1.1.1.6;"
+	  "an s6.plain.example 300 HTTPS 1 t.plain.example ipv4hint=8.8.8.6;"
+	  "ar s6.plain.example 300 HTTPS 1 t.plain.example ipv4hint=8.8.8.7;"
+	  "ar s6.plain.example 300 HTTPS 1 t.vpn.example alpn=h2");
+	for (k = 0; k < 2; k++) {	/* fresh, then cached */
+		/* blocked target at the final name: dropped, NODATA */
+		CHECK(run("s1.plain.example", DNS_T_HTTPS));
+		CHECK_EQ(count(DNS_S_AN), 0);
+		CHECK(!carries4("9.9.9.1"));
+
+		/* fakeip target at the final name: hint rewritten */
+		CHECK(run("s2.plain.example", DNS_T_HTTPS));
+		CHECK_EQ(count(DNS_S_AN), 1);
+		CHECK(!carries4("9.9.9.2"));
+		CHECK(res.nrr && svcb_param(&res.rr[0], SVCB_KEY_IPV4HINT, &val, &len) &&
+		      is_fake(4, val, "9.9.9.2", MARK1, "t.vpn.example"));
+
+		/* at a walk name before the final one: left out, as assembled */
+		CHECK(run("s3.plain.example", DNS_T_HTTPS));
+		CHECK(!carries4("9.9.9.3"));
+		CHECK_EQ(count(DNS_S_AN), 2);
+		CHECK_STR(R(0), "s3.plain.example 300 CNAME s3b.plain.example");
+
+		/* glue: ServiceMode to a fakeip target and AliasMode with hints */
+		CHECK(run("s4.plain.example", DNS_T_A));
+		CHECK_STR(R(0), "s4.plain.example 300 A 1.1.1.4");
+		CHECK(!carries4("9.9.9.4"));
+		CHECK(!carries4("9.9.9.6"));
+		CHECK_EQ(count(DNS_S_AR), 0);
+
+		/* another type in the answer section: left out */
+		CHECK(run("s5.plain.example", DNS_T_A));
+		CHECK(!carries4("9.9.9.5"));
+		CHECK_EQ(count(DNS_S_AN), 1);
+		CHECK_STR(R(0), "s5.plain.example 300 A 1.1.1.5");
+
+		/* forward targets, or no hints: passed through as is */
+		CHECK(run("s6.plain.example", DNS_T_A));
+		CHECK(carries4("8.8.8.6"));
+		CHECK(carries4("8.8.8.7"));
+		CHECK_EQ(count(DNS_S_AN), 2);
+		CHECK_EQ(count(DNS_S_AR), 2);
+		CHECK(k == 0 || no_queries());
+	}
+}
+
 struct pending {
 	int ncb;
 	struct dns_msg m;
@@ -1797,6 +1882,7 @@ int main(int argc, char **argv)
 	RUN(y_pass_through_chain_only);
 	RUN(z_dname_owner_records);
 	RUN(z_alias_mode_params);
+	RUN(z_svcb_target_hints);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);

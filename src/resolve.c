@@ -168,23 +168,15 @@ static bool is_svcb(uint16_t t)
 /*
  * SvcParams of an AliasMode record are to be ignored (RFC 9460 2.4.2), and
  * hints there would carry real addresses no policy looked at: such a record
- * is only ever emitted bare (priority and target, as parsed into sv), and an
- * answer section holding one, or an unparsable one, is never passed through.
+ * is only ever emitted bare (priority and target, as parsed into sv), and a
+ * response holding one, or an unparsable one, is never passed through (see
+ * svcb_ok()).
  */
 static int add_bare_alias(struct dns_msg *m, const struct dns_rr *rr,
                           const struct svcb_view *sv)
 {
 	return dns_msg_add_rr(m, DNS_S_AN, rr->owner, rr->owner_len, rr->type, rr->cls,
 	                      rr->ttl, rr->rdata, (uint16_t)(2 + sv->target_len));
-}
-
-static bool alias_params(const struct dns_rr *rr)
-{
-	struct svcb_view sv;
-
-	if (!is_svcb(rr->type) || rr->rdlen < 2 || rr->rdata[0] || rr->rdata[1])
-		return false;
-	return svcb_parse(rr->rdata, rr->rdlen, &sv) || sv.params_len;
 }
 
 static int afamily(uint16_t qtype)
@@ -669,14 +661,55 @@ static bool strip_type(const struct resolve_req *r, uint16_t t)
 	       (t == DNS_T_DS && r->qtype != DNS_T_DS);
 }
 
+static bool svcb_has_hints(const struct svcb_view *v)
+{
+	uint16_t off;
+
+	for (off = 0; off + 4 <= v->params_len;
+	     off += 4 + (v->params[off + 2] << 8 | v->params[off + 3])) {
+		uint16_t key = (uint16_t)(v->params[off] << 8 | v->params[off + 1]);
+
+		if (key == SVCB_KEY_IPV4HINT || key == SVCB_KEY_IPV6HINT)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * May this SVCB/HTTPS record leave as received, outside what plan_svcb()
+ * decides (passed through, or kept as additional data)? Its hints are
+ * addresses of its effective target (the TargetName, or the owner for "."),
+ * whose rule may be block or fakeip whatever the owner's: they may leave
+ * only when that target matched a plain forward rule (then recorded as a
+ * dependency). The caller makes sure no latch is on. An AliasMode record
+ * may not carry SvcParams at all, and an unparsable record never leaves.
+ */
+static bool svcb_ok(struct resolve_req *r, const struct dns_rr *rr)
+{
+	const struct rule *rule;
+	struct svcb_view sv;
+	bool root;
+
+	if (svcb_parse(rr->rdata, rr->rdlen, &sv))
+		return false;
+	if (!sv.priority)
+		return !sv.params_len;
+	if (!svcb_has_hints(&sv))
+		return true;
+	root = svcb_target_is_root(&sv);
+	rule = dep_match(r, root ? rr->owner : sv.target, root ? rr->owner_len : sv.target_len);
+	return rule && rule->action == RULE_FORWARD;
+}
+
 /*
  * Address records (A/AAAA/SVCB/HTTPS) outside the answer section. In the
  * authority section they never belong, so they are always dropped. In the
  * additional section they are kept only for names whose rule is a plain
  * forward, and only when nothing in this walk latched or bound: real
  * addresses of fakeip or blocked names must never reach the client via glue
- * (e.g. SRV/MX additional data). That decision depends on rules, so the
- * owner is recorded as a cache dependency.
+ * (e.g. SRV/MX additional data). An SVCB/HTTPS record must also pass
+ * svcb_ok(): its hints are its target's addresses. That decision depends on
+ * rules, so the owner (and target) is recorded as a cache dependency.
  */
 static bool glue_ok(struct resolve_req *r, const struct dns_rr *rr)
 {
@@ -689,7 +722,7 @@ static bool glue_ok(struct resolve_req *r, const struct dns_rr *rr)
 	if (rr->section == DNS_S_NS || r->latch.on || r->nbinds)
 		return false;
 	rule = dep_match(r, rr->owner, rr->owner_len);
-	return rule && rule->action == RULE_FORWARD;
+	return rule && rule->action == RULE_FORWARD && (!is_svcb(rr->type) || svcb_ok(r, rr));
 }
 
 static bool all_glue_ok(struct resolve_req *r)
@@ -778,13 +811,19 @@ static bool all_an_chain(const struct resolve_req *r)
 	return true;
 }
 
-static bool no_alias_params(const struct resolve_req *r)
+/*
+ * Every SVCB/HTTPS answer record may leave as received (svcb_ok()). Those
+ * plan_svcb() kept as they are pass this too; any other one (at a walk name
+ * before the final one, or not of the queried type) is checked here, and
+ * fails the response over to assembly, which leaves it out.
+ */
+static bool an_svcb_ok(struct resolve_req *r)
 {
 	const struct dns_msg *m = &r->resp;
 	uint16_t i;
 
 	for (i = 0; i < m->nrr && m->rr[i].section == DNS_S_AN; i++)
-		if (alias_params(&m->rr[i]))
+		if (is_svcb(m->rr[i].type) && !svcb_ok(r, &m->rr[i]))
 			return false;
 	return true;
 }
@@ -792,7 +831,7 @@ static bool no_alias_params(const struct resolve_req *r)
 static bool can_pass_through(struct resolve_req *r)
 {
 	return r->nresp == 1 && !r->synth && !r->latch.on && !r->nbinds && all_an_chain(r) &&
-	       no_alias_params(r) && all_glue_ok(r);
+	       an_svcb_ok(r) && all_glue_ok(r);
 }
 
 /*

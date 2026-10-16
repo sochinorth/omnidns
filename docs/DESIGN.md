@@ -241,7 +241,17 @@ final response's, filtered:
   in force or the answer made bindings. Otherwise each is kept only if its
   owner's rule is a plain `forward`, and that owner is recorded as a
   dependency. This stops glue (e.g. SRV/MX targets) from leaking real
-  addresses of fakeip or blocked names.
+  addresses of fakeip or blocked names. An SVCB/HTTPS record must also be
+  safe as received (below), since its hints are its target's addresses.
+
+An SVCB/HTTPS record is *safe as received* when it parses and either is
+AliasMode without SvcParams, or is ServiceMode and carries no
+`ipv4hint`/`ipv6hint`, or is ServiceMode and its effective target matches a
+plain `forward` rule (that target is then recorded as a dependency). Only
+terminal records are planned per target as above; any other SVCB/HTTPS
+record (in the additional section, at a walk name before the final one, or
+not of the queried type) leaves only if it is safe as received, so real
+hints of a blocked or fakeip target never escape.
 
 A negative answer is the prefix plus the final response's authority and
 additional sections, with the same address filtering and DNSSEC records
@@ -252,8 +262,8 @@ upstream's 4-bit rcode. AA and AD are never set.
 
 When a single upstream response needed no change at all (no alias
 synthesized from a DNAME, no latch, no bindings, no address record to
-filter from the authority or additional section, no AliasMode record
-with SvcParams or unparsable in the answer section, nothing rewritten), and
+filter from the authority or additional section, every SVCB/HTTPS record of
+the answer section safe as received, nothing rewritten), and
 every record of its answer section belongs to the chain (owned by a name
 the walk evaluated, or a DNAME it followed and that DNAME's RRSIG), its
 records are passed through as received; only the header is replaced and
