@@ -13,8 +13,7 @@ static struct nameset_file *mkfile(const char *text)
 	struct nameset_file *f = calloc(1, sizeof(*f));
 	uint32_t inval;
 
-	arena_init(&f->arena, 0);
-	if (nameset_parse(text, strlen(text), &f->arena, &f->pat, &f->npat, &inval, "mem"))
+	if (nameset_parse(text, strlen(text), 0, f, &inval, "mem"))
 		abort();
 	f->refcnt = 1;
 	return f;
@@ -22,7 +21,7 @@ static struct nameset_file *mkfile(const char *text)
 
 static void freefile(struct nameset_file *f)
 {
-	arena_free(&f->arena);
+	free(f->blob);
 	free(f);
 }
 
@@ -208,29 +207,36 @@ TEST(name_text)
 
 /* ---- naive matcher for differential testing ---- */
 
-static bool pat_hit(const struct ns_pattern *p, const char *name, size_t len)
+static bool pat_hit(const char *e, const char *name, size_t len)
 {
-	if (len == p->len && !memcmp(name, p->name, len))
+	const char *p = ns_name(e);
+	size_t plen = strlen(p);
+
+	if (len == plen && !memcmp(name, p, len))
 		return true;
-	if (!p->suffix || len <= p->len)
+	if (!ns_is_suffix(e) || len <= plen)
 		return false;
-	return name[len - p->len - 1] == '.' && !memcmp(name + len - p->len, p->name, p->len);
+	return name[len - plen - 1] == '.' && !memcmp(name + len - plen, p, plen);
 }
 
-static uint16_t naive(const struct ruleset *rs, const char *name)
+static uint16_t naive(const struct rule *rules, uint16_t nrules, const char *name)
 {
 	size_t len = strlen(name);
 
-	for (uint16_t i = 0; i < rs->n; i++) {
-		const struct rule *r = &rs->r[i];
+	for (uint16_t i = 0; i < nrules; i++) {
+		const struct rule *r = &rules[i];
 
 		if (r->catchall)
 			return r->ord;
 		if (!len)
 			continue;
-		for (uint32_t k = 0; k < r->files[0]->npat; k++)
-			if (pat_hit(&r->files[0]->pat[k], name, len))
-				return r->ord;
+		for (uint16_t j = 0; j < r->nfiles; j++) {
+			const struct nameset_file *f = r->files[j];
+
+			for (const char *e = f->blob; e < f->blob + f->blob_len; e = ns_next(e))
+				if (pat_hit(e, name, len))
+					return r->ord;
+		}
 	}
 	return MATCH_NONE;
 }
@@ -243,6 +249,18 @@ static void rand_name(char *buf, int maxlabels)
 	for (int i = 0; i < n; i++) {
 		o += sprintf(buf + o, "%s%s", i ? "." : "", labs[rand() % 7]);
 	}
+}
+
+/* Labels that are prefixes/suffixes of each other. */
+static void rand_name_near(char *buf, int maxlabels)
+{
+	static const char *const labs[] = {
+		"example", "ample", "exampl", "co", "com", "c", "e", "m",
+	};
+	int n = 1 + rand() % maxlabels, o = 0;
+
+	for (int i = 0; i < n; i++)
+		o += sprintf(buf + o, "%s%s", i ? "." : "", labs[rand() % 8]);
 }
 
 TEST(differential)
@@ -277,13 +295,147 @@ TEST(differential)
 				name[0] = 0;
 			else
 				rand_name(name, 5);
-			if (match_lookup(idx, name, strlen(name)) != naive(&rs, name))
+			if (match_lookup(idx, name, strlen(name)) != naive(rs.r, rs.n, name))
 				mism++;
 		}
 		match_free(idx);
 		free_rules(&rs);
 	}
 	CHECK_EQ(mism, 0);
+}
+
+/* Rules with several files each, files shared between rules. */
+TEST(differential_shared_files)
+{
+	enum { NPOOL = 12, MAXR = 24 };
+	struct nameset_file *pool[NPOOL], *lists[MAXR][3];
+	struct rule r[MAXR];
+	char text[4096], name[64];
+	int mism = 0;
+
+	srand(777);
+	for (int round = 0; round < 30; round++) {
+		struct match_index *idx;
+		uint16_t nr = (uint16_t)(1 + rand() % MAXR);
+		uint32_t npat = 0;
+
+		for (int i = 0; i < NPOOL; i++) {
+			int np = rand() % 10, o = 0;
+
+			for (int k = 0; k < np; k++) {
+				rand_name_near(name, 3);
+				o += sprintf(text + o, "%s%s\n", rand() % 2 ? "*." : "", name);
+			}
+			text[o] = 0;
+			pool[i] = mkfile(text);
+			npat += pool[i]->npat;
+		}
+		memset(r, 0, sizeof(r));
+		for (uint16_t i = 0; i < nr; i++) {
+			r[i].ord = i;
+			if (i == nr - 1 && rand() % 2) {
+				r[i].catchall = true;
+				break;
+			}
+			r[i].files = lists[i];
+			r[i].nfiles = (uint16_t)(1 + rand() % 3);
+			for (int j = 0; j < r[i].nfiles; j++)
+				lists[i][j] = pool[rand() % NPOOL];
+		}
+		idx = match_build(r, nr);
+		REQUIRE(idx);
+		CHECK(match_nodes(idx) <= npat);
+		for (int q = 0; q < 3000; q++) {
+			if (q == 0)
+				name[0] = 0;
+			else
+				rand_name_near(name, 4);
+			if (match_lookup(idx, name, strlen(name)) != naive(r, nr, name))
+				mism++;
+		}
+		match_free(idx);
+		for (int i = 0; i < NPOOL; i++)
+			freefile(pool[i]);
+	}
+	CHECK_EQ(mism, 0);
+}
+
+TEST(multi_file_ords)
+{
+	struct nameset_file *a = mkfile("x.test\n*.shared.test\n");
+	struct nameset_file *b = mkfile("*.x.test\nshared.test\n");
+	struct nameset_file *c = mkfile("other.test\n");
+	struct nameset_file *e = mkfile("# no patterns\n");
+	struct nameset_file *f0[] = { e, a }, *f1[] = { b, c }, *f2[] = { c, a };
+	struct rule r[4] = {
+		{ .ord = 0, .files = f0, .nfiles = 2 },
+		{ .ord = 1, .files = f1, .nfiles = 2 },
+		{ .ord = 2, .files = f2, .nfiles = 2 },	/* reuses a and c */
+		{ .ord = 3, .catchall = true },
+	};
+	struct match_index *idx = match_build(r, 4), *one;
+
+	REQUIRE(idx);
+	CHECK_EQ(look(idx, "x.test"), 0);	/* exact in rule 0, suffix in 1 */
+	CHECK_EQ(look(idx, "y.x.test"), 1);
+	CHECK_EQ(look(idx, "shared.test"), 0);	/* suffix in 0, exact in 1 */
+	CHECK_EQ(look(idx, "z.shared.test"), 0);
+	CHECK_EQ(look(idx, "other.test"), 1);
+	CHECK_EQ(look(idx, "y.other.test"), 3);
+	CHECK_EQ(look(idx, "test"), 3);
+	CHECK_EQ(match_nodes(idx), 3);
+	/* bases a, b, c (deduplicated; e has none): two more than a alone,
+	 * same 16-slot table */
+	one = match_build(r, 1);
+	REQUIRE(one);
+	CHECK_EQ(match_footprint(idx) - match_footprint(one), 2 * sizeof(char *));
+	match_free(one);
+	match_free(idx);
+	freefile(a);
+	freefile(b);
+	freefile(c);
+	freefile(e);
+}
+
+/*
+ * Stored names are compared up to their NUL: a pattern must not match a
+ * query that is a prefix of it, or one it is a prefix of. Find a name that
+ * shares hash tag and home slot with "example.co" so that the names
+ * really get compared.
+ */
+TEST(no_prefix_matches)
+{
+	struct ruleset rs = { .n = 0 };
+	struct match_index *idx;
+	uint64_t h0 = omni_hash("example.co", 10), h;
+	char longer[32], text[64];
+	uint32_t i;
+
+	for (i = 0; i < (1u << 28); i++) {
+		snprintf(longer, sizeof(longer), "example.co%x", i);
+		h = omni_hash(longer, strlen(longer));
+		if ((h >> 48) == (h0 >> 48) && (h & 15) == (h0 & 15))
+			break;
+	}
+	REQUIRE(i < (1u << 28));
+	snprintf(text, sizeof(text), "%s\n", longer);
+	add_rule(&rs, text);			/* 0 */
+	add_rule(&rs, "example.co\n");		/* 1 */
+	add_rule(&rs, "*.ample.com\n");		/* 2 */
+	add_rule(&rs, NULL);			/* 3 */
+	idx = match_build(rs.r, rs.n);
+	REQUIRE(idx);
+	CHECK_EQ(match_nodes(idx), 3);
+	CHECK_EQ(look(idx, longer), 0);
+	CHECK_EQ(look(idx, "example.co"), 1);
+	CHECK_EQ(look(idx, "example.com"), 3);
+	CHECK_EQ(look(idx, "example.c"), 3);
+	CHECK_EQ(look(idx, "xample.co"), 3);
+	CHECK_EQ(look(idx, "ample.com"), 2);
+	CHECK_EQ(look(idx, "x.ample.com"), 2);
+	CHECK_EQ(look(idx, "ample.co"), 3);
+	match_free(idx);
+	free_rules(&rs);
 }
 
 static double now_s(void)
@@ -365,6 +517,9 @@ int main(void)
 	RUN(exact_vs_suffix_same_node);
 	RUN(wire_lookup);
 	RUN(differential);
+	RUN(differential_shared_files);
+	RUN(multi_file_ords);
+	RUN(no_prefix_matches);
 	RUN(bulk_100k);
 	return test_summary();
 }

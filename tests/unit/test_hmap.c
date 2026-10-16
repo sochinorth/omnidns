@@ -2,7 +2,6 @@
 #include <stdint.h>
 
 #include "test.h"
-#include "util/arena.h"
 #include "util/hash.h"
 #include "util/hmap.h"
 
@@ -403,89 +402,6 @@ TEST(hmap_growth_churn)
 	free(in);
 }
 
-TEST(arena_align)
-{
-	static const size_t aligns[] = { 1, 2, 4, 8, 16, 32, 64, 128, 4096 };
-	struct arena a;
-	size_t i, j;
-
-	arena_init(&a, 0);
-	CHECK_EQ(a.chunk, 64 * 1024);
-	for (j = 0; j < 200; j++) {
-		for (i = 0; i < sizeof(aligns) / sizeof(aligns[0]); i++) {
-			uint8_t *p = arena_alloc(&a, 1 + j % 7, aligns[i]);
-
-			REQUIRE(p);
-			CHECK(((uintptr_t)p & (aligns[i] - 1)) == 0);
-			memset(p, 0xa5, 1 + j % 7);
-		}
-	}
-	/* align 0 behaves like 1; non-power-of-two is rejected */
-	CHECK(arena_alloc(&a, 3, 0) != NULL);
-	CHECK(arena_alloc(&a, 3, 24) == NULL);
-	arena_free(&a);
-	CHECK(a.head == NULL);
-	CHECK_EQ(a.total, 0);
-}
-
-TEST(arena_large)
-{
-	struct arena a;
-	uint8_t *small1, *big, *small2, *huge;
-	size_t total;
-
-	arena_init(&a, 1024);
-	small1 = arena_alloc(&a, 10, 1);
-	REQUIRE(small1);
-	total = a.total;
-	/* oversized request gets its own chunk... */
-	big = arena_alloc(&a, 100000, 8);
-	REQUIRE(big);
-	memset(big, 1, 100000);
-	CHECK(((uintptr_t)big & 7) == 0);
-	CHECK(a.total >= total + 100000);
-	/* ...and small allocs keep packing into the current chunk */
-	small2 = arena_alloc(&a, 10, 1);
-	CHECK(small2 == small1 + 10);
-	/* large and over-aligned */
-	huge = arena_alloc(&a, 1 << 20, 4096);
-	REQUIRE(huge);
-	CHECK(((uintptr_t)huge & 4095) == 0);
-	memset(huge, 2, 1 << 20);
-	CHECK(big[99999] == 1);
-	/* overflow is refused, not wrapped */
-	CHECK(arena_alloc(&a, SIZE_MAX, 1) == NULL);
-	CHECK(arena_alloc(&a, SIZE_MAX - 8, 64) == NULL);
-	/* filling chunks exactly */
-	for (int i = 0; i < 1000; i++) {
-		uint8_t *p = arena_alloc(&a, 256, 1);
-
-		REQUIRE(p);
-		memset(p, i, 256);
-	}
-	arena_free(&a);
-}
-
-TEST(arena_dup)
-{
-	struct arena a;
-	char *s;
-	uint8_t *d;
-
-	arena_init(&a, 64);
-	s = arena_strndup(&a, "hello world", 5);
-	CHECK_STR(s, "hello");
-	s = arena_strndup(&a, "", 0);
-	CHECK_STR(s, "");
-	d = arena_memdup(&a, "\0\1\2\3", 4);
-	REQUIRE(d);
-	CHECK(memcmp(d, "\0\1\2\3", 4) == 0);
-	CHECK(arena_memdup(&a, NULL, 0) != NULL);
-	s = arena_strndup(&a, "a-string-longer-than-a-quarter-chunk", 36);
-	CHECK_STR(s, "a-string-longer-than-a-quarter-chunk");
-	arena_free(&a);
-}
-
 int main(void)
 {
 	uint8_t key[16] = { 0 };
@@ -501,8 +417,5 @@ int main(void)
 	RUN(hmap_random_model);
 	RUN(hmap_upper_bits);
 	RUN(hmap_growth_churn);
-	RUN(arena_align);
-	RUN(arena_large);
-	RUN(arena_dup);
 	return test_summary();
 }

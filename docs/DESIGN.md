@@ -59,7 +59,7 @@ synchronous netlink exchanges.
 | `nft` | nftables table: chains, maps, async element batches |
 | `cache` | cache of final answers, with dependency revalidation |
 | `dns/wire`, `dns/svcb` | bounded DNS message parser/builder, SVCB rewriting |
-| `util/*` | hash map, SipHash, arena, S3-FIFO, clock |
+| `util/*` | hash map, SipHash, S3-FIFO, clock |
 
 ## Configuration model
 
@@ -94,7 +94,7 @@ after a reload without re-resolving them (see [Cache](#answer-cache)).
 
 ## Name matching
 
-All patterns from all rules go into a single hash map keyed by the dotted
+All patterns from all rules go into a single hash table keyed by the dotted
 name. Each node stores two rule ordinals: the first rule with an exact
 pattern for this name, and the first rule with a suffix pattern. To match
 `a.b.example.com`, the lookup checks:
@@ -105,9 +105,18 @@ pattern for this name, and the first rule with a suffix pattern. To match
 | `b.example.com`, `example.com`, `com` | suffix only |
 
 The lowest ordinal wins; if nothing matches, the catchall applies. A lookup
-costs one hash probe per label and never allocates. 100k patterns build in
-about 7 ms and use about 6.5 MB, and lookups run at about 8M/s on a desktop
-CPU.
+costs one hash probe per label and never allocates.
+
+Each pattern is stored once. A nameset file is read through a fixed 64 KiB
+window into one exact-size blob of NUL-terminated entries (`*.` kept as the
+suffix flag); parsed files are cached across reloads, keyed by inode, mtime
+and size. The table is built once per configuration, sized for the total
+pattern count (at most 75% full), and never grows. Its 12-byte slots hold no
+names: they point into the blobs (file index and offset) and carry a 16-bit
+hash tag and the two ordinals. The configuration's references keep the
+files alive as long as the table. 100k patterns build in about 4 ms with a
+3.1 MB table (plus about 1.7 MB of blob text), and lookups run at about
+11M/s on a desktop CPU.
 
 ## Resolution: the walk
 

@@ -70,21 +70,32 @@ static int read_fd(int fd, size_t size, char **out, size_t *len)
 	return 0;
 }
 
-static int read_file(const char *path, char **out, size_t *len, struct stat *st)
+/* Opens a regular file of at most FILE_MAX_SIZE bytes; fd or -errno. */
+static int open_regular(const char *path, struct stat *st)
 {
 	int fd = open(path, O_RDONLY | O_CLOEXEC), ret;
 
 	if (fd < 0)
 		return -errno;
-	if (fstat(fd, st)) {
+	if (fstat(fd, st))
 		ret = -errno;
-	} else if (!S_ISREG(st->st_mode)) {
+	else if (!S_ISREG(st->st_mode))
 		ret = -EINVAL;
-	} else if ((uint64_t)st->st_size > FILE_MAX_SIZE) {
+	else if ((uint64_t)st->st_size > FILE_MAX_SIZE)
 		ret = -EFBIG;
-	} else {
-		ret = read_fd(fd, (size_t)st->st_size, out, len);
-	}
+	else
+		return fd;
+	close(fd);
+	return ret;
+}
+
+static int read_file(const char *path, char **out, size_t *len, struct stat *st)
+{
+	int fd = open_regular(path, st), ret;
+
+	if (fd < 0)
+		return fd;
+	ret = read_fd(fd, (size_t)st->st_size, out, len);
 	close(fd);
 	return ret;
 }
@@ -365,88 +376,221 @@ static const char *strip_comment(const char *s, const char *e)
 	return e;
 }
 
-struct pat_vec {
-	struct ns_pattern *v;
-	uint32_t n, cap;
+/*
+ * Nameset parsing. The text is read window by window from a source at an
+ * explicit offset; a window is parsed up to its last complete line and the
+ * next one is read from that line's start, so no state crosses windows.
+ * Each valid line is copied once, straight into the output blob, and
+ * validated (and lowercased) there.
+ */
+
+/* Reads up to len bytes at offset pos: count (< len only at EOF) or -errno. */
+typedef ssize_t (*ns_read_fn)(void *ctx, char *buf, size_t len, uint64_t pos);
+
+struct ns_out {
+	char *buf;
+	size_t len, cap;
+	uint32_t npat, bad;
+	const char *path;
 };
 
-static int pat_push(struct pat_vec *pv, struct arena *a, const char *s,
-                    size_t len, bool suffix)
+static void ns_invalid(struct ns_out *o, uint32_t lineno, const char *s, size_t len)
 {
-	struct ns_pattern *p;
+	if (++o->bad <= NAMESET_LOG_INVALID)
+		log_warn("%s:%u: invalid pattern '%.*s'", o->path ? o->path : "nameset",
+		         lineno, (int)(len > 80 ? 80 : len), s);
+}
 
-	if (pv->n == pv->cap) {
-		uint32_t cap = pv->cap ? pv->cap * 2 : 64;
-		struct ns_pattern *nv = realloc(pv->v, cap * sizeof(*nv));
+/* One trimmed line [s, e). */
+static int ns_line(struct ns_out *o, const char *s, const char *e, uint32_t lineno)
+{
+	size_t l, skip;
+	char *q;
 
-		if (!nv)
-			return -ENOMEM;
-		pv->v = nv;
-		pv->cap = cap;
+	if (s == e || *s == '#')
+		return 0;
+	e = strip_comment(s, e);
+	l = (size_t)(e - s);
+	skip = l >= 2 && s[0] == '*' && s[1] == '.' ? 2 : 0;
+	if (l - skip <= 253) {
+		if (o->cap - o->len < l + 1) {
+			/* only if the file grew after fstat() */
+			size_t cap = o->cap + o->cap / 2;
+			char *nb;
+
+			if (cap < o->len + l + 1)
+				cap = o->len + l + 1;
+			nb = realloc(o->buf, cap);
+			if (!nb)
+				return -ENOMEM;
+			o->buf = nb;
+			o->cap = cap;
+		}
+		q = o->buf + o->len;
+		memcpy(q, s, l);
+		q[l] = 0;
+		if (pattern_valid(q + skip, l - skip)) {
+			o->len += l + 1;
+			o->npat++;
+			return 0;
+		}
 	}
-	p = &pv->v[pv->n];
-	p->name = arena_strndup(a, s, len);
-	if (!p->name)
-		return -ENOMEM;
-	p->len = (uint8_t)len;
-	p->suffix = suffix;
-	pv->n++;
+	ns_invalid(o, lineno, s, l);
 	return 0;
 }
 
-int nameset_parse(const char *text, size_t len, struct arena *a,
-                  struct ns_pattern **out, uint32_t *n, uint32_t *ninvalid,
-                  const char *path)
+/* Offset just past the next '\n' at or after pos (the end offset at EOF),
+ * or -errno. */
+static int64_t ns_skip_line(ns_read_fn rd, void *ctx, char *win, size_t window,
+                            uint64_t pos)
 {
-	const char *p = text, *end = text + len, *s, *e, *line;
-	struct pat_vec pv = { 0 };
-	uint32_t lineno = 0, bad = 0;
-	char buf[260];
+	for (;;) {
+		ssize_t n = rd(ctx, win, window, pos);
+		const char *nl;
 
-	*out = NULL;
-	*n = 0;
-	while (next_line(&p, end, &s, &e)) {
-		bool suffix = false;
-		size_t l;
+		if (n <= 0)
+			return n < 0 ? (int64_t)n : (int64_t)pos;
+		nl = memchr(win, '\n', (size_t)n);
+		if (nl)
+			return (int64_t)(pos + (uint64_t)(nl - win) + 1);
+		pos += (uint64_t)n;
+	}
+}
 
-		lineno++;
-		if (s == e || *s == '#')
-			continue;
-		e = strip_comment(s, e);
-		line = s;
-		if (e - s >= 2 && s[0] == '*' && s[1] == '.') {
-			suffix = true;
-			s += 2;
+/* `size` is the expected text size; the blob never needs more than size + 1. */
+static int ns_parse(ns_read_fn rd, void *ctx, size_t window, size_t size,
+                    struct nameset_file *f, uint32_t *ninvalid, const char *path)
+{
+	struct ns_out o = { .cap = size + 1, .path = path };
+	uint32_t lineno = 0;
+	uint64_t pos = 0;
+	int64_t ret = -ENOMEM;
+	char *win;
+
+	if (!window)
+		window = NAMESET_WINDOW;
+	o.buf = malloc(o.cap);
+	win = malloc(window);
+	if (!o.buf || !win)
+		goto out;
+	for (;;) {
+		const char *p = win, *end;
+		ssize_t n;
+		bool eof;
+
+		if (pos > FILE_MAX_SIZE) {
+			ret = -EFBIG;
+			goto out;
 		}
-		l = (size_t)(e - s);
-		if (l < sizeof(buf)) {
-			memcpy(buf, s, l);
-			if (pattern_valid(buf, l)) {
-				if (pat_push(&pv, a, buf, l, suffix))
-					goto nomem;
-				continue;
+		n = rd(ctx, win, window, pos);
+		if (n < 0) {
+			ret = n;
+			goto out;
+		}
+		end = win + n;
+		eof = (size_t)n < window;
+		while (p < end) {
+			const char *q = p, *s, *e;
+			char c;
+
+			next_line(&q, end, &s, &e);
+			if (q[-1] != '\n' && !eof) {
+				if (p > win)
+					break;	/* partial line: re-read from its start */
+				/* The line fills the window: it is longer than any
+				 * pattern, unless the text ends right here. */
+				ret = rd(ctx, &c, 1, pos + (uint64_t)n);
+				if (ret > 0) {
+					lineno++;
+					if (*s != '#')
+						ns_invalid(&o, lineno, s, (size_t)(e - s));
+					ret = ns_skip_line(rd, ctx, win, window, pos + (uint64_t)n);
+				}
+				if (ret < 0)
+					goto out;
+				if (ret > 0) {
+					pos = (uint64_t)ret;
+					goto next;
+				}
+				eof = true;
 			}
+			ret = ns_line(&o, s, e, ++lineno);
+			if (ret)
+				goto out;
+			p = q;
 		}
-		if (++bad <= NAMESET_LOG_INVALID)
-			log_warn("%s:%u: invalid pattern '%.*s'", path ? path : "nameset",
-			         lineno, (int)(e - line > 80 ? 80 : e - line), line);
+		if (eof)
+			break;
+		pos += (uint64_t)(p - win);
+next:;
 	}
-	if (bad > NAMESET_LOG_INVALID)
-		log_warn("%s: %u invalid patterns in total", path ? path : "nameset", bad);
+	if (o.bad > NAMESET_LOG_INVALID)
+		log_warn("%s: %u invalid patterns in total", path ? path : "nameset", o.bad);
 	if (ninvalid)
-		*ninvalid = bad;
-	if (pv.n) {
-		*out = arena_alloc(a, pv.n * sizeof(*pv.v), _Alignof(struct ns_pattern));
-		if (!*out)
-			goto nomem;
-		memcpy(*out, pv.v, pv.n * sizeof(*pv.v));
+		*ninvalid = o.bad;
+	if (!o.npat) {
+		free(o.buf);
+		o.buf = NULL;
+		o.len = 0;
+	} else {
+		char *nb = realloc(o.buf, o.len);
+
+		if (nb)
+			o.buf = nb;
 	}
-	*n = pv.n;
-	free(pv.v);
-	return 0;
-nomem:
-	free(pv.v);
-	return -ENOMEM;
+	f->blob = o.buf;
+	f->blob_len = (uint32_t)o.len;
+	f->npat = o.npat;
+	o.buf = NULL;
+	ret = 0;
+out:
+	free(o.buf);
+	free(win);
+	return (int)ret;
+}
+
+struct ns_mem {
+	const char *text;
+	size_t len;
+};
+
+static ssize_t ns_read_mem(void *ctx, char *buf, size_t len, uint64_t pos)
+{
+	const struct ns_mem *m = ctx;
+
+	if (pos >= m->len)
+		return 0;
+	if (len > m->len - pos)
+		len = (size_t)(m->len - pos);
+	memcpy(buf, m->text + pos, len);
+	return (ssize_t)len;
+}
+
+static ssize_t ns_read_fd(void *ctx, char *buf, size_t len, uint64_t pos)
+{
+	int fd = *(const int *)ctx;
+	size_t n = 0;
+
+	while (n < len) {
+		ssize_t r = pread(fd, buf + n, len - n, (off_t)(pos + n));
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r < 0)
+			return -errno;
+		if (!r)
+			break;
+		n += (size_t)r;
+	}
+	return (ssize_t)n;
+}
+
+int nameset_parse(const char *text, size_t len, size_t window,
+                  struct nameset_file *f, uint32_t *ninvalid, const char *path)
+{
+	struct ns_mem m = { text, len };
+
+	return ns_parse(ns_read_mem, &m, window, len, f, ninvalid, path);
 }
 
 /* ---- nameset cache ----
@@ -466,7 +610,7 @@ static bool nsf_eq(const void *val, const void *key, void *ctx)
 
 static void nsf_free(struct nameset_file *f)
 {
-	arena_free(&f->arena);
+	free(f->blob);
 	free(f->path);
 	free(f);
 }
@@ -489,20 +633,18 @@ static struct nameset_file *nsf_load(const char *path, int *err)
 	struct nameset_file *f = calloc(1, sizeof(*f));
 	uint32_t ninval;
 	struct stat st;
-	size_t len;
-	char *text = NULL;
-	int ret;
+	int fd, ret;
 
 	if (!f || !(f->path = strdup(path))) {
 		free(f);
 		*err = -ENOMEM;
 		return NULL;
 	}
-	arena_init(&f->arena, 0);
-	ret = read_file(path, &text, &len, &st);
-	if (!ret)
-		ret = nameset_parse(text, len, &f->arena, &f->pat, &f->npat, &ninval, path);
-	free(text);
+	fd = ret = open_regular(path, &st);
+	if (fd >= 0) {
+		ret = ns_parse(ns_read_fd, &fd, 0, (size_t)st.st_size, f, &ninval, path);
+		close(fd);
+	}
 	if (ret) {
 		nsf_free(f);
 		*err = ret;
@@ -1267,6 +1409,7 @@ void config_free(struct config *cfg)
 {
 	if (!cfg)
 		return;
+	match_free(cfg->idx);		/* borrows the nameset files' blobs */
 	for (uint16_t i = 0; i < cfg->nrules; i++) {
 		struct rule *r = &cfg->rules[i];
 
@@ -1278,6 +1421,5 @@ void config_free(struct config *cfg)
 		free(r->id);
 	}
 	free(cfg->rules);
-	match_free(cfg->idx);
 	free(cfg);
 }

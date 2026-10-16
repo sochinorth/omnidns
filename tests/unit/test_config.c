@@ -311,8 +311,11 @@ TEST(nsc_reuse)
 	c2 = nsc_get(&nsc, P("ns/r.txt"), &e);
 	REQUIRE(c2);
 	CHECK(c2 != a);
-	CHECK_STR(c2->pat[0].name, "b.example");
-	CHECK_STR(a->pat[0].name, "a.example");	/* old still alive */
+	REQUIRE(c2->blob && a->blob);
+	CHECK_STR(c2->blob, "b.example");
+	CHECK_EQ(c2->blob_len, 10);
+	CHECK_STR(a->blob, "a.example");	/* old still alive and intact */
+	CHECK_EQ(a->blob_len, 10);
 	b = nsc_get(&nsc, P("ns/r.txt"), &e);
 	CHECK(b == c2);
 	nsc_put(b);
@@ -456,44 +459,62 @@ TEST(resolvconf)
 	CHECK_EQ(rc("", s, 8, &sk), 0);
 }
 
-static uint32_t ns(const char *text, struct arena *a, struct ns_pattern **p, uint32_t *inval)
-{
-	uint32_t n = 99;
+/* Parsed blob of one nameset text: owns the result between calls. */
+static struct nameset_file nsr;
 
-	CHECK_EQ(nameset_parse(text, strlen(text), a, p, &n, inval, "test"), 0);
-	return n;
+static uint32_t ns_win(const char *text, size_t len, size_t window, uint32_t *inval)
+{
+	free(nsr.blob);
+	memset(&nsr, 0, sizeof(nsr));
+	nsr.npat = 99;
+	CHECK_EQ(nameset_parse(text, len, window, &nsr, inval, "test"), 0);
+	return nsr.npat;
+}
+
+static uint32_t ns(const char *text, uint32_t *inval)
+{
+	return ns_win(text, strlen(text), 0, inval);
+}
+
+/* i-th entry of nsr.blob */
+static const char *ent(uint32_t i)
+{
+	const char *e = nsr.blob;
+
+	while (i--)
+		e = ns_next(e);
+	return e;
 }
 
 TEST(nameset_edge)
 {
-	struct arena a;
-	struct ns_pattern *p;
 	uint32_t n, inval;
 	char l63[128], l64[128], big[600];
 
-	arena_init(&a, 0);
 	n = ns("# header\r\n\r\n  Example.COM \r\n*.Ads.Net\t# trailing\n"
 	       "foo.bar#baz\n*.\n*\n*.*.x\ntrailing.dot.\n.leading\na..b\n"
 	       "a b\nunder_score-ok.x\n#comment\n   # indented comment\n1.2.3.4\n"
-	       "last.line", &a, &p, &inval);
+	       "last.line", &inval);
 	REQUIRE(n == 5);
 	CHECK_EQ(inval, 8);
-	CHECK_STR(p[0].name, "example.com");
-	CHECK_EQ(p[0].len, 11);
-	CHECK(!p[0].suffix);
-	CHECK_STR(p[1].name, "ads.net");
-	CHECK(p[1].suffix);
-	CHECK_STR(p[2].name, "under_score-ok.x");
-	CHECK_STR(p[3].name, "1.2.3.4");
-	CHECK_STR(p[4].name, "last.line");
+	CHECK_STR(ent(0), "example.com");
+	CHECK(!ns_is_suffix(ent(0)));
+	CHECK_STR(ent(1), "*.ads.net");
+	CHECK(ns_is_suffix(ent(1)));
+	CHECK_STR(ns_name(ent(1)), "ads.net");
+	CHECK_STR(ent(2), "under_score-ok.x");
+	CHECK_STR(ent(3), "1.2.3.4");
+	CHECK_STR(ent(4), "last.line");	/* no trailing newline */
+	CHECK_EQ(nsr.blob_len, 12 + 10 + 17 + 8 + 10);	/* exact size */
+	CHECK(ns_next(ent(4)) == nsr.blob + nsr.blob_len);
 
 	memset(l63, 'a', 63);
 	strcpy(l63 + 63, ".com\n");
 	memset(l64, 'a', 64);
 	strcpy(l64 + 64, ".com\n");
-	n = ns(l63, &a, &p, &inval);
+	n = ns(l63, &inval);
 	CHECK_EQ(n, 1);
-	n = ns(l64, &a, &p, &inval);
+	n = ns(l64, &inval);
 	CHECK_EQ(n, 0);
 	CHECK_EQ(inval, 1);
 
@@ -503,23 +524,129 @@ TEST(nameset_edge)
 		big[i * 64 + 63] = '.';
 	}
 	big[253] = 0;
-	CHECK_EQ(ns(big, &a, &p, &inval), 1);
-	CHECK_EQ(p[0].len, 253);
+	CHECK_EQ(ns(big, &inval), 1);
+	CHECK_EQ(strlen(ent(0)), 253);
 	big[253] = 'b';
 	big[254] = 'b';
 	big[255] = 0;
-	CHECK_EQ(ns(big, &a, &p, &inval), 0);
+	CHECK_EQ(ns(big, &inval), 0);
 	for (int i = 0; i < 127; i++) {
 		big[i * 2] = 'x';
 		big[i * 2 + 1] = '.';
 	}
 	big[253] = 0;
-	CHECK_EQ(ns(big, &a, &p, &inval), 1);
+	CHECK_EQ(ns(big, &inval), 1);
+	/* "*." + 253 chars ok */
+	memmove(big + 2, big, 254);
+	big[0] = '*';
+	big[1] = '.';
+	CHECK_EQ(ns(big, &inval), 1);
+	CHECK(ns_is_suffix(ent(0)));
+	CHECK_EQ(nsr.blob_len, 256);
 
-	CHECK_EQ(ns("", &a, &p, &inval), 0);
-	CHECK(p == NULL);
-	CHECK_EQ(ns("*.x\n*.x\n", &a, &p, &inval), 2);	/* dups are kept */
-	arena_free(&a);
+	CHECK_EQ(ns("", &inval), 0);
+	CHECK(nsr.blob == NULL);
+	CHECK_EQ(nsr.blob_len, 0);
+	CHECK_EQ(ns("# only\n  # comments\n\n\r\n", &inval), 0);
+	CHECK_EQ(inval, 0);
+	CHECK(nsr.blob == NULL);
+	CHECK_EQ(ns("*.x\n*.x\n", &inval), 2);	/* dups are kept */
+	CHECK_EQ(ns("A.B\r\n*.C.D\r\nE\r", &inval), 3);	/* CRLF, lowercased */
+	CHECK_STR(ent(0), "a.b");
+	CHECK_STR(ent(1), "*.c.d");
+	CHECK_STR(ent(2), "e");
+	CHECK_EQ(nsr.blob_len, 4 + 6 + 2);
+	/* order kept around invalid / comment / blank lines */
+	CHECK_EQ(ns("bad!\none\n\n#c\ntwo  # c\n-x-..\n*.three\nb@d\nfour", &inval), 4);
+	CHECK_EQ(inval, 3);
+	CHECK_STR(ent(0), "one");
+	CHECK_STR(ent(1), "two");
+	CHECK_STR(ent(2), "*.three");
+	CHECK_STR(ent(3), "four");
+}
+
+/* Lines longer than the window are invalid (comments: ignored) and skipped
+ * without disturbing the following lines or their numbering. */
+TEST(nameset_long_lines)
+{
+	size_t cap = 3 * NAMESET_WINDOW, o = 0;
+	char *t = malloc(cap);
+	uint32_t inval;
+
+	REQUIRE(t);
+	o += (size_t)sprintf(t + o, "first.x\n");
+	memset(t + o, 'a', NAMESET_WINDOW + 100);	/* spans two windows */
+	o += NAMESET_WINDOW + 100;
+	o += (size_t)sprintf(t + o, "\nsecond.x\n# ");
+	memset(t + o, 'c', 200);
+	o += 200;
+	o += (size_t)sprintf(t + o, "\nthird.x");
+	CHECK_EQ(ns_win(t, o, 0, &inval), 3);
+	CHECK_EQ(inval, 1);
+	CHECK_STR(ent(1), "second.x");
+	CHECK_STR(ent(2), "third.x");
+	/* small window: the comment line is ignored, the name lines fit */
+	CHECK_EQ(ns_win(t, o, 128, &inval), 3);
+	CHECK_EQ(inval, 1);
+	CHECK_STR(ent(2), "third.x");
+	/* long line running into EOF, and one exactly filling the last window */
+	CHECK_EQ(ns_win("ok\nxxxxxxxxxxxxxxxxxxxx", 23, 8, &inval), 1);
+	CHECK_EQ(inval, 1);
+	CHECK_EQ(ns_win("ok\nabc.def", 10, 7, &inval), 2);
+	CHECK_EQ(inval, 0);
+	CHECK_STR(ent(1), "abc.def");
+	CHECK_EQ(ns_win("abc.def", 7, 7, &inval), 1);
+	free(t);
+}
+
+/* Window boundaries anywhere must not change the result for lines that fit
+ * in a window. */
+static void check_windows(const char *text, size_t minwin)
+{
+	size_t len = strlen(text);
+	uint32_t n0, inval0, inval;
+	char *blob0;
+	uint32_t len0;
+	int bad = 0;
+
+	n0 = ns_win(text, len, len + 1, &inval0);	/* single pass */
+	blob0 = nsr.blob;
+	len0 = nsr.blob_len;
+	nsr.blob = NULL;
+	for (size_t w = minwin; w <= len + 2; w++) {
+		bool same = ns_win(text, len, w, &inval) == n0 && inval == inval0 &&
+		            nsr.blob_len == len0 &&
+		            (!len0 || !memcmp(nsr.blob, blob0, len0));
+
+		if (!same && bad++ < 3)
+			fprintf(stderr, "  window %zu differs\n", w);
+	}
+	CHECK_EQ(ns_win(text, len, 0, &inval), n0);
+	CHECK_EQ(inval, inval0);
+	CHECK_EQ(nsr.blob_len, len0);
+	CHECK(!len0 || !memcmp(nsr.blob, blob0, len0));
+	CHECK_EQ(bad, 0);
+	free(blob0);
+}
+
+TEST(nameset_windows)
+{
+	/* every line (with its newline) fits in 7 bytes */
+	check_windows("a.b\n*.cd\n#x\n\nA.B\r\nbad!\n x \n*.\n-\nq.r#\nz", 7);
+	/* realistic lines up to 80 bytes */
+	check_windows("# Header comment line for a block list, 2026\r\n"
+	              "\n"
+	              "ads.example.com\n"
+	              "*.Tracker.Example.NET   # trailing comment here\n"
+	              "  indented.example.org\t\n"
+	              "not valid.example\n"
+	              "*.cdn-1.example_2.io\r\n"
+	              "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z.example.com\n"
+	              "trailing.dot.\n"
+	              "#*.commented.out\n"
+	              "x\n"
+	              "1.2.3.4\n"
+	              "*.last.example", 81);
 }
 
 TEST(prefix_mark)
@@ -601,8 +728,11 @@ int main(void)
 	RUN(fingerprints);
 	RUN(resolvconf);
 	RUN(nameset_edge);
+	RUN(nameset_long_lines);
+	RUN(nameset_windows);
 	RUN(prefix_mark);
 	RUN(upstream_load);
+	free(nsr.blob);
 	nsc_sweep(&nsc);
 	CHECK_EQ(hmap_len(&nsc.by_path), 0);
 	nsc_destroy(&nsc);

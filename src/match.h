@@ -10,9 +10,10 @@
 /*
  * Suffix index over all rules' nameset patterns.
  *
- * A hash map keyed by the dotted pattern name; each node stores
+ * A hash table keyed by the dotted pattern name; each node stores
  * (min ordinal of rules with an exact pattern for the name,
  *  min ordinal of rules with a suffix pattern "*.name").
+ * Names are borrowed from the rules' nameset files, which must outlive it.
  *
  * Lookup of "a.b.google.com" (first match wins = minimum ordinal):
  *   full name   -> consider exact and suffix ordinals

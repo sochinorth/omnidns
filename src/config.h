@@ -4,11 +4,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 
-#include "util/arena.h"
 #include "util/hmap.h"
 
 /*
@@ -94,14 +94,6 @@ void upstream_set_put(struct upstream_set *u);
 
 /* ---- namesets ---- */
 
-/* Pattern: lowercase dotted name without trailing dot; `suffix` means the
- * line was "*.name" (matches name itself and everything below). */
-struct ns_pattern {
-	const char *name;
-	uint8_t len;
-	bool suffix;
-};
-
 /*
  * Parse nameset text: one pattern per line; blank lines and lines starting
  * with '#' are ignored; trailing "# comment" after whitespace is ignored;
@@ -110,11 +102,22 @@ struct ns_pattern {
  * total <= 253 chars, no empty labels, no trailing dot. Uppercase is
  * lowercased (lenient). Invalid lines are skipped and counted in *ninvalid
  * (the first few are logged with `path` and line number).
- * Patterns are allocated in `a`. Returns 0 or -ENOMEM.
+ *
+ * The text is consumed in windows of `window` bytes (0: NAMESET_WINDOW), as
+ * files are. A line that does not fit in one window is invalid (or ignored
+ * if it is a comment), so results only depend on the window size for lines
+ * at least that long.
+ *
+ * Valid patterns are stored in f->blob as consecutive NUL-terminated
+ * entries "[*.]name\0", f->blob_len bytes in total (blob NULL when
+ * f->npat is 0). Returns 0 or -ENOMEM.
  */
-int nameset_parse(const char *text, size_t len, struct arena *a,
-                  struct ns_pattern **out, uint32_t *n, uint32_t *ninvalid,
-                  const char *path);
+#define NAMESET_WINDOW	(64u << 10)
+
+struct nameset_file;
+
+int nameset_parse(const char *text, size_t len, size_t window,
+                  struct nameset_file *f, uint32_t *ninvalid, const char *path);
 
 struct nameset_file {
 	char *path;
@@ -123,10 +126,27 @@ struct nameset_file {
 	struct timespec mtime;
 	off_t size;
 	int refcnt;
-	struct arena arena;
-	struct ns_pattern *pat;
+	uint32_t blob_len;
 	uint32_t npat;
+	char *blob;
 };
+
+/* Walking a blob: for (e = f->blob; e < f->blob + f->blob_len; e = ns_next(e)).
+ * A leading "*." marks a suffix pattern ('*' is not a name character). */
+static inline bool ns_is_suffix(const char *e)
+{
+	return e[0] == '*';
+}
+
+static inline const char *ns_name(const char *e)
+{
+	return ns_is_suffix(e) ? e + 2 : e;
+}
+
+static inline const char *ns_next(const char *e)
+{
+	return e + strlen(e) + 1;
+}
 
 /*
  * Cache of parsed nameset files keyed by path. nsc_get() stats the file and
