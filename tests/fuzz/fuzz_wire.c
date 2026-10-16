@@ -53,7 +53,6 @@ static void check_rr(const struct dns_msg *m, const struct dns_rr *rr)
 	ASSERT(rr->owner >= m->buf && rr->owner + rr->owner_len <= m->buf + m->buf_len);
 	ASSERT(rr->rdata >= m->buf && rr->rdata + rr->rdlen <= m->buf + m->buf_len);
 	ASSERT(dns_name_check(rr->owner, rr->owner_len) == rr->owner_len);
-	ASSERT(dns_name_labels(rr->owner, rr->owner_len) >= 0);
 	ASSERT(rr->type != DNS_T_OPT);
 	if (rr->type == DNS_T_SOA)
 		ASSERT(dns_soa_minimum(rr, &min) == 0);
@@ -212,7 +211,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	}
 	check_msg(&m);
 	ASSERT(dns_msg_copy(&c, &m) == 0);
-	ASSERT(dns_msg_footprint(&c) <= dns_msg_footprint(&m));
 	ASSERT(c.buf_len == c.buf_cap && c.buf_len <= m.buf_len && c.rr_cap == c.nrr);
 	ASSERT(c.nrr == m.nrr);
 	check_rebuilt(&m, &c);

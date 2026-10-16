@@ -92,22 +92,6 @@ void dns_name_lower(uint8_t *wire, uint8_t len)
 		wire[i] = lc(wire[i]);
 }
 
-int dns_name_labels(const uint8_t *wire, uint8_t len)
-{
-	size_t i = 0;
-	int n = 0;
-
-	while (i < len && wire[i]) {
-		if (wire[i] > DNS_MAX_LABEL)
-			return -EBADMSG;
-		i += (size_t)wire[i] + 1;
-		n++;
-	}
-	if (i >= len)
-		return -EBADMSG;
-	return n;
-}
-
 /* Offset in `name` where a suffix of length `slen` starts, or -1. */
 static int suffix_off(const uint8_t *name, uint8_t nlen, uint8_t slen)
 {
@@ -457,11 +441,6 @@ void dns_msg_set_rcode(struct dns_msg *m, int rcode)
 {
 	m->flags = (m->flags & ~DNS_F_RCODE) | (rcode & DNS_F_RCODE);
 	m->edns.ext_rcode = (rcode >> 4) & 0xff;
-}
-
-size_t dns_msg_footprint(const struct dns_msg *m)
-{
-	return m->buf_cap + (size_t)m->rr_cap * sizeof(struct dns_rr);
 }
 
 /* ---- parsing ---- */

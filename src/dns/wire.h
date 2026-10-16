@@ -135,7 +135,6 @@ int dns_name_to_text(const uint8_t *wire, uint8_t wire_len, char *out, size_t ca
 bool dns_name_eq(const uint8_t *a, uint8_t alen, const uint8_t *b, uint8_t blen);	/* case-insensitive */
 uint64_t dns_name_hash(const uint8_t *wire, uint8_t len);	/* case-insensitive, keyed */
 void dns_name_lower(uint8_t *wire, uint8_t len);
-int dns_name_labels(const uint8_t *wire, uint8_t len);		/* count excluding root */
 /* true if `name` equals `zone` or is below it (case-insensitive). */
 bool dns_name_is_under(const uint8_t *name, uint8_t nlen, const uint8_t *zone, uint8_t zlen);
 /*
@@ -198,9 +197,6 @@ static inline int dns_msg_rcode(const struct dns_msg *m)
 	return (m->flags & DNS_F_RCODE) | (m->edns.present ? (m->edns.ext_rcode << 4) : 0);
 }
 void dns_msg_set_rcode(struct dns_msg *m, int rcode);	/* sets ext_rcode too */
-
-/* Size of storage held (for cache accounting). */
-size_t dns_msg_footprint(const struct dns_msg *m);
 
 /*
  * Serialize with name compression (owner names and the compressible rdata

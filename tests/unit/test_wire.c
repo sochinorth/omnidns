@@ -907,8 +907,6 @@ TEST(names)
 	bl = wn(b, "www.example.org");
 	CHECK(!dns_name_eq(a, al, b, bl));
 	CHECK(dns_name_hash(a, al) != dns_name_hash(b, bl));
-	CHECK_EQ(dns_name_labels(a, al), 3);
-	CHECK_EQ(dns_name_labels((const uint8_t *)"", 1), 0);
 	dns_name_lower(a, al);
 	CHECK(!memcmp(a, "\3www\7example\3com", al));
 
@@ -974,7 +972,6 @@ TEST(copy_compact)
 	CHECK(c.buf_len <= m.buf_len);
 	CHECK_EQ(c.rr_cap, c.nrr);
 	CHECK_EQ(c.qoff, 0);
-	CHECK_EQ(dns_msg_footprint(&c), c.buf_len + c.nrr * sizeof(struct dns_rr));
 	/* source can go away */
 	dns_msg_free(&m);
 	CHECK(c.rr[1].rdata[3] == 1);
