@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 
 #include "test.h"
+#include "reply_corpus.h"
 #include "cache.h"
 #include "config.h"
 #include "fakeip.h"
@@ -123,29 +124,78 @@ static size_t dep(uint8_t *p, const struct config *cfg, const char *qname, const
 	return cache_dep_put(p, cfg->rules[idx].fingerprint, d.data, d.len, q.data, q.len);
 }
 
+static uint8_t wbuf[DNS_MAX_MSG], rbuf[DNS_MAX_MSG], refbuf[DNS_MAX_MSG + 1];
+
+/* resp as resolve hands it to the cache: built once, id 0, no OPT */
+static int wire_of(const struct dns_msg *resp, uint8_t *buf)
+{
+	struct dns_msg m = *resp;
+
+	m.id = 0;
+	memset(&m.edns, 0, sizeof(m.edns));
+	return dns_build(&m, buf, DNS_MAX_MSG);
+}
+
+static int ins_resp(struct cache *c, const struct config *cfg, const struct dns_msg *resp,
+                    uint32_t life, const uint8_t *deps, size_t dsz, uint16_t nd,
+                    struct binding *const *b, uint16_t nb)
+{
+	int n = wire_of(resp, wbuf);
+
+	if (n < 0)
+		return n;
+	return cache_insert(c, cfg, resp->qname.data, resp->qname.len, resp->qtype, DNS_C_IN,
+	                    cache_hash(resp->qname.data, resp->qname.len, resp->qtype, DNS_C_IN),
+	                    wbuf, (size_t)n, life, deps, dsz, nd, b, nb);
+}
+
 static int ins(struct cache *c, const struct config *cfg, const char *qname, uint32_t life,
                struct binding *const *b, uint16_t nb)
 {
 	uint8_t d[CACHE_DEP_HDR + DNS_MAX_NAME];
 	size_t dsz = dep(d, cfg, qname, qname);
-	struct dns_name n = N(qname);
 	struct dns_msg m;
 	int r;
 
 	mkresp(&m, qname, "1.2.3.4", life);
-	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
-	                 cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, life, d, dsz, 1, b, nb);
+	r = ins_resp(c, cfg, &m, life, d, dsz, 1, b, nb);
 	dns_msg_free(&m);
 	return r;
 }
 
+/* Look a name up and render the hit for a client asking with that exact
+ * name, id 0, no RD/CD and no EDNS, over TCP: rbuf, returns its length. */
+static int look_raw(struct cache *c, const struct config *cfg, const struct dns_name *n,
+                    uint16_t qtype, uint32_t *age)
+{
+	struct dns_reply rp = { .qname = n->data, .qlen = n->len };
+	struct cache_hit h;
+	int r;
+
+	r = cache_lookup(c, cfg, n->data, n->len, qtype, DNS_C_IN,
+	                 cache_hash(n->data, n->len, qtype, DNS_C_IN), &h);
+	if (r)
+		return r;
+	rp.age = h.age;
+	if (age)
+		*age = h.age;
+	r = dns_reply_render(h.msg, h.len, &rp, rbuf, sizeof(rbuf));
+	CHECK(r > 0);
+	return r;
+}
+
+/* ... and parse it into out */
 static int look(struct cache *c, const struct config *cfg, const char *qname,
 		uint16_t qtype, struct dns_msg *out)
 {
 	struct dns_name n = N(qname);
+	int r = look_raw(c, cfg, &n, qtype, NULL);
 
-	return cache_lookup(c, cfg, n.data, n.len, qtype, DNS_C_IN,
-	                    cache_hash(n.data, n.len, qtype, DNS_C_IN), out);
+	if (r < 0)
+		return r;
+	r = dns_parse(out, rbuf, (size_t)r);
+	CHECK_EQ(r, 0);
+	return r ? -EBADMSG : 0;
 }
 
 static const uint8_t SECRET[16] = { 7 };
@@ -178,7 +228,8 @@ TEST(basic)
 	CHECK_EQ(out.nrr, 1);
 	CHECK_EQ(out.rr[0].ttl, 300);
 	CHECK_EQ(out.rr[0].type, DNS_T_A);
-	CHECK(!memcmp(out.qname.data, "\x01" "X" "\x03" "Foo", 5));	/* case as stored */
+	CHECK(!memcmp(out.qname.data, "\x01" "x" "\x03" "FOO", 5));	/* the client's case */
+	CHECK_EQ(out.flags, DNS_F_QR | DNS_F_RA);
 	CHECK_EQ(look(c, cfg, "x.foo.example", DNS_T_AAAA, &out), -ENOENT);
 
 	time_override_advance(100);
@@ -224,13 +275,24 @@ TEST(limits_e2big)
 		dsz += dep(deps + dsz, cfg, "a.example", name);
 	}
 	mkresp(&m, "a.example", "1.1.1.1", 60);
-	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
-	                      cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, 60,
-	                      deps, dsz, CACHE_MAX_DEPS + 1, NULL, 0), -E2BIG);
-	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
-	                      cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, 60,
-	                      deps, sz32, CACHE_MAX_DEPS, NULL, 0), 0);
+	CHECK_EQ(ins_resp(c, cfg, &m, 60, deps, dsz, CACHE_MAX_DEPS + 1, NULL, 0), -E2BIG);
+	CHECK_EQ(ins_resp(c, cfg, &m, 60, deps, sz32, CACHE_MAX_DEPS, NULL, 0), 0);
 	CHECK_EQ(cache_count(c), 1);
+	/* the stored question must be the key */
+	{
+		struct dns_name other = N("b.example");
+		int len = wire_of(&m, wbuf);
+
+		CHECK_EQ(cache_insert(c, cfg, other.data, other.len, DNS_T_A, DNS_C_IN,
+		                      cache_hash(other.data, other.len, DNS_T_A, DNS_C_IN),
+		                      wbuf, (size_t)len, 60, NULL, 0, 0, NULL, 0), -EINVAL);
+		CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
+		                      cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN),
+		                      wbuf, 20, 60, NULL, 0, 0, NULL, 0), -EINVAL);
+		CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_AAAA, DNS_C_IN,
+		                      cache_hash(n.data, n.len, DNS_T_AAAA, DNS_C_IN),
+		                      wbuf, (size_t)len, 60, NULL, 0, 0, NULL, 0), -EINVAL);
+	}
 	dns_msg_free(&m);
 	cache_free(c);
 	config_free(cfg);
@@ -486,77 +548,31 @@ static int ins_msg(struct cache *c, const struct config *cfg, const struct dns_m
 	uint8_t d[CACHE_DEP_HDR + DNS_MAX_NAME];
 	size_t dsz = dep(d, cfg, "invalid", "x.example");
 
-	return cache_insert(c, cfg, m->qname.data, m->qname.len, m->qtype, DNS_C_IN,
-	                    cache_hash(m->qname.data, m->qname.len, m->qtype, DNS_C_IN),
-	                    m, life, d, dsz, 1, NULL, 0);
-}
-
-static int look_msg(struct cache *c, const struct config *cfg, const struct dns_msg *m,
-                    struct dns_msg *out)
-{
-	return cache_lookup(c, cfg, m->qname.data, m->qname.len, m->qtype, DNS_C_IN,
-	                    cache_hash(m->qname.data, m->qname.len, m->qtype, DNS_C_IN), out);
+	return ins_resp(c, cfg, m, life, d, dsz, 1, NULL, 0);
 }
 
 /*
- * Compare a cache hit with what a deep copy of the inserted message aged by
- * `age` looks like (the original cache semantics): same flags, question,
- * RR order and bytes, TTLs reduced and floored at 0, id and EDNS zero.
+ * A hit for client name q (rendered by look_raw) must be byte for byte what
+ * the pre-wire-cache path made of the inserted message aged by `age`.
  */
-static void check_hit(const struct dns_msg *got, const struct dns_msg *resp, uint32_t age)
+static void check_hit(int got, const struct dns_msg *resp, const struct dns_name *q,
+                      uint32_t age)
 {
-	uint8_t w1[4096], w2[4096];
-	struct dns_msg exp;
-	int n1, n2;
-	uint16_t i;
+	int n = ref_reply(resp, q->data, q->len, 0, 0, false, 65536, age, refbuf);
 
-	CHECK_EQ(got->id, 0);
-	CHECK(!got->edns.present && !got->edns.ext_rcode && !got->edns.udp_size);
-	CHECK_EQ(got->flags, resp->flags);
-	CHECK_EQ(got->has_q, resp->has_q);
-	CHECK_EQ(got->qname.len, resp->qname.len);
-	CHECK(!memcmp(got->qname.data, resp->qname.data, resp->qname.len));
-	CHECK_EQ(got->qtype, resp->qtype);
-	CHECK_EQ(got->qclass, resp->qclass);
-	REQUIRE(got->nrr == resp->nrr);
-	for (i = 0; i < got->nrr; i++) {
-		const struct dns_rr *g = &got->rr[i], *r = &resp->rr[i];
-
-		CHECK_EQ(g->section, r->section);
-		CHECK_EQ(g->type, r->type);
-		CHECK_EQ(g->cls, r->cls);
-		CHECK_EQ(g->ttl, r->ttl > age ? r->ttl - age : 0);
-		CHECK_EQ(g->owner_len, r->owner_len);
-		CHECK(!memcmp(g->owner, r->owner, r->owner_len));
-		CHECK_EQ(g->rdlen, r->rdlen);
-		CHECK(!r->rdlen || !memcmp(g->rdata, r->rdata, r->rdlen));
-		CHECK(g->owner >= got->buf && g->rdata + g->rdlen <= got->buf + got->buf_len);
-	}
-
-	/* and the wire form is byte-identical */
-	dns_msg_init(&exp);
-	REQUIRE(dns_msg_copy(&exp, resp) == 0);
-	exp.id = 0;
-	memset(&exp.edns, 0, sizeof(exp.edns));
-	for (i = 0; i < exp.nrr; i++)
-		exp.rr[i].ttl = exp.rr[i].ttl > age ? exp.rr[i].ttl - age : 0;
-	n1 = dns_build(&exp, w1, sizeof(w1));
-	n2 = dns_build(got, w2, sizeof(w2));
-	CHECK(n1 > 12);
-	CHECK_EQ(n1, n2);
-	CHECK(n1 == n2 && !memcmp(w1, w2, (size_t)n1));
-	dns_msg_free(&exp);
+	CHECK(n > 12);
+	CHECK_EQ(got, n);
+	CHECK(got == n && !memcmp(rbuf, refbuf, (size_t)n));
 }
 
 TEST(round_trip)
 {
 	struct config *cfg = load(HDR RULE_FA RULE_ALL);
 	struct cache *c = cache_new(100, 1 << 20, NULL);
-	struct dns_msg m[4], out;
-	uint32_t age;
+	struct dns_msg m[4];
+	uint32_t age, a;
 	int i;
 
-	dns_msg_init(&out);
 	time_override_set(5000);
 	msg_chain(&m[0]);
 	msg_nx(&m[1]);
@@ -566,44 +582,45 @@ TEST(round_trip)
 		CHECK_EQ(ins_msg(c, cfg, &m[i], 1000), 0);
 	CHECK_EQ(cache_count(c), 4);
 
-	/* `out` is reused across hits of different sizes */
 	for (age = 0; age <= 45; age += 45) {
 		for (i = 0; i < 4; i++) {
-			REQUIRE(look_msg(c, cfg, &m[i], &out) == 0);
-			check_hit(&out, &m[i], age);
+			int n = look_raw(c, cfg, &m[i].qname, m[i].qtype, &a);
+
+			REQUIRE(n > 0);
+			CHECK_EQ(a, age);
+			check_hit(n, &m[i], &m[i].qname, age);
 		}
-		REQUIRE(look_msg(c, cfg, &m[0], &out) == 0);
-		check_hit(&out, &m[0], age);
 		time_override_advance(45);
 	}
-	/* lookups are case-insensitive; the question keeps the stored case */
+	/* lookups are case-insensitive; the question takes the client's case */
 	{
 		struct dns_name q = N("www.FOO.example");
+		int n = look_raw(c, cfg, &q, DNS_T_A, NULL);
 
-		REQUIRE(cache_lookup(c, cfg, q.data, q.len, DNS_T_A, DNS_C_IN,
-		                     cache_hash(q.data, q.len, DNS_T_A, DNS_C_IN), &out) == 0);
-		check_hit(&out, &m[0], 90);
+		REQUIRE(n > 0);
+		CHECK(!memcmp(rbuf + 12, q.data, q.len));
+		check_hit(n, &m[0], &q, 90);
 	}
 
 	for (i = 0; i < 4; i++)
 		dns_msg_free(&m[i]);
-	dns_msg_free(&out);
 	cache_free(c);
 	config_free(cfg);
 }
 
-/* Answers whose owners and rdata expand past 64 KiB. */
+/* An answer too large for a TCP message is stored, and served, truncated. */
 TEST(huge_answer)
 {
 	struct config *cfg = load(HDR RULE_FA RULE_ALL);
 	struct cache *c = cache_new(100, 1 << 20, NULL);
 	struct dns_msg m, out;
 	uint8_t rd[255];
-	int i;
+	size_t b0;
+	int i, n;
 
 	dns_msg_init(&out);
 	time_override_set(1000);
-	/* 300 distinct 255-byte TXT rdata: ~76 KiB, not addressable */
+	/* 300 distinct 255-byte TXT rdata: ~76 KiB */
 	qinit(&m, "big.example", DNS_T_TXT, DNS_F_QR | DNS_F_RA);
 	rd[0] = 254;
 	for (i = 0; i < 300; i++) {
@@ -612,25 +629,320 @@ TEST(huge_answer)
 		rd[2] = (uint8_t)(i >> 8);
 		add(&m, DNS_S_AN, "big.example", DNS_T_TXT, 60, rd, sizeof(rd));
 	}
-	CHECK_EQ(ins_msg(c, cfg, &m, 60), -E2BIG);
-	CHECK_EQ(cache_count(c), 0);
-	CHECK_EQ(cache_bytes(c), 0);
+	CHECK_EQ(ins_msg(c, cfg, &m, 60), 0);
+	CHECK_EQ(cache_count(c), 1);
+	b0 = cache_bytes(c);
+	CHECK(b0 < 200 + CACHE_ENTRY_OVERHEAD);
+	n = look_raw(c, cfg, &m.qname, DNS_T_TXT, NULL);
+	check_hit(n, &m, &m.qname, 0);
+	REQUIRE(look(c, cfg, "big.example", DNS_T_TXT, &out) == 0);
+	CHECK(out.flags & DNS_F_TC);
+	CHECK_EQ(out.nrr, 0);
 	dns_msg_free(&m);
 
-	/* the same size, repetitive: interned, cached and served intact */
+	/* 240 of them fit and are stored whole */
 	qinit(&m, "big.example", DNS_T_TXT, DNS_F_QR | DNS_F_RA);
-	for (i = 0; i < 300; i++) {
+	for (i = 0; i < 240; i++) {
 		memset(rd + 1, 'a' + i % 4, 254);
 		add(&m, DNS_S_AN, "big.example", DNS_T_TXT, 60, rd, sizeof(rd));
 	}
 	CHECK_EQ(ins_msg(c, cfg, &m, 60), 0);
 	CHECK_EQ(cache_count(c), 1);
-	REQUIRE(cache_lookup(c, cfg, m.qname.data, m.qname.len, DNS_T_TXT, DNS_C_IN,
-	                     cache_hash(m.qname.data, m.qname.len, DNS_T_TXT, DNS_C_IN), &out) == 0);
-	check_hit(&out, &m, 0);
+	CHECK(cache_bytes(c) > 240 * 267);
+	n = look_raw(c, cfg, &m.qname, DNS_T_TXT, NULL);
+	check_hit(n, &m, &m.qname, 0);
 	dns_msg_free(&m);
 
 	dns_msg_free(&out);
+	cache_free(c);
+	config_free(cfg);
+}
+
+/* ---- delivery from the stored bytes vs the old path ---- */
+
+struct golden {
+	const char *name;
+	int len;
+	uint64_t fnv;
+	const char *hex;
+};
+
+static const struct golden golden[] = {
+#include "reply_golden.inc"
+};
+
+/*
+ * Cases whose recorded bytes changed on purpose: they have names equal but
+ * for case (a 0x20 client, or an upstream echoing one), which dns_build()
+ * now compresses case-insensitively. They are compared with the reference
+ * path run on today's dns_build(), and must still parse to the same
+ * records as the recording, apart from the case of compressed names.
+ */
+static const char *const ci_changed[] = {
+	"chain_0x20", "mixed", "mixed_other", "https_edns", "glue_edns900",
+};
+
+static uint64_t fnv64(const uint8_t *p, size_t n)
+{
+	uint64_t h = 1469598103934665603ull;
+
+	while (n--)
+		h = (h ^ *p++) * 1099511628211ull;
+	return h;
+}
+
+static bool is_ci_changed(const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < sizeof(ci_changed) / sizeof(ci_changed[0]); i++)
+		if (!strcmp(name, ci_changed[i]))
+			return true;
+	return false;
+}
+
+/* The same messages, compared without case and the id. */
+static bool same_msg_nocase(const uint8_t *a, size_t alen, const uint8_t *b, size_t blen)
+{
+	struct dns_msg x, y;
+	bool ok;
+	uint16_t i;
+
+	dns_msg_init(&x);
+	dns_msg_init(&y);
+	ok = !dns_parse(&x, a, alen) && !dns_parse(&y, b, blen) && x.flags == y.flags &&
+	     x.nrr == y.nrr && x.edns.present == y.edns.present &&
+	     dns_name_eq(x.qname.data, x.qname.len, y.qname.data, y.qname.len);
+	for (i = 0; ok && i < x.nrr; i++) {
+		const struct dns_rr *r = &x.rr[i], *t = &y.rr[i];
+		uint16_t k;
+
+		ok = r->section == t->section && r->type == t->type && r->ttl == t->ttl &&
+		     dns_name_eq(r->owner, r->owner_len, t->owner, t->owner_len) &&
+		     r->rdlen == t->rdlen;
+		for (k = 0; ok && k < r->rdlen; k++)
+			ok = (r->rdata[k] | 0x20) == (t->rdata[k] | 0x20);
+	}
+	dns_msg_free(&x);
+	dns_msg_free(&y);
+	return ok;
+}
+
+static int hexval(char ch)
+{
+	return ch <= '9' ? ch - '0' : ch - 'a' + 10;
+}
+
+/* Insert a case's answer, age it, and render the hit for the case's client. */
+static int deliver_case(struct cache *c, const struct config *cfg, const struct rcase *rc,
+                        const struct dns_msg *m)
+{
+	struct dns_name q = rc_N(rc->client);
+	struct dns_reply rp = {
+		.id = rc->id, .rdcd = rc->rdcd, .qname = q.data, .qlen = q.len,
+		.edns = rc->edns, .edns_udp = REF_EDNS_MAX_UDP,
+	};
+	struct cache_hit h;
+
+	cache_flush(c);
+	time_override_set(100000);
+	if (ins_resp(c, cfg, m, 1000000, NULL, 0, 0, NULL, 0))
+		return -1;
+	time_override_advance(rc->age);
+	if (cache_lookup(c, cfg, q.data, q.len, m->qtype, DNS_C_IN,
+	                 cache_hash(q.data, q.len, m->qtype, DNS_C_IN), &h))
+		return -1;
+	CHECK_EQ(h.age, rc->age);
+	rp.age = h.age;
+	return dns_reply_render(h.msg, h.len, &rp, rbuf,
+	                        ref_limit(rc->edns, rc->tcp, rc->udp_size));
+}
+
+TEST(golden_replies)
+{
+	struct config *cfg = load(HDR RULE_FA RULE_ALL);
+	struct cache *c = cache_new(100, 1 << 20, NULL);
+	size_t i;
+
+	REQUIRE(NRCASES == sizeof(golden) / sizeof(golden[0]));
+	for (i = 0; i < NRCASES; i++) {
+		const struct rcase *rc = &rcases[i];
+		const struct golden *g = &golden[i];
+		struct dns_msg m;
+		int n, nref, k;
+
+		if (strcmp(rc->name, g->name)) {
+			CHECK(!strcmp(rc->name, g->name));
+			break;
+		}
+		rc->mk(&m);
+		n = deliver_case(c, cfg, rc, &m);
+		nref = ref_case(rc, &m, refbuf);
+		dns_msg_free(&m);
+		if (n != nref || memcmp(rbuf, refbuf, (size_t)(n > 0 ? n : 0))) {
+			fprintf(stderr, "  case %s: differs from the reference (%d vs %d)\n",
+			        rc->name, n, nref);
+			CHECK(0);
+			continue;
+		}
+		if (is_ci_changed(rc->name)) {
+			uint8_t old[1400];
+
+			if (!g->hex || strlen(g->hex) / 2 > sizeof(old)) {
+				CHECK(0);
+				continue;
+			}
+			for (k = 0; k < g->len; k++)
+				old[k] = (uint8_t)(hexval(g->hex[2 * k]) << 4 | hexval(g->hex[2 * k + 1]));
+			CHECK(n != g->len || memcmp(rbuf, old, (size_t)n));	/* still listed? */
+			if (!same_msg_nocase(rbuf, (size_t)n, old, (size_t)g->len)) {
+				fprintf(stderr, "  case %s: not the recorded message\n", rc->name);
+				CHECK(0);
+			}
+			continue;
+		}
+		if (n != g->len || fnv64(rbuf, (size_t)n) != g->fnv) {
+			fprintf(stderr, "  case %s: %d bytes, recorded %d\n", rc->name, n, g->len);
+			CHECK(0);
+		}
+	}
+	cache_free(c);
+	config_free(cfg);
+}
+
+/* ---- randomized: insert -> deliver vs the reference ---- */
+
+static uint32_t rnd_state = 12345;
+
+static uint32_t rnd(void)
+{
+	rnd_state ^= rnd_state << 13;
+	rnd_state ^= rnd_state >> 17;
+	rnd_state ^= rnd_state << 5;
+	return rnd_state;
+}
+
+static const char *const rnd_names[] = {
+	"example", "a.example", "b.a.example", "www.example", "cdn.www.example",
+	"x.y.z.example", "mail.example", "ns1.example", "ns2.example", "zz.test",
+};
+
+static struct dns_name rnd_name(void)
+{
+	struct dns_name n = rc_N(rnd_names[rnd() % (sizeof(rnd_names) / sizeof(rnd_names[0]))]);
+	uint8_t i;
+
+	for (i = 0; i < n.len; i++)
+		if (n.data[i] >= 'a' && n.data[i] <= 'z' && rnd() % 3 == 0)
+			n.data[i] -= 32;
+	return n;
+}
+
+static void rnd_rr(struct dns_msg *m, enum dns_section sec)
+{
+	static const uint16_t types[] = { DNS_T_A, DNS_T_AAAA, DNS_T_CNAME, DNS_T_NS, DNS_T_PTR,
+	                                  DNS_T_MX, DNS_T_SOA, DNS_T_TXT, DNS_T_SRV, DNS_T_HTTPS };
+	struct dns_name o = rnd_name(), t = rnd_name(), t2 = rnd_name();
+	uint16_t type = types[rnd() % (sizeof(types) / sizeof(types[0]))], len = 0, i;
+	uint32_t ttl = rnd() % 4 == 0 ? rnd() % 0x80000000u : rnd() % 400;
+	uint8_t rd[700];
+
+	switch (type) {
+	case DNS_T_A:
+	case DNS_T_AAAA:
+		len = type == DNS_T_A ? 4 : 16;
+		for (i = 0; i < len; i++)
+			rd[i] = (uint8_t)rnd();
+		break;
+	case DNS_T_CNAME: case DNS_T_NS: case DNS_T_PTR:
+		memcpy(rd, t.data, t.len);
+		len = t.len;
+		break;
+	case DNS_T_MX:
+		rd[0] = 0;
+		rd[1] = (uint8_t)rnd();
+		memcpy(rd + 2, t.data, t.len);
+		len = 2 + t.len;
+		break;
+	case DNS_T_SOA:
+		memcpy(rd, t.data, t.len);
+		memcpy(rd + t.len, t2.data, t2.len);
+		len = t.len + t2.len;
+		for (i = 0; i < 20; i++)
+			rd[len++] = (uint8_t)rnd();
+		break;
+	default:
+		len = (uint16_t)(rnd() % 600);
+		for (i = 0; i < len; i++)
+			rd[i] = (uint8_t)rnd();
+		break;
+	}
+	if (dns_msg_add_rr(m, sec, o.data, o.len, type, DNS_C_IN, ttl, rd, len))
+		abort();
+}
+
+TEST(randomized_replies)
+{
+	static const uint16_t sizes[] = { 0, 100, 512, 513, 700, 1232, 1400, 4096 };
+	struct config *cfg = load(HDR RULE_FA RULE_ALL);
+	struct cache *c = cache_new(100, 64 << 20, NULL);
+	int iter, fails = 0;
+
+	for (iter = 0; iter < 3000 && fails < 5; iter++) {
+		struct dns_name q = rnd_name();
+		struct rcase rc = { 0 };
+		struct dns_msg m;
+		int sec, k, n, nref, nrr = (int)(rnd() % (rnd() % 8 == 0 ? 170 : 40));
+
+		dns_msg_init(&m);
+		dns_msg_set_question(&m, q.data, q.len, (uint16_t)(1 + rnd() % 70), DNS_C_IN);
+		m.flags = (uint16_t)(rnd() & ~DNS_F_QR);
+		for (sec = DNS_S_AN; sec <= DNS_S_AR; sec++)
+			for (k = rnd() % 3 ? (int)(rnd() % (nrr + 1)) : 0; k > 0; k--)
+				rnd_rr(&m, (enum dns_section)sec);
+		/* the client asks with the same name in its own case */
+		q = m.qname;
+		for (k = 0; k < q.len; k++)
+			if (((q.data[k] | 0x20) >= 'a' && (q.data[k] | 0x20) <= 'z') && rnd() % 2)
+				q.data[k] ^= 0x20;
+		rc.id = (uint16_t)rnd();
+		rc.rdcd = (uint16_t)(rnd() & (DNS_F_RD | DNS_F_CD));
+		rc.edns = rnd() % 2;
+		rc.tcp = rnd() % 4 == 0;
+		rc.udp_size = sizes[rnd() % (sizeof(sizes) / sizeof(sizes[0]))];
+		rc.age = rnd() % 3 ? rnd() % 500 : 0;
+		{
+			struct dns_reply rp = {
+				.id = rc.id, .rdcd = rc.rdcd, .qname = q.data, .qlen = q.len,
+				.edns = rc.edns, .edns_udp = REF_EDNS_MAX_UDP,
+			};
+			struct cache_hit h;
+
+			cache_flush(c);
+			time_override_set(100000);
+			n = ins_resp(c, cfg, &m, 1000000, NULL, 0, 0, NULL, 0);
+			CHECK_EQ(n, 0);
+			time_override_advance(rc.age);
+			n = cache_lookup(c, cfg, q.data, q.len, m.qtype, DNS_C_IN,
+			                 cache_hash(q.data, q.len, m.qtype, DNS_C_IN), &h);
+			CHECK_EQ(n, 0);
+			if (!n) {
+				rp.age = h.age;
+				n = dns_reply_render(h.msg, h.len, &rp, rbuf,
+				                     ref_limit(rc.edns, rc.tcp, rc.udp_size));
+			}
+		}
+		nref = ref_reply(&m, q.data, q.len, rc.id, rc.rdcd, rc.edns,
+		                 ref_limit(rc.edns, rc.tcp, rc.udp_size), rc.age, refbuf);
+		if (n != nref || n <= 0 || memcmp(rbuf, refbuf, (size_t)n)) {
+			fprintf(stderr, "  iteration %d (%d RRs, edns %d tcp %d size %u age %u):"
+			        " %d vs reference %d\n", iter, m.nrr, rc.edns, rc.tcp,
+			        rc.udp_size, rc.age, n, nref);
+			CHECK(0);
+			fails++;
+		}
+		dns_msg_free(&m);
+	}
 	cache_free(c);
 	config_free(cfg);
 }
@@ -641,7 +953,6 @@ static int ins_deps(struct cache *c, const struct config *cfg, const char *qname
                     const char *d0, const char *d1)
 {
 	uint8_t d[2 * (CACHE_DEP_HDR + DNS_MAX_NAME)];
-	struct dns_name n = N(qname);
 	struct dns_msg m;
 	uint16_t nd = 0;
 	size_t dsz = 0;
@@ -652,8 +963,7 @@ static int ins_deps(struct cache *c, const struct config *cfg, const char *qname
 	if (d1)
 		dsz += dep(d + dsz, cfg, qname, d1), nd++;
 	mkresp(&m, qname, "192.0.2.9", 300);
-	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
-	                 cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, 300, d, dsz, nd, NULL, 0);
+	r = ins_resp(c, cfg, &m, 300, d, dsz, nd, NULL, 0);
 	dns_msg_free(&m);
 	return r;
 }
@@ -787,6 +1097,26 @@ TEST(byte_accounting)
 	fprintf(stderr, "  (heap checks need ASan)\n");
 #endif
 
+	/* a typical entry: CNAME + 3 A, deps on the qname and the target */
+	{
+		uint8_t d[2 * (CACHE_DEP_HDR + DNS_MAX_NAME)];
+		size_t dsz = dep(d, cfg, "www.example.com", "www.example.com");
+		struct dns_msg t;
+
+		dsz += dep(d + dsz, cfg, "www.example.com", "cdn.example.net");
+		qinit(&t, "www.example.com", DNS_T_A, DNS_F_QR | DNS_F_RA);
+		add_name(&t, DNS_S_AN, "www.example.com", DNS_T_CNAME, 300, "cdn.example.net");
+		add_a(&t, DNS_S_AN, "cdn.example.net", 60, "192.0.2.1");
+		add_a(&t, DNS_S_AN, "cdn.example.net", 60, "192.0.2.2");
+		add_a(&t, DNS_S_AN, "cdn.example.net", 60, "192.0.2.3");
+		cache_flush(c);
+		CHECK_EQ(ins_resp(c, cfg, &t, 60, d, dsz, 2, NULL, 0), 0);
+		/* message 110 (header 12, question 21, CNAME 29, A 3 x 16), deps 35 */
+		if (sizeof(void *) == 8)
+			CHECK_EQ(cache_bytes(c), 48 + 110 + 35 + CACHE_ENTRY_OVERHEAD);
+		dns_msg_free(&t);
+	}
+
 	/* eviction by bytes with multi-RR entries */
 	cache_flush(c);
 	cache_set_limits(c, 100000, 4096);
@@ -800,12 +1130,7 @@ TEST(byte_accounting)
 		CHECK(cache_bytes(c) <= 4096);
 	}
 	CHECK(cache_count(c) > 2 && cache_count(c) < 100);
-	{
-		struct dns_name q = N("c99.example");
-
-		CHECK_EQ(cache_lookup(c, cfg, q.data, q.len, DNS_T_A, DNS_C_IN,
-		                      cache_hash(q.data, q.len, DNS_T_A, DNS_C_IN), &out), 0);
-	}
+	CHECK_EQ(look(c, cfg, "c99.example", DNS_T_A, &out), 0);
 
 	for (i = 0; i < 3; i++)
 		dns_msg_free(&m[i]);
@@ -839,6 +1164,8 @@ int main(void)
 	RUN(byte_limit);
 	RUN(round_trip);
 	RUN(huge_answer);
+	RUN(golden_replies);
+	RUN(randomized_replies);
 	RUN(deps_revalidation);
 	RUN(byte_accounting);
 	nsc_destroy(&nsc);

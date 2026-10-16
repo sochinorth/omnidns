@@ -411,12 +411,31 @@ static void setup(const char *cfgtext)
 static struct dns_msg res;
 static int ncb;
 static struct resolve_req *cur;
+static struct dns_name cur_qname;	/* of the query in progress */
+static uint8_t res_wire[DNS_MAX_MSG];	/* the reply as the server renders it */
+static int res_len;
 
-static void res_cb(void *ctx, const struct dns_msg *m)
+/* Render msg as the server does for a client without EDNS over TCP (id 0,
+ * RD), and parse it into res. */
+static void take(const uint8_t *msg, size_t len, uint32_t age)
+{
+	struct dns_reply rp = {
+		.rdcd = DNS_F_RD, .qname = cur_qname.data, .qlen = cur_qname.len, .age = age,
+	};
+
+	res_len = dns_reply_render(msg, len, &rp, res_wire, sizeof(res_wire));
+	if (res_len < 0 || dns_parse(&res, res_wire, (size_t)res_len)) {
+		fprintf(stderr, "    unusable answer (%d)\n", res_len);
+		dns_msg_reset(&res);
+		res_len = 0;
+	}
+}
+
+static void res_cb(void *ctx, const uint8_t *msg, size_t len)
 {
 	ncb++;
 	cur = NULL;
-	dns_msg_copy(&res, m);
+	take(msg, len, 0);
 	uloop_end();
 }
 
@@ -447,14 +466,41 @@ static struct resolve_req *start(const char *qname, uint16_t qtype)
 	qlog[0] = 0;
 	nqueries = 0;
 	dns_msg_free(&res);
+	cur_qname = n;
 	cur = resolve_start(&o, &q, res_cb, NULL);
 	dns_msg_free(&q);
 	return cur;
 }
 
-/* Resolve and wait; returns true when the callback fired exactly once. */
+/* A synchronous cache hit, as the server takes it before resolve_start(). */
+static bool hit(const char *qname, uint16_t qtype)
+{
+	struct dns_name n = N(qname);
+	struct cache_hit h;
+	struct dns_msg q;
+	int r;
+
+	dns_msg_init(&q);
+	dns_msg_set_question(&q, n.data, n.len, qtype, DNS_C_IN);
+	r = resolve_lookup(&o, &q, &h);
+	dns_msg_free(&q);
+	if (r)
+		return false;
+	ncb = 1;
+	qlog[0] = 0;
+	nqueries = 0;
+	dns_msg_free(&res);
+	cur_qname = n;
+	take(h.msg, h.len, h.age);
+	return true;
+}
+
+/* Answer like the server: from the cache, else resolve and wait; returns
+ * true when the answer came exactly once. */
 static bool run(const char *qname, uint16_t qtype)
 {
+	if (hit(qname, qtype))
+		return true;
 	if (!start(qname, qtype) || ncb)
 		return false;
 	run_loop(3000);
@@ -1213,17 +1259,16 @@ TEST(t_other_qtypes_steered)
 	CHECK_EQ(count(DNS_S_AR), 0);
 }
 
-/* the answer as the server would build it (id 0, no EDNS), as hex */
+/* the answer as the server renders it (id 0, no EDNS), as hex */
 static const char *wire_hex(void)
 {
-	static uint8_t buf[DNS_MAX_MSG];
-	static char hex[2 * sizeof(buf) + 1];
-	int n = dns_build(&res, buf, sizeof(buf)), i;
+	static char hex[2 * sizeof(res_wire) + 1];
+	int n = res_len, i;
 
-	if (n < 0)
-		return "(build failed)";
+	if (n <= 0)
+		return "(no answer)";
 	for (i = 0; i < n; i++)
-		sprintf(hex + 2 * i, "%02x", buf[i]);
+		sprintf(hex + 2 * i, "%02x", res_wire[i]);
 	if (getenv("TEST_PRINT_WIRE"))
 		fprintf(stderr, "    wire: %s\n", hex);
 	return hex;
@@ -1373,12 +1418,13 @@ struct pending {
 
 static int npending;
 
-static void pending_cb(void *ctx, const struct dns_msg *m)
+static void pending_cb(void *ctx, const uint8_t *msg, size_t len)
 {
 	struct pending *p = ctx;
 
 	p->ncb++;
-	dns_msg_copy(&p->m, m);
+	if (dns_parse(&p->m, msg, len))
+		dns_msg_reset(&p->m);
 	if (!--npending)
 		uloop_end();
 }

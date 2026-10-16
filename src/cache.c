@@ -14,77 +14,59 @@
 /*
  * Entry layout: everything in ONE allocation.
  *
- *   struct centry              header (56 B on LP64, 48 B on ILP32)
+ *   struct centry              header (48 B on LP64)
  *   struct binding *binds[nbinds]
- *   struct crr rr[nrr]         compact RR records (16 B each)
  *   deps[dsz]                  packed (fingerprint u64, len u8, name)*,
  *                              len 0 = the qname
- *   data[dlen]                 the key qname (case as inserted) at offset 0,
- *                              then every owner name and rdata, interned:
- *                              a byte string already present in data (an
- *                              owner equal to the qname, a CNAME target, an
- *                              earlier owner, or any suffix of those) is
- *                              referenced instead of stored again.
+ *   msg[mlen]                  the answer as dns_build() wrote it: header,
+ *                              question (the key: qname in the case it was
+ *                              inserted with, uncompressed at offset 12,
+ *                              then qtype and qclass), the records; no OPT,
+ *                              id 0
  *
- * Everything else a lookup needs to rebuild the message (flags, question
- * presence) is in the header; the cached message's id and EDNS are always
- * zero, so they are not kept. Offsets into data are 16-bit: a message whose
- * interned owners and rdata cannot all start below 64 KiB is not cached
- * (only possible for a large TCP answer that expands past 64 KiB).
+ * A hit is served from msg by dns_reply_render(), which patches id, flags,
+ * question case and aged TTLs and appends OPT, so nothing is rebuilt.
  */
-struct crr {
-	uint16_t owner_off, rdata_off;	/* into data */
-	uint32_t ttl;
-	uint16_t type, cls;
-	uint16_t rdlen;
-	uint8_t owner_len;
-	uint8_t section;
-};
-
-_Static_assert(sizeof(struct crr) == 16, "crr layout");
-
 struct centry {
 	struct s3_node s3;	/* s3.hash = low 32 bits of the key hash */
 	uint32_t gen;		/* low 32 bits of the config generation */
 	uint32_t inserted, lifetime;
 	uint32_t bytes;		/* accounted size (allocation + overhead) */
-	uint16_t qtype, qclass;
-	uint16_t flags;		/* header flags incl. 4-bit rcode */
-	uint16_t nrr;
-	uint16_t ndeps, nbinds;
+	uint16_t mlen;		/* msg bytes (a message is <= 65535) */
 	uint16_t dsz;		/* packed deps bytes (<= 32 * 264) */
+	uint8_t ndeps, nbinds;
 	uint8_t qlen;
-	bool has_q;
-	struct binding *tail[];	/* binds, then rr, deps, data (see above) */
+	struct binding *tail[];	/* binds, then deps, msg (see above) */
 };
 
-/* 24 (s3) + 16 + 16 = 56 B on LP64; the tail starts pointer-aligned */
-_Static_assert(sizeof(struct centry) == sizeof(struct s3_node) + 32, "centry layout");
-_Static_assert(sizeof(struct centry) % _Alignof(struct crr) == 0, "crr alignment");
+_Static_assert(CACHE_MAX_DEPS <= UINT8_MAX && CACHE_MAX_BINDS <= UINT8_MAX, "centry counts");
+/* 24 (s3) + 16 + 7 = 47 B on LP64, padded: the tail starts pointer-aligned */
+_Static_assert(sizeof(struct centry) == sizeof(struct s3_node) + 24 || sizeof(void *) != 8,
+               "centry layout");
 
 static inline struct binding **e_binds(const struct centry *e)
 {
 	return (struct binding **)e->tail;
 }
 
-static inline const struct crr *e_rr(const struct centry *e)
-{
-	return (const struct crr *)(e->tail + e->nbinds);
-}
-
 static inline const uint8_t *e_deps(const struct centry *e)
 {
-	return (const uint8_t *)(e_rr(e) + e->nrr);
+	return (const uint8_t *)(e->tail + e->nbinds);
 }
 
-static inline const uint8_t *e_data(const struct centry *e)
+static inline const uint8_t *e_msg(const struct centry *e)
 {
 	return e_deps(e) + e->dsz;
 }
 
 static inline const uint8_t *e_qname(const struct centry *e)
 {
-	return e_data(e);
+	return e_msg(e) + 12;
+}
+
+static inline uint16_t get16(const uint8_t *p)
+{
+	return (uint16_t)(p[0] << 8 | p[1]);
 }
 
 struct ckey {
@@ -116,8 +98,10 @@ static bool key_eq(const void *val, const void *key, void *ctx)
 	const struct centry *e = val;
 	const struct ckey *k = key;
 
-	return e->qtype == k->qtype && e->qclass == k->qclass &&
-	       dns_name_eq(e_qname(e), e->qlen, k->qname, k->qlen);
+	const uint8_t *q = e_qname(e);
+
+	return e->qlen == k->qlen && get16(q + e->qlen) == k->qtype &&
+	       get16(q + e->qlen + 2) == k->qclass && dns_name_eq(q, e->qlen, k->qname, k->qlen);
 }
 
 static void entry_free(struct cache *c, struct centry *e)
@@ -271,85 +255,13 @@ static bool deps_valid(const struct centry *e, const struct config *cfg)
 	return true;
 }
 
-/* Make room for nrr RRs and len bytes in a reset message (nrr == 0). */
-static int msg_reserve(struct dns_msg *m, uint16_t nrr, size_t len)
-{
-	if (nrr > m->rr_cap) {
-		struct dns_rr *rr = realloc(m->rr, nrr * sizeof(*rr));
-
-		if (!rr)
-			return -ENOMEM;
-		m->rr = rr;
-		m->rr_cap = nrr;
-	}
-	if (len > m->buf_cap) {
-		uint8_t *b = realloc(m->buf, len);
-
-		if (!b)
-			return -ENOMEM;
-		m->buf = b;
-		m->buf_cap = len;
-	}
-	return 0;
-}
-
-/*
- * Rebuild the cached message into out (already reset), TTLs aged by age.
- * The result has the layout dns_msg_copy produces: per RR, the owner then
- * the rdata, back to back in buf.
- */
-static int inflate(const struct centry *e, struct dns_msg *out, uint32_t age)
-{
-	const struct crr *crr = e_rr(e);
-	const uint8_t *data = e_data(e);
-	size_t len = 0;
-	uint8_t *p;
-	uint16_t i;
-
-	out->flags = e->flags;
-	if (e->has_q) {
-		memcpy(out->qname.data, e_qname(e), e->qlen);
-		out->qname.len = e->qlen;
-		out->qtype = e->qtype;
-		out->qclass = e->qclass;
-		out->has_q = true;
-	}
-	for (i = 0; i < e->nrr; i++)
-		len += (size_t)crr[i].owner_len + crr[i].rdlen;
-	if (msg_reserve(out, e->nrr, len))
-		return -ENOMEM;
-	p = out->buf;
-	for (i = 0; i < e->nrr; i++) {
-		const struct crr *c = &crr[i];
-		struct dns_rr *rr = &out->rr[i];
-
-		memcpy(p, data + c->owner_off, c->owner_len);
-		rr->owner = p;
-		rr->owner_len = c->owner_len;
-		p += c->owner_len;
-		if (c->rdlen)
-			memcpy(p, data + c->rdata_off, c->rdlen);
-		rr->rdata = p;
-		rr->rdlen = c->rdlen;
-		p += c->rdlen;
-		rr->section = c->section;
-		rr->type = c->type;
-		rr->cls = c->cls;
-		rr->ttl = c->ttl > age ? c->ttl - age : 0;
-	}
-	out->nrr = e->nrr;
-	out->buf_len = len;
-	return 0;
-}
-
 int cache_lookup(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 uint64_t hash, struct dns_msg *out)
+                 uint64_t hash, struct cache_hit *hit)
 {
 	uint32_t now = omni_now(), age;
 	struct centry *e;
 
-	dns_msg_reset(out);
 	e = find(c, qname, qlen, qtype, qclass, hash);
 	if (!e)
 		return -ENOENT;
@@ -365,111 +277,43 @@ int cache_lookup(struct cache *c, const struct config *cfg,
 		}
 		e->gen = (uint32_t)cfg->gen;
 	}
-	if (inflate(e, out, age)) {
-		dns_msg_reset(out);
-		return -ENOENT;
-	}
 	s3_touch(&e->s3);
+	hit->msg = e_msg(e);
+	hit->len = e->mlen;
+	hit->age = age;
 	return 0;
 }
 
-
-/* Interning searches at most this much of data: bounds the work for huge
- * answers; typical answers fit entirely. */
-#define INTERN_WINDOW 4096
-
-/*
- * Place s[0..len) in data[0..*dlen): reuse an existing occurrence, else
- * append. Returns its offset, or -1 if it would not be addressable.
- */
-static int32_t intern(uint8_t *data, size_t *dlen, const uint8_t *s, size_t len)
-{
-	const uint8_t *hit;
-	size_t off;
-
-	if (!len)
-		return 0;
-	hit = memmem(data, *dlen < INTERN_WINDOW ? *dlen : INTERN_WINDOW, s, len);
-	if (hit)
-		return (int32_t)(hit - data);	/* < INTERN_WINDOW */
-	off = *dlen;
-	if (off > UINT16_MAX)
-		return -1;
-	memcpy(data + off, s, len);
-	*dlen += len;
-	return (int32_t)off;
-}
-
-/*
- * Build an entry for resp in one allocation. The data area is first sized
- * for the worst case (nothing interned), then the allocation is shrunk to
- * what was used. Returns NULL with *err set.
- */
-static struct centry *entry_new(const uint8_t *qname, uint8_t qlen, const struct dns_msg *resp,
+/* Build an entry in one allocation. Returns NULL with *err set. */
+static struct centry *entry_new(uint8_t qlen, const uint8_t *msg, size_t mlen,
 				const uint8_t *deps, size_t dsz, uint16_t ndeps,
 				struct binding *const *binds, uint16_t nbinds, int *err)
 {
-	size_t bsz = (size_t)nbinds * sizeof(*binds);
-	size_t rsz = (size_t)resp->nrr * sizeof(struct crr), hsz, dmax = qlen, dlen;
-	struct centry *e, *n;
-	struct crr *crr;
-	uint8_t *data;
-	uint16_t i;
+	size_t bsz = (size_t)nbinds * sizeof(*binds), sz = sizeof(struct centry) + bsz + dsz + mlen;
+	struct centry *e = malloc(sz);
 
-	for (i = 0; i < resp->nrr; i++)
-		dmax += (size_t)resp->rr[i].owner_len + resp->rr[i].rdlen;
-	hsz = sizeof(*e) + bsz + rsz + dsz;
-	e = calloc(1, hsz + dmax);
 	if (!e) {
 		*err = -ENOMEM;
 		return NULL;
 	}
+	memset(e, 0, sizeof(*e));
 	if (nbinds)
 		memcpy(e->tail, binds, bsz);
-	e->nbinds = nbinds;
-	e->nrr = resp->nrr;
-	e->ndeps = ndeps;
+	e->nbinds = (uint8_t)nbinds;
+	e->ndeps = (uint8_t)ndeps;
 	e->dsz = (uint16_t)dsz;
 	if (dsz)
 		memcpy((uint8_t *)e_deps(e), deps, dsz);
-	crr = (struct crr *)e_rr(e);
-	data = (uint8_t *)e_data(e);
-	memcpy(data, qname, qlen);
+	memcpy((uint8_t *)e_msg(e), msg, mlen);
+	e->mlen = (uint16_t)mlen;
 	e->qlen = qlen;
-	dlen = qlen;
-	for (i = 0; i < resp->nrr; i++) {
-		const struct dns_rr *rr = &resp->rr[i];
-		int32_t oo = intern(data, &dlen, rr->owner, rr->owner_len);
-		int32_t ro = intern(data, &dlen, rr->rdata, rr->rdlen);
-
-		if (oo < 0 || ro < 0) {
-			free(e);
-			*err = -E2BIG;
-			return NULL;
-		}
-		crr[i].owner_off = (uint16_t)oo;
-		crr[i].rdata_off = (uint16_t)ro;
-		crr[i].owner_len = rr->owner_len;
-		crr[i].rdlen = rr->rdlen;
-		crr[i].section = rr->section;
-		crr[i].type = rr->type;
-		crr[i].cls = rr->cls;
-		crr[i].ttl = rr->ttl;
-	}
-	if (dlen < dmax) {
-		n = realloc(e, hsz + dlen);
-		if (n)
-			e = n;
-		else
-			dlen = dmax;	/* keep the larger block, account for it */
-	}
-	e->bytes = (uint32_t)(hsz + dlen + ENTRY_OVERHEAD);
+	e->bytes = (uint32_t)(sz + ENTRY_OVERHEAD);
 	return e;
 }
 
 int cache_insert(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 uint64_t hash, const struct dns_msg *resp, uint32_t lifetime,
+                 uint64_t hash, const uint8_t *msg, size_t mlen, uint32_t lifetime,
                  const uint8_t *deps, size_t dsz, uint16_t ndeps,
                  struct binding *const *binds, uint16_t nbinds)
 {
@@ -479,22 +323,22 @@ int cache_insert(struct cache *c, const struct config *cfg,
 
 	if (ndeps > CACHE_MAX_DEPS || dsz > UINT16_MAX || nbinds > CACHE_MAX_BINDS)
 		return -E2BIG;
+	if (mlen > UINT16_MAX || mlen < 12 + (size_t)qlen + 4 || get16(msg + 4) != 1 ||
+	    !dns_name_eq(msg + 12, qlen, qname, qlen) || get16(msg + 12 + qlen) != qtype ||
+	    get16(msg + 12 + qlen + 2) != qclass)
+		return -EINVAL;
 	if (!lifetime)
 		return 0;
-	e = entry_new(qname, qlen, resp, deps, dsz, ndeps, binds, nbinds, &err);
+	e = entry_new(qlen, msg, mlen, deps, dsz, ndeps, binds, nbinds, &err);
 	if (!e)
 		return err;
 	if (e->bytes > c->max_bytes) {
 		free(e);
 		return -E2BIG;
 	}
-	e->flags = resp->flags;
-	e->has_q = resp->has_q;
 	old = find(c, qname, qlen, qtype, qclass, hash);
 	if (old)
 		entry_drop(c, old);
-	e->qtype = qtype;
-	e->qclass = qclass;
 	e->gen = (uint32_t)cfg->gen;
 	e->inserted = omni_now();
 	e->lifetime = lifetime;

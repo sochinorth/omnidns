@@ -11,9 +11,11 @@
 /*
  * Cache of complete, policy-aware resolution results.
  *
- * Key: (lowercased qname, qtype, qclass).
- * Value: the final response message (sections + rcode/flags, no OPT),
- *        insert time, lifetime, dependency list, binding refs, config gen.
+ * Key: (qname, qtype, qclass), the name compared case-insensitively.
+ * Value: the final response in wire format as dns_build() wrote it (one
+ *        question, no OPT), insert time, lifetime, dependency list, binding
+ *        refs, config gen. A hit hands out those bytes and the entry's age;
+ *        dns_reply_render() turns them into the client's reply.
  *
  * Dependencies: every name whose rule match influenced the result (each
  * walk step, each ServiceMode TargetName) is recorded with the matched
@@ -21,9 +23,7 @@
  * re-matched against cfg; any fingerprint mismatch drops the entry (miss).
  * Otherwise entry->gen is updated to cfg->gen.
  *
- * TTLs: returned copies have every RR TTL reduced by the elapsed time
- * (floored at 0). An entry is served until insert + lifetime; then it is a
- * miss and dropped.
+ * An entry is served until insert + lifetime; then it is a miss and dropped.
  *
  * Eviction: S3-FIFO bounded by max_entries and max_bytes, batched.
  * Dropping an entry releases its binding refs (fakeip_unref); it never
@@ -70,22 +70,29 @@ void cache_set_limits(struct cache *c, uint32_t max_entries, size_t max_bytes);
  * that follows it hash the key once). */
 uint64_t cache_hash(const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass);
 
-/* Returns 0 on hit (out filled with id 0, no EDNS, the question as
- * inserted) or -ENOENT. `out` must be initialized; it is reset first, and
- * its rr/buf allocations are reused when large enough. */
+struct cache_hit {
+	const uint8_t *msg;	/* the stored response (see above) */
+	uint16_t len;
+	uint32_t age;		/* seconds since insert: subtract from TTLs */
+};
+
+/* Returns 0 on hit, or -ENOENT. hit->msg points into the entry and stays
+ * valid only until the next call into the cache. */
 int cache_lookup(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 uint64_t hash, struct dns_msg *out);
+                 uint64_t hash, struct cache_hit *hit);
 
 /*
- * Insert/replace. `lifetime` seconds (0 => not cached). Takes a reference on
- * each binding. deps: ndeps packed dependencies, dsz bytes (see above).
+ * Insert/replace. msg: the response as dns_build() wrote it, with exactly
+ * one question whose name is qname (any case; it is the key's stored
+ * case), no OPT. `lifetime` seconds (0 => not cached). Takes a reference
+ * on each binding. deps: ndeps packed dependencies, dsz bytes (see above).
  * ndeps > CACHE_MAX_DEPS or nbinds > CACHE_MAX_BINDS => not cached (returns
- * -E2BIG).
+ * -E2BIG); a msg without that question => -EINVAL.
  */
 int cache_insert(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 uint64_t hash, const struct dns_msg *resp, uint32_t lifetime,
+                 uint64_t hash, const uint8_t *msg, size_t mlen, uint32_t lifetime,
                  const uint8_t *deps, size_t dsz, uint16_t ndeps,
                  struct binding *const *binds, uint16_t nbinds);
 

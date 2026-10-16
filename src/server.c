@@ -13,6 +13,7 @@
 #include <libubox/list.h>
 #include <libubox/uloop.h>
 
+#include "cache.h"
 #include "dns/wire.h"
 #include "log.h"
 #include "resolve.h"
@@ -90,7 +91,6 @@ struct creq {
 	uint16_t id;
 	uint16_t rdcd;			/* RD|CD bits copied from the query */
 	struct dns_name qname;
-	uint16_t qtype, qclass;
 	bool edns;
 	uint16_t udp_size;
 };
@@ -196,35 +196,20 @@ static void creq_release(struct creq *q)
 
 /* ---- response building ---- */
 
-static int build_reply(const struct creq *q, const struct dns_msg *resp,
-                       uint8_t *buf, size_t maxlen)
+/*
+ * Replies are rendered from a response in wire format, a fresh one from
+ * resolve or a cache hit alike: id, RD/CD, the client's question bytes,
+ * aged TTLs, OPT iff the query had one, the size limit.
+ */
+static int render(const uint8_t *msg, size_t len, uint32_t age, uint16_t id, uint16_t rdcd,
+                  const struct dns_name *qname, bool edns, uint8_t *buf, size_t maxlen)
 {
-	struct dns_msg m;
-	int ret, rcode;
+	struct dns_reply rp = {
+		.id = id, .rdcd = rdcd, .qname = qname->data, .qlen = qname->len,
+		.edns = edns, .edns_udp = EDNS_MAX_UDP, .age = age,
+	};
 
-	/* Shallow copy: only the inline header/question/EDNS fields of m are
-	 * modified below; rr[] and buf stay borrowed from resp (read-only via
-	 * dns_build) and must not be freed here. */
-	if (resp) {
-		m = *resp;
-	} else {
-		dns_msg_init(&m);
-		m.flags = DNS_R_SERVFAIL;
-	}
-	m.id = q->id;
-	m.flags = (m.flags & ~(DNS_F_RD | DNS_F_CD | DNS_F_OPCODE | DNS_F_AA)) |
-	          DNS_F_QR | DNS_F_RA | q->rdcd;
-	ret = dns_msg_set_question(&m, q->qname.data, q->qname.len, q->qtype, q->qclass);
-	if (ret)
-		return ret;
-	rcode = dns_msg_rcode(&m);
-	memset(&m.edns, 0, sizeof(m.edns));
-	if (q->edns) {
-		m.edns.present = true;
-		m.edns.udp_size = EDNS_MAX_UDP;
-	}
-	dns_msg_set_rcode(&m, rcode);
-	return dns_build(&m, buf, maxlen);
+	return dns_reply_render(msg, len, &rp, buf, maxlen);
 }
 
 /* Minimal error reply when only the raw header (and maybe question) is known. */
@@ -299,20 +284,18 @@ static void udp_send(int fd, const struct sockaddr_storage *peer, socklen_t peer
 		log_rl(LOG_DEBUG, "udp sendmsg: %s", strerror(errno));
 }
 
-static size_t udp_limit(const struct creq *q)
+static size_t udp_limit(bool edns, uint16_t udp_size)
 {
-	if (!q->edns)
+	if (!edns || udp_size < 512)
 		return 512;
-	if (q->udp_size < 512)
-		return 512;
-	return q->udp_size > EDNS_MAX_UDP ? EDNS_MAX_UDP : q->udp_size;
+	return udp_size > EDNS_MAX_UDP ? EDNS_MAX_UDP : udp_size;
 }
 
 static void tcp_send(struct tcp_conn *c, const uint8_t *buf, size_t len);
 static void tcp_close(struct tcp_conn *c);
 static void tcp_update_events(struct tcp_conn *c);
 
-static void creq_done(void *ctx, const struct dns_msg *resp)
+static void creq_done(void *ctx, const uint8_t *msg, size_t mlen)
 {
 	struct creq *q = ctx;
 	int len;
@@ -320,11 +303,13 @@ static void creq_done(void *ctx, const struct dns_msg *resp)
 	q->rr = NULL;
 	if (q->conn) {
 		q->conn->inflight--;
-		len = build_reply(q, resp, out_buf, sizeof(out_buf));
+		len = render(msg, mlen, 0, q->id, q->rdcd, &q->qname, q->edns,
+		             out_buf, sizeof(out_buf));
 		if (len > 0)
 			tcp_send(q->conn, out_buf, len);
 	} else {
-		len = build_reply(q, resp, out_buf, udp_limit(q));
+		len = render(msg, mlen, 0, q->id, q->rdcd, &q->qname, q->edns,
+		             out_buf, udp_limit(q->edns, q->udp_size));
 		if (len > 0)
 			udp_send(q->udp_fd, &q->peer, q->peerlen, &q->local, q->have_local,
 			         q->ifindex, out_buf, len);
@@ -355,11 +340,13 @@ static void creq_free(struct creq *q)
 
 /*
  * Validate and dispatch one query. Returns length of an immediate reply
- * written to `reply` (0 if dispatched or dropped).
+ * written to `reply` (0 if dispatched or dropped). reply_cap is the TCP
+ * limit; UDP replies are limited per query.
  */
 static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 			struct list_head *reqs, uint8_t *reply, size_t reply_cap)
 {
+	struct cache_hit hit;
 	struct dns_msg m;
 	struct creq *q;
 	struct client_cnt *cc;
@@ -393,6 +380,19 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 		goto out;
 	}
 
+	/*
+	 * A cache hit is answered right here: it holds nothing while pending,
+	 * so the pending limits (which bound requests in flight) do not apply.
+	 * An entry that cannot be rendered (never expected) is resolved anew.
+	 */
+	if (!resolve_lookup(tmpl->o, &m, &hit)) {
+		ret = render(hit.msg, hit.len, hit.age, m.id, m.flags & (DNS_F_RD | DNS_F_CD),
+		             &m.qname, m.edns.present, reply,
+		             tmpl->conn ? reply_cap : udp_limit(m.edns.present, m.edns.udp_size));
+		if (ret > 0)
+			goto out;
+	}
+
 	cc = client_acquire(&tmpl->peer);
 	if (!cc) {
 		stats.refused_limit++;
@@ -416,8 +416,6 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 	q->id = m.id;
 	q->rdcd = m.flags & (DNS_F_RD | DNS_F_CD);
 	q->qname = m.qname;
-	q->qtype = m.qtype;
-	q->qclass = m.qclass;
 	q->edns = m.edns.present;
 	q->udp_size = m.edns.udp_size;
 	list_add_tail(&q->list, reqs);
@@ -487,7 +485,7 @@ static void udp_read_cb(struct uloop_fd *ufd, unsigned events)
 				tmpl.have_local = true;
 			}
 		}
-		rlen = handle_query(udp_buf, n, &tmpl, &udp_reqs, out_buf, 512);
+		rlen = handle_query(udp_buf, n, &tmpl, &udp_reqs, out_buf, sizeof(out_buf));
 		if (rlen > 0)
 			udp_send(ufd->fd, &tmpl.peer, tmpl.peerlen, &tmpl.local, tmpl.have_local,
 			         tmpl.ifindex, out_buf, rlen);
@@ -596,7 +594,10 @@ static bool tcp_read(struct tcp_conn *c)
 	for (;;) {
 		ssize_t n;
 
-		if (c->inflight >= TCP_MAX_INFLIGHT || c->outq_bytes >= TCP_MAX_OUTQ)
+		/* replies may be sent from here (errors, cache hits): stop once
+		 * the output backs up or failed (read_closed) */
+		if (c->read_closed || c->inflight >= TCP_MAX_INFLIGHT ||
+		    c->outq_bytes >= TCP_MAX_OUTQ)
 			return true;
 		if (c->hdr_got < 2) {
 			n = recv(c->ufd.fd, c->hdr + c->hdr_got, 2 - c->hdr_got, MSG_DONTWAIT);

@@ -45,7 +45,6 @@ struct resolve_req {
 
 	struct dns_name qname;
 	uint16_t qtype, qclass, rd;
-	uint64_t khash;			/* cache key hash, by try_cache() */
 
 	/* walk state */
 	struct dns_name name;
@@ -72,6 +71,7 @@ struct resolve_req {
 	uint16_t nbinds, binds_cap, wait_i;
 	struct dns_msg out;
 	uint32_t lifetime;
+	bool cache_it;			/* insert the answer when delivering it */
 };
 
 enum { SCAN_ALIAS, SCAN_DONE, SCAN_QUERY };
@@ -339,9 +339,37 @@ static void req_free(struct resolve_req *r)
 	free(r);
 }
 
+static void out_init(struct resolve_req *r, int rcode);
+
+/*
+ * The answer leaves as bytes, built once: the cache stores them and the
+ * server renders every reply from them, fresh or cached. The buffer is
+ * consumed by the callback before anything else can build.
+ */
+static uint8_t wire[DNS_MAX_MSG];
+
 static void deliver_now(struct resolve_req *r)
 {
-	r->cb(r->ctx, &r->out);
+	struct omni *o = r->o;
+	int len;
+
+	r->out.id = 0;
+	memset(&r->out.edns, 0, sizeof(r->out.edns));
+	len = dns_build(&r->out, wire, sizeof(wire));
+	if (len < 0) {
+		/* not for messages assembled here (valid names, bounded rdata) */
+		stats.servfail++;
+		r->cache_it = false;
+		out_init(r, DNS_R_SERVFAIL);
+		len = dns_build(&r->out, wire, sizeof(wire));
+	}
+	/* not when the config changed under the walk (its deps are stale) */
+	if (r->cache_it && o->cfg->gen == r->gen0)
+		cache_insert(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype,
+		             r->qclass, cache_hash(r->qname.data, r->qname.len, r->qtype, r->qclass),
+		             wire, (size_t)len, r->lifetime, r->deps, r->dsz, r->ndeps,
+		             r->binds, r->nbinds);
+	r->cb(r->ctx, wire, (size_t)len);
 	req_free(r);
 }
 
@@ -381,17 +409,12 @@ static void servfail(struct resolve_req *r)
 	finish_rcode(r, DNS_R_SERVFAIL);
 }
 
-/* Cache the final answer (when the config did not change) and reply. */
+/* Reply with the final answer, cached (when the config did not change). */
 static void finish_cached(struct resolve_req *r)
 {
-	struct omni *o = r->o;
-
 	if (r->nbinds)
 		stats.fakeip_answers++;
-	if (o->cache && r->lifetime && o->cfg->gen == r->gen0 && !r->deps_full)
-		cache_insert(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype,
-		             r->qclass, r->khash, &r->out, r->lifetime, r->deps, r->dsz,
-		             r->ndeps, r->binds, r->nbinds);
+	r->cache_it = r->o->cache && r->lifetime && !r->deps_full;
 	deliver(r);
 }
 
@@ -514,17 +537,26 @@ static int ptr_addr(const struct dns_name *n, uint8_t *addr)
 	return 0;
 }
 
+/* A PTR query for a fake-pool address: its family (addr filled), else 0. */
+static int ptr_fake(const struct fakeip_db *fdb, const struct dns_name *qname,
+                    uint16_t qtype, uint8_t *addr)
+{
+	int fam;
+
+	if (qtype != DNS_T_PTR || !fdb)
+		return 0;
+	fam = ptr_addr(qname, addr);
+	return fam && fakeip_in_pool(fdb, fam, addr) ? fam : 0;
+}
+
 static bool try_ptr(struct resolve_req *r)
 {
 	struct fakeip_db *fdb = r->o->fdb;
 	struct binding *b;
 	uint8_t addr[16];
-	int fam;
+	int fam = ptr_fake(fdb, &r->qname, r->qtype, addr);
 
-	if (r->qtype != DNS_T_PTR || !fdb)
-		return false;
-	fam = ptr_addr(&r->qname, addr);
-	if (!fam || !fakeip_in_pool(fdb, fam, addr))
+	if (!fam)
 		return false;
 	b = fakeip_lookup(fdb, fam, addr);
 	if (b) {
@@ -1162,25 +1194,21 @@ static void walk(struct resolve_req *r, bool scanning)
 
 /* ---- entry points ---- */
 
-static bool try_cache(struct resolve_req *r)
+int resolve_lookup(struct omni *o, const struct dns_msg *query, struct cache_hit *hit)
 {
-	struct omni *o = r->o;
-	int rcode;
+	uint8_t addr[16];
 
-	/* without a cache here, finish_cached() has none either: it never changes */
-	if (!o->cache)
-		return false;
-	r->khash = cache_hash(r->qname.data, r->qname.len, r->qtype, r->qclass);
-	if (cache_lookup(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype, r->qclass,
-	                 r->khash, &r->out))
-		return false;
+	/* the precedence resolve_start() applies: ANY and fake PTR come first */
+	if (!o->cache || !query->has_q || query->qtype == DNS_T_ANY ||
+	    ptr_fake(o->fdb, &query->qname, query->qtype, addr))
+		return -ENOENT;
+	if (cache_lookup(o->cache, o->cfg, query->qname.data, query->qname.len, query->qtype,
+	                 query->qclass, cache_hash(query->qname.data, query->qname.len,
+	                                           query->qtype, query->qclass), hit))
+		return -ENOENT;
+	stats.requests++;
 	stats.cache_hits++;
-	rcode = r->out.flags & DNS_F_RCODE;
-	r->out.flags = DNS_F_QR | DNS_F_RA | r->rd;
-	dns_msg_set_rcode(&r->out, rcode);
-	dns_msg_set_question(&r->out, r->qname.data, r->qname.len, r->qtype, r->qclass);
-	deliver(r);
-	return true;
+	return 0;
 }
 
 struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
@@ -1213,7 +1241,7 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 
 	if (r->qtype == DNS_T_ANY)
 		finish_rcode(r, DNS_R_NOTIMP);
-	else if (!try_ptr(r) && !try_cache(r))
+	else if (!try_ptr(r))
 		walk(r, false);
 	r->starting = false;
 	return r;

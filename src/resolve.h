@@ -8,16 +8,19 @@
  * Policy-aware resolution of one client question.
  *
  * Input: a validated query (opcode QUERY, exactly one question, class IN;
- * the server handles everything else). Output: a response dns_msg whose
- * flags carry QR|RA (+RD copied, AA clear), rcode, and AN/NS/AR sections.
- * The server stamps id, question (client's original bytes/case) and EDNS.
+ * the server handles everything else). Output: the response in wire format
+ * as dns_build() wrote it: id 0, flags QR|RA (+RD copied, AA clear), rcode,
+ * the query's question, AN/NS/AR sections, no OPT. The server renders the
+ * client's reply from it with dns_reply_render() (id, RD/CD, question case,
+ * EDNS, size limit), the same way it renders cache hits.
  *
- * Special cases handled here:
+ * Special cases, in this order:
  *   qtype ANY             -> NOTIMP
  *   PTR for a fake pool address (in-addr.arpa / ip6.arpa under the pool)
  *                         -> answered from the binding DB, NXDOMAIN if none;
  *                            never sent upstream
- *   cache hit             -> answered from cache
+ *   cache hit             -> resolve_lookup(), synchronously, before any
+ *                            request is started
  *
  * The walk (see plan): state {name, upstream, latch, prefix RRs, deps}.
  *   step limit RESOLVE_MAX_STEPS (exceeded -> SERVFAIL), loop detection.
@@ -45,11 +48,23 @@
 struct omni;
 struct resolve_req;
 
-/* resp is valid only during the callback; never NULL. */
-typedef void (*resolve_cb)(void *ctx, const struct dns_msg *resp);
+struct cache_hit;
 
-/* query: parsed client query (its id/edns are ignored). Callback is never
- * invoked synchronously. */
+/* msg (see above) is valid only during the callback; never NULL. */
+typedef void (*resolve_cb)(void *ctx, const uint8_t *msg, size_t len);
+
+/*
+ * Answer from the cache, synchronously: 0 with *hit filled (the stored
+ * response and its age, valid until the next cache call), or -ENOENT when
+ * the query must go through resolve_start(): a miss, an entry that failed
+ * revalidation, or a query that ANY/fake-PTR handling answers instead.
+ * Counts as a request when it hits.
+ */
+int resolve_lookup(struct omni *o, const struct dns_msg *query, struct cache_hit *hit);
+
+/* query: parsed client query (its id/edns are ignored); the cache is not
+ * consulted (resolve_lookup() was). Callback is never invoked
+ * synchronously. */
 struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
                                   resolve_cb cb, void *ctx);
 /* No callback after cancel. */
