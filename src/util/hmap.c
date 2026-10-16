@@ -6,29 +6,41 @@
 
 #define HMAP_TOMB ((void *)(uintptr_t)1)
 #define HMAP_MIN_CAP 16
+#define HMAP_SLOT_BYTES (sizeof(void *) + sizeof(uint32_t))
+
+/* 12 B/slot on LP64, 8 B on ILP32 (was 16 B on both with a u64 hash). */
+_Static_assert(HMAP_SLOT_BYTES == 12 || HMAP_SLOT_BYTES == 8,
+               "hmap slot = 32-bit hash + value pointer");
+/* the hash array sits right after the val array in the same allocation */
+_Static_assert(_Alignof(uint32_t) <= _Alignof(void *), "hash array alignment");
 
 static int hmap_rehash(struct hmap *m, uint32_t cap)
 {
-	struct hmap_slot *old = m->slots, *slots;
+	void **oldval = m->val, **val;
+	uint32_t *oldhash = m->hash, *hash;
 	uint32_t oldcap = m->mask ? m->mask + 1 : 0, i;
 
-	slots = calloc(cap, sizeof(*slots));
-	if (!slots)
+	/* calloc checks cap * HMAP_SLOT_BYTES for overflow (matters on ILP32) */
+	val = calloc(cap, HMAP_SLOT_BYTES);
+	if (!val)
 		return -ENOMEM;
-	m->slots = slots;
+	hash = (uint32_t *)(val + cap);
+	m->val = val;
+	m->hash = hash;
 	m->mask = cap - 1;
 	m->used = m->len;
 	for (i = 0; i < oldcap; i++) {
-		void *v = old[i].val;
+		void *v = oldval[i];
 		uint32_t j;
 
 		if (!v || v == HMAP_TOMB)
 			continue;
-		for (j = old[i].hash & m->mask; slots[j].val; j = (j + 1) & m->mask)
+		for (j = oldhash[i] & m->mask; val[j]; j = (j + 1) & m->mask)
 			;
-		slots[j] = old[i];
+		val[j] = v;
+		hash[j] = oldhash[i];
 	}
-	free(old);
+	free(oldval);
 	return 0;
 }
 
@@ -52,30 +64,36 @@ int hmap_reserve(struct hmap *m, uint32_t n)
 
 void hmap_free(struct hmap *m)
 {
-	free(m->slots);
-	m->slots = NULL;
+	free(m->val);
+	m->val = NULL;
+	m->hash = NULL;
 	m->mask = m->len = m->used = 0;
+}
+
+size_t hmap_footprint(const struct hmap *m)
+{
+	return m->mask ? ((size_t)m->mask + 1) * HMAP_SLOT_BYTES : 0;
 }
 
 void *hmap_get(const struct hmap *m, uint64_t hash, const void *key,
                hmap_eq_fn eq, void *ctx)
 {
-	uint32_t i;
+	uint32_t h = (uint32_t)hash, i;
 
 	if (!m->mask)
 		return NULL;
-	for (i = hash & m->mask; m->slots[i].val; i = (i + 1) & m->mask) {
-		struct hmap_slot *s = &m->slots[i];
+	for (i = h & m->mask; m->val[i]; i = (i + 1) & m->mask) {
+		void *v = m->val[i];
 
-		if (s->val != HMAP_TOMB && s->hash == hash && eq(s->val, key, ctx))
-			return s->val;
+		if (v != HMAP_TOMB && m->hash[i] == h && eq(v, key, ctx))
+			return v;
 	}
 	return NULL;
 }
 
 int hmap_put(struct hmap *m, uint64_t hash, void *val)
 {
-	uint32_t i;
+	uint32_t h = (uint32_t)hash, i;
 
 	if (!m->mask || (uint64_t)(m->used + 1) * 4 > (uint64_t)(m->mask + 1) * 3) {
 		/* grow only if live entries need it; otherwise just purge tombstones */
@@ -86,13 +104,13 @@ int hmap_put(struct hmap *m, uint64_t hash, void *val)
 		if (hmap_rehash(m, cap))
 			return -ENOMEM;
 	}
-	for (i = hash & m->mask; m->slots[i].val && m->slots[i].val != HMAP_TOMB;
+	for (i = h & m->mask; m->val[i] && m->val[i] != HMAP_TOMB;
 	     i = (i + 1) & m->mask)
 		;
-	if (!m->slots[i].val)
+	if (!m->val[i])
 		m->used++;
-	m->slots[i].hash = hash;
-	m->slots[i].val = val;
+	m->hash[i] = h;
+	m->val[i] = val;
 	m->len++;
 	return 0;
 }
@@ -100,11 +118,11 @@ int hmap_put(struct hmap *m, uint64_t hash, void *val)
 static void hmap_del_slot(struct hmap *m, uint32_t i)
 {
 	/* if the next slot is empty, this can become empty too (shortens chains) */
-	if (!m->slots[(i + 1) & m->mask].val) {
-		m->slots[i].val = NULL;
+	if (!m->val[(i + 1) & m->mask]) {
+		m->val[i] = NULL;
 		m->used--;
 	} else {
-		m->slots[i].val = HMAP_TOMB;
+		m->val[i] = HMAP_TOMB;
 	}
 	m->len--;
 }
@@ -112,16 +130,14 @@ static void hmap_del_slot(struct hmap *m, uint32_t i)
 void *hmap_del(struct hmap *m, uint64_t hash, const void *key,
                hmap_eq_fn eq, void *ctx)
 {
-	uint32_t i;
+	uint32_t h = (uint32_t)hash, i;
 
 	if (!m->mask)
 		return NULL;
-	for (i = hash & m->mask; m->slots[i].val; i = (i + 1) & m->mask) {
-		struct hmap_slot *s = &m->slots[i];
+	for (i = h & m->mask; m->val[i]; i = (i + 1) & m->mask) {
+		void *v = m->val[i];
 
-		if (s->val != HMAP_TOMB && s->hash == hash && eq(s->val, key, ctx)) {
-			void *v = s->val;
-
+		if (v != HMAP_TOMB && m->hash[i] == h && eq(v, key, ctx)) {
 			hmap_del_slot(m, i);
 			return v;
 		}
@@ -135,8 +151,8 @@ bool hmap_del_ptr(struct hmap *m, uint64_t hash, const void *val)
 
 	if (!m->mask)
 		return false;
-	for (i = hash & m->mask; m->slots[i].val; i = (i + 1) & m->mask) {
-		if (m->slots[i].val == val) {
+	for (i = (uint32_t)hash & m->mask; m->val[i]; i = (i + 1) & m->mask) {
+		if (m->val[i] == val) {
 			hmap_del_slot(m, i);
 			return true;
 		}
@@ -149,7 +165,7 @@ void *hmap_next(const struct hmap *m, uint32_t *it)
 	if (!m->mask)
 		return NULL;
 	while (*it <= m->mask) {
-		void *v = m->slots[(*it)++].val;
+		void *v = m->val[(*it)++];
 
 		if (v && v != HMAP_TOMB)
 			return v;

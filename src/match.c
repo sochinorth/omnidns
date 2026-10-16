@@ -155,9 +155,7 @@ uint16_t match_lookup_wire(const struct match_index *idx, const uint8_t *wire, u
 
 size_t match_footprint(const struct match_index *idx)
 {
-	size_t slots = idx->map.mask ? (size_t)idx->map.mask + 1 : 0;
-
-	return sizeof(*idx) + idx->arena.total + slots * sizeof(struct hmap_slot);
+	return sizeof(*idx) + idx->arena.total + hmap_footprint(&idx->map);
 }
 
 uint32_t match_nodes(const struct match_index *idx)

@@ -22,7 +22,4 @@ static inline uint64_t omni_hash(const void *data, size_t len)
 	return siphash24(omni_hash_key, data, len);
 }
 
-/* Case-insensitive (ASCII) variant: hashes tolower() of every byte. */
-uint64_t omni_hash_ci(const void *data, size_t len);
-
 #endif

@@ -21,11 +21,6 @@ static inline uint64_t load64le(const uint8_t *p)
 	       (uint64_t)p[6] << 48 | (uint64_t)p[7] << 56;
 }
 
-static inline uint8_t lower(uint8_t c)
-{
-	return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c;
-}
-
 struct sip {
 	uint64_t v0, v1, v2, v3;
 };
@@ -65,38 +60,19 @@ static uint64_t sip_final(struct sip *s, uint64_t b)
 	return v0 ^ v1 ^ v2 ^ v3;
 }
 
-static uint64_t siphash_impl(const uint8_t key[16], const uint8_t *in, size_t len, int fold)
+uint64_t siphash24(const uint8_t key[16], const void *data, size_t len)
 {
+	const uint8_t *in = data;
 	struct sip s;
-	uint8_t tmp[8];
 	size_t i, j, full = len & ~(size_t)7;
 	uint64_t b = (uint64_t)len << 56;
 
 	sip_init(&s, key);
-	for (i = 0; i < full; i += 8) {
-		if (fold) {
-			for (j = 0; j < 8; j++)
-				tmp[j] = lower(in[i + j]);
-			sip_block(&s, load64le(tmp));
-		} else {
-			sip_block(&s, load64le(in + i));
-		}
-	}
-	for (j = 0; i + j < len; j++) {
-		uint8_t c = in[i + j];
-		b |= (uint64_t)(fold ? lower(c) : c) << (8 * j);
-	}
+	for (i = 0; i < full; i += 8)
+		sip_block(&s, load64le(in + i));
+	for (j = 0; i + j < len; j++)
+		b |= (uint64_t)in[i + j] << (8 * j);
 	return sip_final(&s, b);
-}
-
-uint64_t siphash24(const uint8_t key[16], const void *data, size_t len)
-{
-	return siphash_impl(key, data, len, 0);
-}
-
-uint64_t omni_hash_ci(const void *data, size_t len)
-{
-	return siphash_impl(omni_hash_key, data, len, 1);
 }
 
 void hash_init(void)

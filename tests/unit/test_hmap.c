@@ -59,26 +59,6 @@ TEST(siphash_vector)
 	CHECK(siphash24(key, msg, 63) == 0x958a324ceb064572ULL);
 }
 
-TEST(hash_ci)
-{
-	const char *a = "WwW.ExAmPlE.CoM.with-a-long-tail", *b = "www.example.com.WITH-A-LONG-TAIL";
-	uint8_t key[16] = { 1, 2, 3 };
-	size_t n = strlen(a), i;
-
-	hash_init_fixed(key);
-	for (i = 0; i <= n; i++)
-		CHECK(omni_hash_ci(a, i) == omni_hash_ci(b, i));
-	/* the ci hash equals the plain hash of the lowercased input */
-	CHECK(omni_hash_ci("example", 7) == omni_hash("example", 7));
-	CHECK(omni_hash_ci("EXAMPLE", 7) == omni_hash("example", 7));
-	CHECK(omni_hash_ci("example", 7) != omni_hash_ci("exampld", 7));
-	/* non-ASCII bytes are not folded */
-	CHECK(omni_hash_ci("\xc4", 1) != omni_hash_ci("\xe4", 1));
-	/* only letters fold: '@' (0x40) and '`' (0x60) stay distinct */
-	CHECK(omni_hash_ci("@", 1) != omni_hash_ci("`", 1));
-	CHECK(omni_hash_ci("[", 1) != omni_hash_ci("{", 1));
-}
-
 TEST(hmap_basic)
 {
 	struct hmap m = HMAP_INIT;
@@ -108,7 +88,8 @@ TEST(hmap_basic)
 	CHECK(!hmap_del_ptr(&m, key_hash(1), &it[1]));
 	CHECK_EQ(hmap_len(&m), 0);
 	hmap_free(&m);
-	CHECK(m.slots == NULL);
+	CHECK(m.val == NULL && m.hash == NULL);
+	CHECK_EQ(hmap_footprint(&m), 0);
 	CHECK(get(&m, 1, 1) == NULL);
 	/* reusable after free */
 	CHECK(hmap_put(&m, 5, &it[5]) == 0);
@@ -176,7 +157,7 @@ TEST(hmap_reserve)
 {
 	struct hmap m = HMAP_INIT;
 	struct item *it = calloc(10000, sizeof(*it));
-	struct hmap_slot *slots;
+	void **slots;
 	uint32_t i, cap;
 
 	REQUIRE(it);
@@ -184,17 +165,18 @@ TEST(hmap_reserve)
 	cap = m.mask + 1;
 	CHECK((cap & (cap - 1)) == 0);
 	CHECK((uint64_t)cap * 3 > 10000ull * 4);
-	slots = m.slots;
+	slots = m.val;
+	CHECK_EQ(hmap_footprint(&m), (size_t)cap * (sizeof(void *) + sizeof(uint32_t)));
 	for (i = 0; i < 10000; i++) {
 		it[i].key = i;
 		REQUIRE(hmap_put(&m, key_hash(i), &it[i]) == 0);
 	}
 	/* no rehash happened */
-	CHECK(m.slots == slots);
+	CHECK(m.val == slots);
 	CHECK_EQ(m.mask + 1, cap);
 	/* smaller reserve is a no-op */
 	CHECK(hmap_reserve(&m, 10) == 0);
-	CHECK(m.slots == slots);
+	CHECK(m.val == slots);
 	/* growing reserve keeps contents */
 	REQUIRE(hmap_reserve(&m, 100000) == 0);
 	CHECK(m.mask + 1 > cap);
@@ -327,6 +309,100 @@ TEST(hmap_random_model)
 	free(in);
 }
 
+/*
+ * Hashes equal in the low 32 bits but distinct above: they collide in the
+ * table (only 32 bits are stored) and eq alone must tell them apart.
+ */
+TEST(hmap_upper_bits)
+{
+	enum { N = 2000 };
+	struct hmap m = HMAP_INIT;
+	struct item *it = calloc(N, sizeof(*it)), *v;
+	uint32_t i, iter, n = 0;
+
+	REQUIRE(it);
+	for (i = 0; i < N; i++) {
+		it[i].key = i;
+		REQUIRE(hmap_put(&m, (uint64_t)(i + 1) << 32 | 0x5a5a5a5a, &it[i]) == 0);
+	}
+	CHECK_EQ(hmap_len(&m), N);
+	for (i = 0; i < N; i++)
+		CHECK(get(&m, (uint64_t)(i + 1) << 32 | 0x5a5a5a5a, i) == &it[i]);
+	/* absent key with the same low bits */
+	CHECK(get(&m, (uint64_t)(N + 1) << 32 | 0x5a5a5a5a, N) == NULL);
+	/* different low bits never match, even for a present key */
+	CHECK(get(&m, 1ULL << 32 | 0x5a5a5a5b, 0) == NULL);
+	for (i = 0; i < N; i += 2)
+		CHECK(del(&m, (uint64_t)(i + 1) << 32 | 0x5a5a5a5a, i) == &it[i]);
+	for (i = 0; i < N; i++)
+		CHECK(get(&m, (uint64_t)(i + 1) << 32 | 0x5a5a5a5a, i) ==
+		      (i & 1 ? &it[i] : NULL));
+	for (iter = 0; (v = hmap_next(&m, &iter)); n++)
+		CHECK(v->key & 1);
+	CHECK_EQ(n, N / 2);
+	for (i = 1; i < N; i += 2)
+		CHECK(hmap_del_ptr(&m, (uint64_t)(i + 1) << 32 | 0x5a5a5a5a, &it[i]));
+	CHECK_EQ(hmap_len(&m), 0);
+	hmap_free(&m);
+	free(it);
+}
+
+/* Growth well past 2^16 live entries with tombstone churn, checked against a model. */
+TEST(hmap_growth_churn)
+{
+	enum { N = 150000 };
+	struct hmap m = HMAP_INIT;
+	struct item *it = calloc(N, sizeof(*it)), *v;
+	bool *in = calloc(N, sizeof(*in));
+	uint32_t i, iter, n, len = 0, round;
+
+	REQUIRE(it && in);
+	for (i = 0; i < N; i++) {
+		it[i].key = i;
+		REQUIRE(hmap_put(&m, key_hash(i), &it[i]) == 0);
+		in[i] = true;
+	}
+	len = N;
+	CHECK(m.mask + 1 > 1u << 17);
+	for (round = 0; round < 3; round++) {
+		/* delete a pseudo-random half, then reinsert some of them */
+		for (i = 0; i < N; i++) {
+			if (!in[i] || rng() & 1)
+				continue;
+			CHECK(del(&m, key_hash(i), i) == &it[i]);
+			in[i] = false;
+			len--;
+		}
+		CHECK_EQ(hmap_len(&m), len);
+		for (i = 0; i < N; i++) {
+			if (in[i] || rng() % 3 == 0)
+				continue;
+			REQUIRE(hmap_put(&m, key_hash(i), &it[i]) == 0);
+			in[i] = true;
+			len++;
+		}
+		CHECK_EQ(hmap_len(&m), len);
+		CHECK(m.used * 4 <= (m.mask + 1) * 3);
+		for (i = 0; i < N; i++)
+			CHECK(get(&m, key_hash(i), i) == (in[i] ? &it[i] : NULL));
+		for (i = 0; i < N; i++)
+			it[i].seen = 0;
+		n = 0;
+		for (iter = 0; (v = hmap_next(&m, &iter)); n++) {
+			CHECK(in[v->key]);
+			v->seen++;
+		}
+		CHECK_EQ(n, len);
+		for (i = 0; i < N; i++)
+			CHECK_EQ(it[i].seen, in[i]);
+		if (test_cur_failed)
+			break;
+	}
+	hmap_free(&m);
+	free(it);
+	free(in);
+}
+
 TEST(arena_align)
 {
 	static const size_t aligns[] = { 1, 2, 4, 8, 16, 32, 64, 128, 4096 };
@@ -416,7 +492,6 @@ int main(void)
 
 	hash_init_fixed(key);
 	RUN(siphash_vector);
-	RUN(hash_ci);
 	RUN(hmap_basic);
 	RUN(hmap_collisions);
 	RUN(hmap_wrap);
@@ -424,6 +499,8 @@ int main(void)
 	RUN(hmap_iter_delete);
 	RUN(hmap_tombstone_churn);
 	RUN(hmap_random_model);
+	RUN(hmap_upper_bits);
+	RUN(hmap_growth_churn);
 	RUN(arena_align);
 	RUN(arena_large);
 	RUN(arena_dup);
