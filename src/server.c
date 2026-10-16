@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -40,12 +41,16 @@ struct listener {
 	bool closed;
 };
 
-/* per client IP pending-query accounting */
+/* per client IP pending-query accounting; the key is family + ip */
 struct client_cnt {
 	uint8_t family;
 	uint8_t ip[16];
+	uint32_t hash;			/* of the key, as kept by hmap (low 32 bits) */
 	uint32_t n;
 };
+
+#define CLIENT_KEY_LEN		(1 + 16)
+_Static_assert(offsetof(struct client_cnt, ip) == 1, "client key must be contiguous");
 
 struct outbuf {
 	struct list_head list;
@@ -144,13 +149,14 @@ static struct client_cnt *client_acquire(const struct sockaddr_storage *peer)
 	if (stats.pending >= cfg->max_pending)
 		return NULL;
 	sa_ip(peer, &key.family, key.ip);
-	h = omni_hash(&key.family, 1) ^ omni_hash(key.ip, 16);
+	h = omni_hash(&key.family, CLIENT_KEY_LEN);
 	c = hmap_get(&clients, h, &key, client_eq, NULL);
 	if (!c) {
 		c = calloc(1, sizeof(*c));
 		if (!c)
 			return NULL;
 		*c = key;
+		c->hash = (uint32_t)h;
 		c->n = 0;
 		if (hmap_put(&clients, h, c)) {
 			free(c);
@@ -169,7 +175,7 @@ static void client_release(struct client_cnt *c)
 	stats.pending--;
 	if (--c->n)
 		return;
-	hmap_del_ptr(&clients, omni_hash(&c->family, 1) ^ omni_hash(c->ip, 16), c);
+	hmap_del_ptr(&clients, c->hash, c);	/* hmap only uses the low 32 bits */
 	free(c);
 }
 
