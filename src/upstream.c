@@ -350,6 +350,12 @@ static void udp_cb(struct exchange *ex)
 	}
 }
 
+/*
+ * A fresh socket (kernel-random source port) per attempt, on purpose. It is
+ * created non-blocking, so it is registered with ULOOP_BLOCKING: in libubox
+ * that flag only means "do not touch O_NONBLOCK", which saves the
+ * fcntl(F_GETFL) + fcntl(F_SETFL) pair uloop_fd_add() would otherwise do.
+ */
 static int sock_open(struct exchange *ex, int type)
 {
 	const struct upstream_server *s = &ex->set->srv[ex->srv];
@@ -388,7 +394,7 @@ static int udp_start(struct exchange *ex)
 	if (send(ex->ufd.fd, ex->qbuf + EX_MSG_OFF, ex->qlen, 0) != ex->qlen)
 		return errno ? -errno : -EIO;
 	U.st.udp_sent++;
-	return uloop_fd_add(&ex->ufd, ULOOP_READ | ULOOP_ERROR_CB) ? -EIO : 0;
+	return uloop_fd_add(&ex->ufd, ULOOP_READ | ULOOP_ERROR_CB | ULOOP_BLOCKING) ? -EIO : 0;
 }
 
 /* ---- TCP ---- */
@@ -420,7 +426,8 @@ static void tcp_write(struct exchange *ex)
 	if (!ex->tsent)
 		U.st.tcp_sent++;
 	ex->tsent += n;
-	if (ex->tsent == total && uloop_fd_add(&ex->ufd, ULOOP_READ | ULOOP_ERROR_CB))
+	if (ex->tsent == total &&
+	    uloop_fd_add(&ex->ufd, ULOOP_READ | ULOOP_ERROR_CB | ULOOP_BLOCKING))
 		tcp_fail(ex, -EIO);
 }
 
@@ -477,7 +484,7 @@ static void ex_start_tcp(struct exchange *ex)
 	ex->tcp = true;
 	new_id(ex);
 	err = sock_open(ex, SOCK_STREAM);
-	if (!err && uloop_fd_add(&ex->ufd, ULOOP_WRITE | ULOOP_ERROR_CB))
+	if (!err && uloop_fd_add(&ex->ufd, ULOOP_WRITE | ULOOP_ERROR_CB | ULOOP_BLOCKING))
 		err = -EIO;
 	if (err)
 		ex_next(ex, err);

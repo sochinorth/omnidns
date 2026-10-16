@@ -519,7 +519,7 @@ static void tcp_update_events(struct tcp_conn *c)
 	if (!list_empty(&c->outq))
 		ev |= ULOOP_WRITE;
 	if (ev)
-		uloop_fd_add(&c->ufd, ev);
+		uloop_fd_add(&c->ufd, ev | ULOOP_BLOCKING);
 	else
 		uloop_fd_delete(&c->ufd);
 }
@@ -699,12 +699,18 @@ static void tcp_accept_cb(struct uloop_fd *ufd, unsigned events)
 		INIT_LIST_HEAD(&c->reqs);
 		INIT_LIST_HEAD(&c->outq);
 		list_add(&c->list, &conns);
-		uloop_fd_add(&c->ufd, ULOOP_READ);
+		uloop_fd_add(&c->ufd, ULOOP_READ | ULOOP_BLOCKING);
 		uloop_timeout_set(&c->idle, TCP_IDLE_MS);
 	}
 }
 
 /* ---- listeners ---- */
+
+/*
+ * All sockets here are created non-blocking (SOCK_NONBLOCK, accept4 flags)
+ * and registered with ULOOP_BLOCKING, which in libubox only means "leave
+ * O_NONBLOCK alone": it skips a redundant fcntl(F_GETFL) + fcntl(F_SETFL).
+ */
 
 static int open_listener(const struct sockaddr_storage *addr, uint16_t port, int proto)
 {
@@ -806,7 +812,7 @@ static void activate(struct list_head *head)
 	struct listener *l;
 
 	list_for_each_entry(l, head, list)
-		uloop_fd_add(&l->ufd, ULOOP_READ);
+		uloop_fd_add(&l->ufd, ULOOP_READ | ULOOP_BLOCKING);
 }
 
 int server_start(struct omni *o)
