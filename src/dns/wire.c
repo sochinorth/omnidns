@@ -832,21 +832,33 @@ static void put_opt(struct bctx *b, const struct dns_edns *e)
 	b->len += DNS_OPT_LEN;
 }
 
+/*
+ * One build context for the whole process (~6.7 KB: too big for the stack of
+ * small targets, wasteful to malloc per message). This is safe because the
+ * daemon is single-threaded and dns_build() is not re-entrant by construction:
+ * nothing below it calls back into other code (no callbacks, no uloop, no
+ * signal handler builds messages), so a second dns_build() cannot start while
+ * one is running.
+ *
+ * Per-call reset: only the scalars and head[] (512 bytes) need it. ent[] is
+ * read only through head[]/next chains of indices < nent, so whatever a
+ * previous (possibly failed) build left in it is unreachable once head[] is
+ * cleared and nent is 0.
+ */
+static struct bctx build_ctx;
+
 int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
 {
-	struct bctx *b;
+	struct bctx *b = &build_ctx;
 	uint16_t cnt[3] = { 0 }, flags = m->flags;
 	size_t qend, optlen = m->edns.present ? DNS_OPT_LEN : 0;
-	int nent, r = 0;
+	int nent, r;
 	uint16_t i;
 
 	if (maxlen > DNS_MAX_MSG)
 		maxlen = DNS_MAX_MSG;
 	if (maxlen < DNS_HDR_LEN + optlen)
 		return -ENOSPC;
-	b = malloc(sizeof(*b));
-	if (!b)
-		return -ENOMEM;
 	b->out = out;
 	b->cap = maxlen - optlen;
 	b->len = DNS_HDR_LEN;
@@ -859,17 +871,15 @@ int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
 		if (!r)
 			r = put_u16(b, m->qclass);
 		if (r)
-			goto out;
+			return r;
 	}
 	qend = b->len;
 	nent = b->nent;
 	for (i = 0; i < m->nrr; i++) {
 		const struct dns_rr *rr = &m->rr[i];
 
-		if (rr->section > DNS_S_AR) {
-			r = -EINVAL;
-			goto out;
-		}
+		if (rr->section > DNS_S_AR)
+			return -EINVAL;
 		r = put_rr(b, rr);
 		if (r == -ENOSPC && rr->section == DNS_S_AR) {
 			r = 0;
@@ -884,7 +894,7 @@ int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
 			break;
 		}
 		if (r)
-			goto out;
+			return r;
 		cnt[rr->section]++;
 	}
 	put16(out, m->id);
@@ -895,10 +905,7 @@ int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
 	put16(out + 10, cnt[2] + (m->edns.present ? 1 : 0));
 	if (m->edns.present)
 		put_opt(b, &m->edns);
-	r = (int)b->len;
-out:
-	free(b);
-	return r;
+	return (int)b->len;
 }
 
 /* ---- accessors ---- */

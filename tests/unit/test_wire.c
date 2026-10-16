@@ -921,6 +921,79 @@ TEST(rcode_and_types)
 	dns_msg_free(&m);
 }
 
+/* dns_build() reuses one static context: stale state must never leak. */
+static void small_msg(struct dns_msg *m, uint8_t *n1)
+{
+	uint8_t a[4] = { 192, 0, 2, 1 };
+	uint8_t l1 = wn(n1, "www.example.org");
+
+	dns_msg_init(m);
+	m->id = 0x1234;
+	m->flags = DNS_F_QR | DNS_F_RD | DNS_F_RA;
+	dns_msg_set_question(m, n1, l1, DNS_T_A, DNS_C_IN);
+	dns_msg_add_rr(m, DNS_S_AN, n1, l1, DNS_T_A, DNS_C_IN, 60, a, 4);
+}
+
+TEST(build_reuse)
+{
+	static const uint8_t expect[] = {
+		0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0,
+		3, 'w', 'w', 'w', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'o', 'r', 'g', 0,
+		0, 1, 0, 1,
+		0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1,
+	};
+	struct dns_msg big, sm, bad;
+	uint8_t n1[256], nb[256], nsm[256], out[65535], first[512];
+	uint8_t lb;
+	int n, n0, i;
+
+	small_msg(&sm, nsm);
+	n0 = dns_build(&sm, first, sizeof(first));
+	REQUIRE(n0 == (int)sizeof(expect));
+	CHECK(!memcmp(first, expect, sizeof(expect)));
+
+	/* a big build fills the compression table with many suffixes ... */
+	dns_msg_init(&big);
+	lb = wn(nb, "www.example.org");
+	REQUIRE(dns_msg_set_question(&big, nb, lb, DNS_T_A, DNS_C_IN) == 0);
+	for (i = 0; i < 200; i++) {
+		char name[64];
+		uint8_t l;
+
+		snprintf(name, sizeof(name), "h%d.www.example.org", i);
+		l = wn(n1, name);
+		REQUIRE(dns_msg_add_rr(&big, DNS_S_AN, n1, l, DNS_T_CNAME, 1, 30, nb, lb) == 0);
+	}
+	n = dns_build(&big, out, sizeof(out));
+	REQUIRE(n > 0);
+	/* ... and the next, smaller build must not see any of it */
+	memset(out, 0xee, sizeof(out));
+	CHECK_EQ(dns_build(&sm, out, 512), n0);
+	CHECK(!memcmp(out, expect, sizeof(expect)));
+
+	/* failing midway: the question name is hashed into the table, then
+	 * does not fit; an RR with a bad section fails after the question */
+	CHECK_EQ(dns_build(&big, out, 12 + 4), -ENOSPC);
+	CHECK_EQ(dns_build(&sm, out, 512), n0);
+	CHECK(!memcmp(out, expect, sizeof(expect)));
+	small_msg(&bad, n1);
+	bad.rr[0].section = DNS_S_AR + 1;
+	CHECK_EQ(dns_build(&bad, out, 512), -EINVAL);
+	memset(out, 0, sizeof(out));
+	CHECK_EQ(dns_build(&sm, out, 512), n0);
+	CHECK(!memcmp(out, expect, sizeof(expect)));
+
+	/* a truncated (TC) build followed by a full one */
+	n = dns_build(&big, out, 512);
+	CHECK(n > 0 && (out[2] & 0x02));
+	CHECK_EQ(dns_build(&sm, out, 512), n0);
+	CHECK(!memcmp(out, expect, sizeof(expect)));
+
+	dns_msg_free(&bad);
+	dns_msg_free(&sm);
+	dns_msg_free(&big);
+}
+
 int main(void)
 {
 	uint8_t key[16] = { 1, 2, 3 };
@@ -945,5 +1018,6 @@ int main(void)
 	RUN(copy_footprint);
 	RUN(growth_rebase);
 	RUN(rcode_and_types);
+	RUN(build_reuse);
 	return test_summary();
 }
