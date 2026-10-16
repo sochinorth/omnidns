@@ -19,7 +19,7 @@
 #define UP_EDNS_SIZE		1232
 #define UP_MAX_EXCHANGES	1024
 #define UP_UDP_BUDGET		16	/* datagrams per wakeup */
-#define UP_QBUF			512
+#define UP_QBUF			(12 + DNS_MAX_NAME + 4 + 11)	/* hdr, question, OPT */
 
 struct exchange;
 
@@ -33,8 +33,13 @@ struct upstream_query {
 	struct uloop_timeout defer;
 };
 
-/* Header length; the (lowercased, uncompressed) question name follows it in qbuf. */
-#define EX_QNAME_OFF		12
+/*
+ * qbuf layout: the 2-byte TCP length prefix, then the query message (UDP sends
+ * from EX_MSG_OFF; TCP sends the prefix too, so no framing copy is needed).
+ * The (lowercased, uncompressed) question name follows the 12-byte header.
+ */
+#define EX_MSG_OFF		2
+#define EX_QNAME_OFF		(EX_MSG_OFF + 12)
 
 struct exchange {
 	uint32_t hash;			/* low 32 bits, as kept by hmap */
@@ -52,8 +57,8 @@ struct exchange {
 	struct uloop_fd ufd;
 	struct uloop_timeout timer;
 
-	uint8_t qbuf[UP_QBUF];
-	int qlen;
+	uint8_t qbuf[EX_MSG_OFF + UP_QBUF];
+	int qlen;			/* message length, without the prefix */
 
 	/* TCP state */
 	size_t tsent;
@@ -367,8 +372,8 @@ static int sock_open(struct exchange *ex, int type)
 static void new_id(struct exchange *ex)
 {
 	ex->id = rand_id();
-	ex->qbuf[0] = ex->id >> 8;
-	ex->qbuf[1] = ex->id;
+	ex->qbuf[EX_MSG_OFF] = ex->id >> 8;
+	ex->qbuf[EX_MSG_OFF + 1] = ex->id;
 }
 
 static int udp_start(struct exchange *ex)
@@ -380,7 +385,7 @@ static int udp_start(struct exchange *ex)
 	err = sock_open(ex, SOCK_DGRAM);
 	if (err)
 		return err;
-	if (send(ex->ufd.fd, ex->qbuf, ex->qlen, 0) != ex->qlen)
+	if (send(ex->ufd.fd, ex->qbuf + EX_MSG_OFF, ex->qlen, 0) != ex->qlen)
 		return errno ? -errno : -EIO;
 	U.st.udp_sent++;
 	return uloop_fd_add(&ex->ufd, ULOOP_READ | ULOOP_ERROR_CB) ? -EIO : 0;
@@ -395,8 +400,7 @@ static void tcp_fail(struct exchange *ex, int err)
 
 static void tcp_write(struct exchange *ex)
 {
-	uint8_t frame[2 + UP_QBUF];
-	size_t total = 2 + ex->qlen;
+	size_t total = EX_MSG_OFF + ex->qlen;
 	int soerr = 0;
 	socklen_t sl = sizeof(soerr);
 	ssize_t n;
@@ -407,10 +411,7 @@ static void tcp_write(struct exchange *ex)
 		if (soerr)
 			return tcp_fail(ex, -soerr);
 	}
-	frame[0] = ex->qlen >> 8;
-	frame[1] = ex->qlen;
-	memcpy(frame + 2, ex->qbuf, ex->qlen);
-	n = send(ex->ufd.fd, frame + ex->tsent, total - ex->tsent, MSG_NOSIGNAL);
+	n = send(ex->ufd.fd, ex->qbuf + ex->tsent, total - ex->tsent, MSG_NOSIGNAL);
 	if (n < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 			return;
@@ -490,7 +491,7 @@ static void fd_cb(struct uloop_fd *fd, unsigned int events)
 
 	if (!ex->tcp)
 		udp_cb(ex);
-	else if (ex->tsent < 2u + ex->qlen)
+	else if (ex->tsent < EX_MSG_OFF + (size_t)ex->qlen)
 		tcp_write(ex);
 	else
 		tcp_read(ex);
@@ -538,25 +539,44 @@ static void timer_cb(struct uloop_timeout *t)
 	ex_next(ex, -ETIMEDOUT);
 }
 
+int upstream_build_query(uint8_t *out, size_t cap, const uint8_t *name,
+                         uint8_t len, uint16_t qtype)
+{
+	uint8_t *p = out;
+
+	if (!len || cap < 12u + len + 4 + 11)
+		return -ENOSPC;
+	*p++ = 0;			/* id: set per attempt */
+	*p++ = 0;
+	*p++ = DNS_F_RD >> 8;
+	*p++ = DNS_F_RD & 0xff;
+	memcpy(p, "\0\1\0\0\0\0\0\1", 8);	/* QD=1 AN=0 NS=0 AR=1 */
+	p += 8;
+	memcpy(p, name, len);		/* verbatim: at out + 12 */
+	p += len;
+	*p++ = qtype >> 8;
+	*p++ = qtype;
+	*p++ = 0;
+	*p++ = DNS_C_IN;
+	/* OPT: root owner, type 41, udp size, ext-rcode/version/DO 0, rdlen 0 */
+	*p++ = 0;
+	*p++ = DNS_T_OPT >> 8;
+	*p++ = DNS_T_OPT & 0xff;
+	*p++ = UP_EDNS_SIZE >> 8;
+	*p++ = UP_EDNS_SIZE & 0xff;
+	memset(p, 0, 6);
+	p += 6;
+	return (int)(p - out);
+}
+
 static int build_query(struct exchange *ex, const uint8_t *lname, uint8_t len)
 {
-	struct dns_msg m;
-	int n;
+	int n = upstream_build_query(ex->qbuf + EX_MSG_OFF, UP_QBUF, lname, len, ex->qtype);
 
-	dns_msg_init(&m);
-	n = dns_msg_set_question(&m, lname, len, ex->qtype, DNS_C_IN);
-	if (!n) {
-		m.flags = DNS_F_RD;
-		m.edns.present = true;
-		m.edns.udp_size = UP_EDNS_SIZE;
-		n = dns_build(&m, ex->qbuf, sizeof(ex->qbuf));
-	}
-	dns_msg_free(&m);
 	if (n < 0)
 		return n;
-	/* the first name in a message is never compressed: qbuf holds it verbatim */
-	if (n < EX_QNAME_OFF + len || memcmp(ex->qbuf + EX_QNAME_OFF, lname, len))
-		return -EINVAL;
+	ex->qbuf[0] = n >> 8;		/* TCP length prefix */
+	ex->qbuf[1] = n;
 	ex->qnlen = len;
 	ex->qlen = n;
 	return 0;

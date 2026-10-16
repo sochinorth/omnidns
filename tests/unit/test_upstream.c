@@ -674,6 +674,93 @@ TEST(shutdown_many)
 	upstream_set_put(u);
 }
 
+/* The direct query writer must match the generic dns_build() construction
+ * it replaced, byte for byte. */
+static int ref_query(uint8_t *out, const uint8_t *name, uint8_t len, uint16_t qtype)
+{
+	struct dns_msg m;
+	int n;
+
+	dns_msg_init(&m);
+	n = dns_msg_set_question(&m, name, len, qtype, DNS_C_IN);
+	if (!n) {
+		m.flags = DNS_F_RD;
+		m.edns.present = true;
+		m.edns.udp_size = 1232;
+		n = dns_build(&m, out, 512);
+	}
+	dns_msg_free(&m);
+	return n;
+}
+
+TEST(build_query_bytes)
+{
+	static const uint16_t types[] = { DNS_T_A, DNS_T_AAAA, DNS_T_HTTPS,
+	                                  DNS_T_ANY, DNS_T_PTR, 65535, 0 };
+	uint8_t name[DNS_MAX_NAME], got[512], want[512];
+	int nnames = 0;
+
+	for (int v = 0; v < 6; v++) {
+		uint8_t len = 0;
+
+		switch (v) {
+		case 0:			/* root */
+			name[len++] = 0;
+			break;
+		case 1:
+		case 2: {
+			struct dns_name n;
+
+			REQUIRE(!dns_name_from_text(&n, v == 1 ? "a.example.com" :
+			                            "www.a.www.a.www.example.com"));
+			memcpy(name, n.data, n.len);
+			len = n.len;
+			break;
+		}
+		case 3:			/* 63-octet label */
+			name[len++] = 63;
+			memset(name + len, 'x', 63);
+			len += 63;
+			name[len++] = 0;
+			break;
+		default:		/* maximum length names (255) */
+			while (len + 1 + (v == 4 ? 63 : 1) + 1 <= DNS_MAX_NAME) {
+				uint8_t l = v == 4 ? 63 : 1;
+
+				name[len++] = l;
+				memset(name + len, 'a' + len % 26, l);
+				len += l;
+			}
+			if (len + 1 < DNS_MAX_NAME) {	/* pad to exactly 255 */
+				uint8_t l = DNS_MAX_NAME - len - 2;
+
+				name[len++] = l;
+				memset(name + len, 'z', l);
+				len += l;
+			}
+			name[len++] = 0;
+			CHECK_EQ(len, DNS_MAX_NAME);
+			break;
+		}
+		REQUIRE(dns_name_check(name, len) == len);
+		nnames++;
+		for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+			int a = upstream_build_query(got, sizeof(got), name, len, types[t]);
+			int b = ref_query(want, name, len, types[t]);
+
+			CHECK(a > 0);
+			CHECK_EQ(a, b);
+			CHECK(a == b && a > 0 && !memcmp(got, want, a));
+			CHECK(a > 0 && !memcmp(got + 12, name, len));
+		}
+	}
+	CHECK_EQ(nnames, 6);
+	/* exact fit and one byte short */
+	name[0] = 0;
+	CHECK_EQ(upstream_build_query(got, 12 + 1 + 4 + 11, name, 1, DNS_T_A), 28);
+	CHECK_EQ(upstream_build_query(got, 12 + 1 + 4 + 10, name, 1, DNS_T_A), -ENOSPC);
+}
+
 int main(void)
 {
 	char tpl[] = "/tmp/omni-upstream-XXXXXX";
@@ -685,6 +772,7 @@ int main(void)
 	snprintf(tmpdir, sizeof(tmpdir), "%s", tpl);
 	uloop_init();
 	upstream_init(300, 2000);
+	RUN(build_query_bytes);
 	dead_port = free_port();
 	if (!fake_start(&srv_a, "a", zone_a) || !fake_start(&srv_b, "b", zone_b)) {
 		fprintf(stderr, "cannot start dnsmini, skipping\n");

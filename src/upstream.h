@@ -52,4 +52,13 @@ struct upstream_stats {
 };
 const struct upstream_stats *upstream_get_stats(void);
 
+/*
+ * Write the upstream query for (name, qtype) into out: header with id 0 and
+ * RD, the question with `name` copied verbatim at out + 12 (the caller
+ * validates and lowercases it), and the OPT RR described above. Returns the
+ * length or -ENOSPC. Exposed for tests.
+ */
+int upstream_build_query(uint8_t *out, size_t cap, const uint8_t *name,
+                         uint8_t len, uint16_t qtype);
+
 #endif
