@@ -1468,6 +1468,57 @@ TEST(x_authority_addresses)
 	}
 }
 
+/*
+ * Only answer records of the chain itself are passed through: a record
+ * owned by any other name takes the assembled path, which carries over the
+ * chain alone. Chains answered in one response (CNAME, DNAME, with their
+ * RRSIGs) still pass through.
+ */
+TEST(y_pass_through_chain_only)
+{
+	int k;
+
+	setup(CFG_DEFAULT);
+	S("10.0.0.1", "x.plain.example", DNS_T_A, 0,
+	  "an x.plain.example 300 A 1.1.1.1;an www.vpn.example 300 A 1.2.3.4");
+	S("10.0.0.1", "nx.plain.example", DNS_T_A, DNS_R_NXDOMAIN,
+	  "an www.vpn.example 300 A 1.2.3.4;ns plain.example 300 SOA 60");
+	S("10.0.0.1", "c.plain.example", DNS_T_A, 0,
+	  "an c.plain.example 300 CNAME d.plain.example;an c.plain.example 300 RRSIG;"
+	  "an d.plain.example 300 A 1.1.1.2;an d.plain.example 300 RRSIG;"
+	  "an e.vpn.example 300 CNAME d.plain.example");
+	S("10.0.0.1", "www.d.plain.example", DNS_T_A, 0,
+	  "an d.plain.example 900 DNAME e.plain.example;an d.plain.example 900 RRSIG;"
+	  "an www.d.plain.example 900 CNAME www.e.plain.example;"
+	  "an www.e.plain.example 300 A 3.3.3.3;an www.e.plain.example 300 RRSIG");
+	for (k = 0; k < 2; k++) {	/* fresh, then cached */
+		CHECK(run("x.plain.example", DNS_T_A));
+		CHECK_EQ(count(DNS_S_AN), 1);
+		CHECK_STR(R(0), "x.plain.example 300 A 1.1.1.1");
+
+		CHECK(run("nx.plain.example", DNS_T_A));
+		CHECK_EQ(rcode(), DNS_R_NXDOMAIN);
+		CHECK_EQ(count(DNS_S_AN), 0);
+		CHECK_EQ(count(DNS_S_NS), 1);
+
+		/* the stray CNAME forces assembly, which drops the RRSIGs too */
+		CHECK(run("c.plain.example", DNS_T_A));
+		CHECK_EQ(count(DNS_S_AN), 2);
+		CHECK_STR(R(0), "c.plain.example 300 CNAME d.plain.example");
+		CHECK_STR(R(1), "d.plain.example 300 A 1.1.1.2");
+
+		/* passed through as is */
+		CHECK(run("www.d.plain.example", DNS_T_A));
+		CHECK_EQ(count(DNS_S_AN), 5);
+		CHECK_STR(R(0), "d.plain.example 900 DNAME e.plain.example");
+		CHECK_EQ(res.nrr > 1 ? res.rr[1].type : 0, DNS_T_RRSIG);
+		CHECK_STR(R(2), "www.d.plain.example 900 CNAME www.e.plain.example");
+		CHECK_STR(R(3), "www.e.plain.example 300 A 3.3.3.3");
+		CHECK_EQ(res.nrr > 4 ? res.rr[4].type : 0, DNS_T_RRSIG);
+		CHECK(k == 0 || no_queries());
+	}
+}
+
 struct pending {
 	int ncb;
 	struct dns_msg m;
@@ -1622,6 +1673,7 @@ int main(int argc, char **argv)
 	RUN(v_wire_compat);
 	RUN(w_deps_dedup);
 	RUN(x_authority_addresses);
+	RUN(y_pass_through_chain_only);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);
