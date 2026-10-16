@@ -125,14 +125,22 @@ int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
                        uint8_t *out, size_t cap, uint16_t *outlen)
 {
 	struct svcb_view v;
-	size_t off, o, room, params;
-	unsigned removed = 0;
 	int r;
 
 	r = svcb_parse(rdata, len, &v);
 	if (r)
 		return r;
-	off = 2 + (size_t)v.target_len;
+	return svcb_rewrite_view(&v, fn, ctx, drop_v6, out, cap, outlen);
+}
+
+int svcb_rewrite_view(const struct svcb_view *v, svcb_addr_fn fn, void *ctx, bool drop_v6,
+                      uint8_t *out, size_t cap, uint16_t *outlen)
+{
+	const uint8_t *rdata = v->target - 2;
+	size_t off = 2 + (size_t)v->target_len, len = off + v->params_len, o, room, params;
+	unsigned removed = 0;
+	int r;
+
 	if (cap < off)
 		return -ENOSPC;
 	memcpy(out, rdata, off);

@@ -61,4 +61,8 @@ int svcb_rewrite_hints(const uint8_t *rdata, uint16_t len,
                        svcb_addr_fn fn, void *ctx, bool drop_v6,
                        uint8_t *out, size_t cap, uint16_t *outlen);
 
+/* The same for rdata already parsed into v (by svcb_parse; v points into it). */
+int svcb_rewrite_view(const struct svcb_view *v, svcb_addr_fn fn, void *ctx, bool drop_v6,
+                      uint8_t *out, size_t cap, uint16_t *outlen);
+
 #endif

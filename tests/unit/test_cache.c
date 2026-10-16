@@ -133,7 +133,8 @@ static int ins(struct cache *c, const struct config *cfg, const char *qname, uin
 	int r;
 
 	mkresp(&m, qname, "1.2.3.4", life);
-	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, life, d, dsz, 1, b, nb);
+	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
+	                 cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, life, d, dsz, 1, b, nb);
 	dns_msg_free(&m);
 	return r;
 }
@@ -143,7 +144,8 @@ static int look(struct cache *c, const struct config *cfg, const char *qname,
 {
 	struct dns_name n = N(qname);
 
-	return cache_lookup(c, cfg, n.data, n.len, qtype, DNS_C_IN, out);
+	return cache_lookup(c, cfg, n.data, n.len, qtype, DNS_C_IN,
+	                    cache_hash(n.data, n.len, qtype, DNS_C_IN), out);
 }
 
 static const uint8_t SECRET[16] = { 7 };
@@ -222,9 +224,11 @@ TEST(limits_e2big)
 		dsz += dep(deps + dsz, cfg, "a.example", name);
 	}
 	mkresp(&m, "a.example", "1.1.1.1", 60);
-	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 60,
+	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
+	                      cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, 60,
 	                      deps, dsz, CACHE_MAX_DEPS + 1, NULL, 0), -E2BIG);
-	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 60,
+	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
+	                      cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, 60,
 	                      deps, sz32, CACHE_MAX_DEPS, NULL, 0), 0);
 	CHECK_EQ(cache_count(c), 1);
 	dns_msg_free(&m);
@@ -482,8 +486,16 @@ static int ins_msg(struct cache *c, const struct config *cfg, const struct dns_m
 	uint8_t d[CACHE_DEP_HDR + DNS_MAX_NAME];
 	size_t dsz = dep(d, cfg, "invalid", "x.example");
 
-	return cache_insert(c, cfg, m->qname.data, m->qname.len, m->qtype, DNS_C_IN, m,
-	                    life, d, dsz, 1, NULL, 0);
+	return cache_insert(c, cfg, m->qname.data, m->qname.len, m->qtype, DNS_C_IN,
+	                    cache_hash(m->qname.data, m->qname.len, m->qtype, DNS_C_IN),
+	                    m, life, d, dsz, 1, NULL, 0);
+}
+
+static int look_msg(struct cache *c, const struct config *cfg, const struct dns_msg *m,
+                    struct dns_msg *out)
+{
+	return cache_lookup(c, cfg, m->qname.data, m->qname.len, m->qtype, DNS_C_IN,
+	                    cache_hash(m->qname.data, m->qname.len, m->qtype, DNS_C_IN), out);
 }
 
 /*
@@ -557,12 +569,10 @@ TEST(round_trip)
 	/* `out` is reused across hits of different sizes */
 	for (age = 0; age <= 45; age += 45) {
 		for (i = 0; i < 4; i++) {
-			REQUIRE(cache_lookup(c, cfg, m[i].qname.data, m[i].qname.len, m[i].qtype,
-			                     DNS_C_IN, &out) == 0);
+			REQUIRE(look_msg(c, cfg, &m[i], &out) == 0);
 			check_hit(&out, &m[i], age);
 		}
-		REQUIRE(cache_lookup(c, cfg, m[0].qname.data, m[0].qname.len, m[0].qtype,
-		                     DNS_C_IN, &out) == 0);
+		REQUIRE(look_msg(c, cfg, &m[0], &out) == 0);
 		check_hit(&out, &m[0], age);
 		time_override_advance(45);
 	}
@@ -570,7 +580,8 @@ TEST(round_trip)
 	{
 		struct dns_name q = N("www.FOO.example");
 
-		REQUIRE(cache_lookup(c, cfg, q.data, q.len, DNS_T_A, DNS_C_IN, &out) == 0);
+		REQUIRE(cache_lookup(c, cfg, q.data, q.len, DNS_T_A, DNS_C_IN,
+		                     cache_hash(q.data, q.len, DNS_T_A, DNS_C_IN), &out) == 0);
 		check_hit(&out, &m[0], 90);
 	}
 
@@ -614,7 +625,8 @@ TEST(huge_answer)
 	}
 	CHECK_EQ(ins_msg(c, cfg, &m, 60), 0);
 	CHECK_EQ(cache_count(c), 1);
-	REQUIRE(cache_lookup(c, cfg, m.qname.data, m.qname.len, DNS_T_TXT, DNS_C_IN, &out) == 0);
+	REQUIRE(cache_lookup(c, cfg, m.qname.data, m.qname.len, DNS_T_TXT, DNS_C_IN,
+	                     cache_hash(m.qname.data, m.qname.len, DNS_T_TXT, DNS_C_IN), &out) == 0);
 	check_hit(&out, &m, 0);
 	dns_msg_free(&m);
 
@@ -640,7 +652,8 @@ static int ins_deps(struct cache *c, const struct config *cfg, const char *qname
 	if (d1)
 		dsz += dep(d + dsz, cfg, qname, d1), nd++;
 	mkresp(&m, qname, "192.0.2.9", 300);
-	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 300, d, dsz, nd, NULL, 0);
+	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN,
+	                 cache_hash(n.data, n.len, DNS_T_A, DNS_C_IN), &m, 300, d, dsz, nd, NULL, 0);
 	dns_msg_free(&m);
 	return r;
 }
@@ -790,7 +803,8 @@ TEST(byte_accounting)
 	{
 		struct dns_name q = N("c99.example");
 
-		CHECK_EQ(cache_lookup(c, cfg, q.data, q.len, DNS_T_A, DNS_C_IN, &out), 0);
+		CHECK_EQ(cache_lookup(c, cfg, q.data, q.len, DNS_T_A, DNS_C_IN,
+		                      cache_hash(q.data, q.len, DNS_T_A, DNS_C_IN), &out), 0);
 	}
 
 	for (i = 0; i < 3; i++)

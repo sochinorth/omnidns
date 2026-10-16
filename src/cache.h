@@ -66,12 +66,16 @@ struct cache *cache_new(uint32_t max_entries, size_t max_bytes, struct fakeip_db
 void cache_free(struct cache *c);
 void cache_set_limits(struct cache *c, uint32_t max_entries, size_t max_bytes);
 
+/* The key's hash, as lookups and inserts take it (a miss and the insert
+ * that follows it hash the key once). */
+uint64_t cache_hash(const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass);
+
 /* Returns 0 on hit (out filled with id 0, no EDNS, the question as
  * inserted) or -ENOENT. `out` must be initialized; it is reset first, and
  * its rr/buf allocations are reused when large enough. */
 int cache_lookup(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 struct dns_msg *out);
+                 uint64_t hash, struct dns_msg *out);
 
 /*
  * Insert/replace. `lifetime` seconds (0 => not cached). Takes a reference on
@@ -81,7 +85,7 @@ int cache_lookup(struct cache *c, const struct config *cfg,
  */
 int cache_insert(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 const struct dns_msg *resp, uint32_t lifetime,
+                 uint64_t hash, const struct dns_msg *resp, uint32_t lifetime,
                  const uint8_t *deps, size_t dsz, uint16_t ndeps,
                  struct binding *const *binds, uint16_t nbinds);
 

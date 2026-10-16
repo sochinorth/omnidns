@@ -104,7 +104,7 @@ struct cache {
 
 #define ENTRY_OVERHEAD CACHE_ENTRY_OVERHEAD
 
-static uint64_t key_hash(const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass)
+uint64_t cache_hash(const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass)
 {
 	uint64_t t = (uint64_t)qtype << 16 | qclass;
 
@@ -239,12 +239,11 @@ size_t cache_bytes(const struct cache *c)
 }
 
 static struct centry *find(struct cache *c, const uint8_t *qname, uint8_t qlen,
-                           uint16_t qtype, uint16_t qclass, uint64_t *hash)
+                           uint16_t qtype, uint16_t qclass, uint64_t hash)
 {
 	struct ckey k = { .qname = qname, .qlen = qlen, .qtype = qtype, .qclass = qclass };
 
-	*hash = key_hash(qname, qlen, qtype, qclass);
-	return hmap_get(&c->map, *hash, &k, key_eq, NULL);
+	return hmap_get(&c->map, hash, &k, key_eq, NULL);
 }
 
 /*
@@ -345,14 +344,13 @@ static int inflate(const struct centry *e, struct dns_msg *out, uint32_t age)
 
 int cache_lookup(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 struct dns_msg *out)
+                 uint64_t hash, struct dns_msg *out)
 {
 	uint32_t now = omni_now(), age;
 	struct centry *e;
-	uint64_t h;
 
 	dns_msg_reset(out);
-	e = find(c, qname, qlen, qtype, qclass, &h);
+	e = find(c, qname, qlen, qtype, qclass, hash);
 	if (!e)
 		return -ENOENT;
 	age = now > e->inserted ? now - e->inserted : 0;
@@ -471,12 +469,11 @@ static struct centry *entry_new(const uint8_t *qname, uint8_t qlen, const struct
 
 int cache_insert(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
-                 const struct dns_msg *resp, uint32_t lifetime,
+                 uint64_t hash, const struct dns_msg *resp, uint32_t lifetime,
                  const uint8_t *deps, size_t dsz, uint16_t ndeps,
                  struct binding *const *binds, uint16_t nbinds)
 {
 	struct centry *e, *old;
-	uint64_t h;
 	uint16_t i;
 	int err;
 
@@ -493,7 +490,7 @@ int cache_insert(struct cache *c, const struct config *cfg,
 	}
 	e->flags = resp->flags;
 	e->has_q = resp->has_q;
-	old = find(c, qname, qlen, qtype, qclass, &h);
+	old = find(c, qname, qlen, qtype, qclass, hash);
 	if (old)
 		entry_drop(c, old);
 	e->qtype = qtype;
@@ -501,14 +498,14 @@ int cache_insert(struct cache *c, const struct config *cfg,
 	e->gen = (uint32_t)cfg->gen;
 	e->inserted = omni_now();
 	e->lifetime = lifetime;
-	if (hmap_put(&c->map, h, e)) {
+	if (hmap_put(&c->map, hash, e)) {
 		free(e);
 		return -ENOMEM;
 	}
 	for (i = 0; i < nbinds; i++)
 		fakeip_ref(binds[i]);
 	c->bytes += e->bytes;
-	s3_insert(&c->s3, &e->s3, h);
+	s3_insert(&c->s3, &e->s3, hash);
 	maybe_evict(c);
 	return 0;
 }

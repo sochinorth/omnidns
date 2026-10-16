@@ -45,6 +45,7 @@ struct resolve_req {
 
 	struct dns_name qname;
 	uint16_t qtype, qclass, rd;
+	uint64_t khash;			/* cache key hash, by try_cache() */
 
 	/* walk state */
 	struct dns_name name;
@@ -79,16 +80,19 @@ enum { LIFE_NONE, LIFE_POS, LIFE_NEG };
 
 struct plan {
 	uint8_t act;
+	bool sv_ok;			/* sv holds the parsed rdata */
 	uint32_t mark;
 	const char *rule_id;
+	struct svcb_view sv;		/* SVCB/HTTPS queries: by find_svcb_alias */
 };
 
 /*
  * Scratch for terminal processing, one entry per answer record of the
- * response in hand. It is only used synchronously within one terminal()
- * call (never across a wait for an upstream or nft), so a single static
- * array serves every request, and so does one buffer for a rewritten SVCB
- * rdata (never longer than the original).
+ * response in hand: for SVCB/HTTPS queries, find_svcb_alias() parses each
+ * candidate record into it once, then terminal() plans. It is only used
+ * synchronously within one scan() (never across a wait for an upstream or
+ * nft), so a single static array serves every request, and so does one
+ * buffer for a rewritten SVCB rdata (never longer than the original).
  */
 static struct plan plan[DNS_MAX_RRS];
 static uint8_t hint_buf[UINT16_MAX];
@@ -386,8 +390,8 @@ static void finish_cached(struct resolve_req *r)
 		stats.fakeip_answers++;
 	if (o->cache && r->lifetime && o->cfg->gen == r->gen0 && !r->deps_full)
 		cache_insert(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype,
-		             r->qclass, &r->out, r->lifetime, r->deps, r->dsz, r->ndeps,
-		             r->binds, r->nbinds);
+		             r->qclass, r->khash, &r->out, r->lifetime, r->deps, r->dsz,
+		             r->ndeps, r->binds, r->nbinds);
 	deliver(r);
 }
 
@@ -576,8 +580,8 @@ static bool all_glue_ok(struct resolve_req *r)
 	return true;
 }
 
-/* Copy NS/AR of the last response into out. */
-static int copy_tail(struct resolve_req *r, bool strip_sec, bool strip_glue, bool no_ar)
+/* Copy NS/AR of the last response into out (glue as glue_ok() allows). */
+static int copy_tail(struct resolve_req *r, bool strip_sec)
 {
 	const struct dns_msg *m = &r->resp;
 	uint16_t i;
@@ -586,12 +590,8 @@ static int copy_tail(struct resolve_req *r, bool strip_sec, bool strip_glue, boo
 	for (i = 0; i < m->nrr; i++) {
 		const struct dns_rr *rr = &m->rr[i];
 
-		if (rr->section == DNS_S_AN || (no_ar && rr->section == DNS_S_AR))
-			continue;
-		if (strip_sec && strip_type(r, rr->type))
-			continue;
-		if ((strip_glue && rr->section == DNS_S_AR &&
-		     (rr->type == DNS_T_A || rr->type == DNS_T_AAAA)) || !glue_ok(r, rr))
+		if (rr->section == DNS_S_AN || (strip_sec && strip_type(r, rr->type)) ||
+		    !glue_ok(r, rr))
 			continue;
 		ret = add_rr(&r->out, rr->section, rr);
 		if (ret)
@@ -599,6 +599,7 @@ static int copy_tail(struct resolve_req *r, bool strip_sec, bool strip_glue, boo
 	}
 	return 0;
 }
+
 
 static int copy_prefix(struct resolve_req *r)
 {
@@ -649,7 +650,7 @@ static void finish_negative(struct resolve_req *r)
 		out_init(r, rcode);
 		ret = copy_prefix(r);
 		if (!ret)
-			ret = copy_tail(r, false, r->latch.on, false);
+			ret = copy_tail(r, false);
 	}
 	if (ret) {
 		servfail(r);
@@ -766,23 +767,19 @@ static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 	struct hint_ctx h = {
 		.r = r, .rule_id = p->rule_id, .mark = p->mark, .ttl = fake_ttl(r, rr->ttl),
 	};
-	struct svcb_view v;
 	uint16_t len;
 	int ret;
 
-	ret = svcb_parse(rr->rdata, rr->rdlen, &v);
-	if (ret)
-		return ret;
-	if (svcb_target_is_root(&v)) {
+	if (svcb_target_is_root(&p->sv)) {
 		h.endpoint = r->name.data;
 		h.endpoint_len = r->name.len;
 	} else {
-		h.endpoint = v.target;
-		h.endpoint_len = v.target_len;
+		h.endpoint = p->sv.target;
+		h.endpoint_len = p->sv.target_len;
 	}
 	/* fakes have the size of the addresses they replace */
-	ret = svcb_rewrite_hints(rr->rdata, rr->rdlen, hint_fn, &h,
-	                         !fakeip_has_pool(r->o->fdb, 6), hint_buf, rr->rdlen, &len);
+	ret = svcb_rewrite_view(&p->sv, hint_fn, &h, !fakeip_has_pool(r->o->fdb, 6),
+	                        hint_buf, rr->rdlen, &len);
 	if (ret)
 		return ret;
 	if (len != rr->rdlen || memcmp(hint_buf, rr->rdata, len))
@@ -806,22 +803,21 @@ static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struc
 }
 
 /* Decide one ServiceMode RR (match its effective target). */
-static int plan_svcb(struct resolve_req *r, const struct dns_rr *rr, struct plan *p)
+static int plan_svcb(struct resolve_req *r, struct plan *p)
 {
 	const struct rule *rule;
 	const uint8_t *t;
-	struct svcb_view v;
 	uint8_t tlen;
 
-	if (svcb_parse(rr->rdata, rr->rdlen, &v)) {
+	if (!p->sv_ok) {
 		p->act = ACT_DROP;
 		return 0;
 	}
 	p->act = ACT_KEEP;
-	if (!v.priority)
+	if (!p->sv.priority)
 		return 0;
-	t = svcb_target_is_root(&v) ? r->name.data : v.target;
-	tlen = svcb_target_is_root(&v) ? r->name.len : v.target_len;
+	t = svcb_target_is_root(&p->sv) ? r->name.data : p->sv.target;
+	tlen = svcb_target_is_root(&p->sv) ? r->name.len : p->sv.target_len;
 	rule = dep_match(r, t, tlen);
 	if (!rule)
 		return -ENOENT;
@@ -881,7 +877,7 @@ static int plan_terminal(struct resolve_req *r, uint16_t *nkept, bool *dropped,
 				p->mark = r->latch.mark;
 			}
 		} else if (is_svcb(r->qtype)) {
-			ret = plan_svcb(r, rr, p);
+			ret = plan_svcb(r, p);
 			if (ret)
 				return ret;
 		} else {
@@ -925,7 +921,7 @@ static int build_terminal(struct resolve_req *r, bool changed, bool *rewritten)
 	/* hints were planned, but there was nothing to rewrite */
 	if (changed && !*rewritten && can_pass_through(r))
 		return pass_through(r);
-	return copy_tail(r, *rewritten, r->latch.on || r->nbinds, false);
+	return copy_tail(r, *rewritten);
 }
 
 static void terminal(struct resolve_req *r)
@@ -1090,32 +1086,32 @@ static int scan_alias(struct resolve_req *r, const struct dns_rr *rr)
 	return alias_to(r, &target);
 }
 
-static const struct dns_rr *find_svcb_alias(const struct resolve_req *r)
+/* The AliasMode record to follow; parses the records it looks at into plan[]. */
+static const struct plan *find_svcb_alias(const struct resolve_req *r)
 {
 	const struct dns_msg *m = &r->resp;
-	struct svcb_view v;
 	uint16_t i;
 
 	for (i = 0; i < m->nrr && m->rr[i].section == DNS_S_AN; i++) {
 		const struct dns_rr *rr = &m->rr[i];
+		struct plan *p = &plan[i];
 
-		if (rr->type != r->qtype || !owned(rr, &r->name) ||
-		    svcb_parse(rr->rdata, rr->rdlen, &v))
+		if (rr->type != r->qtype || !owned(rr, &r->name))
 			continue;
-		if (!v.priority && !svcb_target_is_root(&v))
-			return rr;
+		p->sv_ok = !svcb_parse(rr->rdata, rr->rdlen, &p->sv);
+		if (p->sv_ok && !p->sv.priority && !svcb_target_is_root(&p->sv))
+			return p;
 	}
 	return NULL;
 }
 
-static int scan_svcb_alias(struct resolve_req *r, const struct dns_rr *rr)
+static int scan_svcb_alias(struct resolve_req *r, const struct plan *p)
 {
+	const struct dns_rr *rr = &r->resp.rr[p - plan];
 	struct dns_name target;
-	struct svcb_view v;
 
-	svcb_parse(rr->rdata, rr->rdlen, &v);
-	memcpy(target.data, v.target, v.target_len);
-	target.len = v.target_len;
+	memcpy(target.data, p->sv.target, p->sv.target_len);
+	target.len = p->sv.target_len;
 	if (prefix_add(r, rr)) {
 		servfail(r);
 		return SCAN_DONE;
@@ -1128,6 +1124,7 @@ static int scan(struct resolve_req *r)
 {
 	const struct dns_msg *m = &r->resp;
 	const struct dns_rr *rr;
+	const struct plan *alias;
 	int rcode = m->flags & DNS_F_RCODE;
 	bool asked;
 
@@ -1136,8 +1133,8 @@ static int scan(struct resolve_req *r)
 		return scan_dname(r, rr);
 	if (r->qtype != DNS_T_CNAME && (rr = find_rr(m, &r->name, DNS_T_CNAME)))
 		return scan_alias(r, rr);
-	if (is_svcb(r->qtype) && (rr = find_svcb_alias(r)))
-		return scan_svcb_alias(r, rr);
+	if (is_svcb(r->qtype) && (alias = find_svcb_alias(r)))
+		return scan_svcb_alias(r, alias);
 	if (find_rr(m, &r->name, r->qtype)) {
 		terminal(r);
 		return SCAN_DONE;
@@ -1175,8 +1172,12 @@ static bool try_cache(struct resolve_req *r)
 	struct omni *o = r->o;
 	int rcode;
 
-	if (!o->cache || cache_lookup(o->cache, o->cfg, r->qname.data, r->qname.len,
-	                              r->qtype, r->qclass, &r->out))
+	/* without a cache here, finish_cached() has none either: it never changes */
+	if (!o->cache)
+		return false;
+	r->khash = cache_hash(r->qname.data, r->qname.len, r->qtype, r->qclass);
+	if (cache_lookup(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype, r->qclass,
+	                 r->khash, &r->out))
 		return false;
 	stats.cache_hits++;
 	rcode = r->out.flags & DNS_F_RCODE;
