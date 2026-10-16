@@ -120,6 +120,26 @@ TEST(exact_vs_suffix_same_node)
 	free_rules(&rs);
 }
 
+TEST(refcount)
+{
+	struct ruleset rs = { .n = 0 };
+	struct match_index *idx;
+
+	add_rule(&rs, "a.example\n");
+	add_rule(&rs, NULL);
+	idx = match_build(rs.r, rs.n);
+	REQUIRE(idx);
+	CHECK(match_get(idx) == idx);
+	CHECK(match_get(idx) == idx);
+	match_free(idx);
+	match_free(idx);
+	CHECK_EQ(look(idx, "a.example"), 0);	/* one reference left */
+	CHECK_EQ(look(idx, "b.example"), 1);
+	match_free(idx);
+	match_free(NULL);
+	free_rules(&rs);
+}
+
 TEST(wire_lookup)
 {
 	struct ruleset rs = { .n = 0 };
@@ -545,6 +565,7 @@ int main(void)
 	RUN(name_text);
 	RUN(ordinals);
 	RUN(exact_vs_suffix_same_node);
+	RUN(refcount);
 	RUN(wire_lookup);
 	RUN(differential);
 	RUN(differential_shared_files);

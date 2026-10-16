@@ -114,7 +114,15 @@ and size. The table is built once per configuration, sized for the patterns of
 the distinct files (at most 75% full), and never grows. Its 12-byte slots hold no
 names: they point into the blobs (file index and offset) and carry a 16-bit
 hash tag and the two ordinals. The configuration's references keep the
-files alive as long as the table. 100k patterns build in about 4 ms with a
+files alive as long as the table.
+
+A reload whose rules reference the same parsed files, rule by rule and in
+the same order, shares the previous table (it is refcounted) instead of
+building one. Both configurations then hold references to exactly the files
+the table borrows from, so the files outlive it whichever is freed last. A
+file that is re-read but yields the same patterns (touched, or atomically
+replaced by a list refresh) keeps its identity in the file cache, so it
+doesn't force a rebuild either. 100k patterns build in about 4 ms with a
 3.1 MB table (plus about 1.7 MB of blob text), and lookups run at about
 11M/s on a desktop CPU.
 

@@ -15,6 +15,11 @@
  *  min ordinal of rules with a suffix pattern "*.name").
  * Names are borrowed from the rules' nameset files, which must outlive it.
  *
+ * Refcounted: match_build() returns one reference, match_get() adds one and
+ * match_free() drops one (the last frees the table). A config reuses its
+ * predecessor's index when its rules reference exactly the same nameset
+ * files (see config.c), so every holder references the borrowed files.
+ *
  * Lookup of "a.b.google.com" (first match wins = minimum ordinal):
  *   full name   -> consider exact and suffix ordinals
  *   ancestors   -> "b.google.com", "google.com", "com": suffix only
@@ -29,7 +34,8 @@
 struct match_index;
 
 struct match_index *match_build(const struct rule *rules, uint16_t nrules);
-void match_free(struct match_index *idx);
+struct match_index *match_get(struct match_index *idx);
+void match_free(struct match_index *idx);	/* drops a reference; NULL ok */
 
 uint16_t match_lookup(const struct match_index *idx, const char *name, size_t len);
 /* Convenience: converts the wire name to text first. */

@@ -29,6 +29,7 @@ struct match_index {
 	const char **bases;	/* distinct nameset blobs, sorted by address */
 	uint32_t mask, len;
 	uint16_t nbases, catchall;
+	int refcnt;
 };
 
 /* The slot holding name, or the empty slot where it belongs. */
@@ -169,6 +170,7 @@ struct match_index *match_build(const struct rule *rules, uint16_t nrules)
 
 	if (!idx)
 		return NULL;
+	idx->refcnt = 1;
 	idx->catchall = MATCH_NONE;
 	if (collect_bases(idx, rules, nrules))
 		goto fail;
@@ -197,9 +199,15 @@ fail:
 	return NULL;
 }
 
+struct match_index *match_get(struct match_index *idx)
+{
+	idx->refcnt++;
+	return idx;
+}
+
 void match_free(struct match_index *idx)
 {
-	if (!idx)
+	if (!idx || --idx->refcnt > 0)
 		return;
 	free(idx->slots);
 	free(idx->bases);

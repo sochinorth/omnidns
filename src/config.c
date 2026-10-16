@@ -679,6 +679,18 @@ struct nameset_file *nsc_get(struct nameset_cache *c, const char *path, int *err
 	f = nsf_load(path, err);
 	if (!f)
 		return NULL;
+	if (old && old->npat == f->npat && old->blob_len == f->blob_len &&
+	    (!f->blob_len || !memcmp(old->blob, f->blob, f->blob_len))) {
+		/* touched or replaced with identical patterns: keep the object,
+		 * so configs (and their match index) still compare equal */
+		old->dev = f->dev;
+		old->ino = f->ino;
+		old->mtime = f->mtime;
+		old->size = f->size;
+		nsf_free(f);
+		old->refcnt++;
+		return old;
+	}
 	if (hmap_put(&c->by_path, h, f)) {
 		nsf_free(f);
 		*err = -ENOMEM;
@@ -1371,8 +1383,45 @@ out:
 	return ret;
 }
 
+bool config_same_namesets(const struct config *a, const struct config *b)
+{
+	if (a->nrules != b->nrules)
+		return false;
+	for (uint16_t i = 0; i < a->nrules; i++) {
+		const struct rule *x = &a->rules[i], *y = &b->rules[i];
+
+		if (x->catchall != y->catchall || x->nfiles != y->nfiles ||
+		    (x->nfiles && memcmp(x->files, y->files, x->nfiles * sizeof(*x->files))))
+			return false;
+	}
+	return true;
+}
+
+bool config_same_policy(const struct config *a, const struct config *b)
+{
+	if (a->idx != b->idx || a->nrules != b->nrules || a->fwmask != b->fwmask)
+		return false;
+	for (uint16_t i = 0; i < a->nrules; i++)
+		if (a->rules[i].fingerprint != b->rules[i].fingerprint)
+			return false;
+	return true;
+}
+
 struct config *config_load(const char *path, struct nameset_cache *nsc,
                            char *err, size_t errlen)
+{
+	return config_reload(path, nsc, NULL, err, errlen);
+}
+
+/*
+ * Sharing prev's index is safe: it borrows the blobs of exactly the files
+ * the new rules reference (pointer-equal, each holding its own nsc
+ * reference), so whichever config is freed last still keeps them alive.
+ * A nameset_file pointer cannot be recycled while prev exists, since prev
+ * holds references to all of its files.
+ */
+struct config *config_reload(const char *path, struct nameset_cache *nsc,
+                             const struct config *prev, char *err, size_t errlen)
 {
 	struct loader L = { .nsc = nsc, .err = err, .errlen = errlen };
 	struct config *cfg = calloc(1, sizeof(*cfg));
@@ -1392,7 +1441,10 @@ struct config *config_load(const char *path, struct nameset_cache *nsc,
 	shrink = realloc(cfg->rules, cfg->nrules * sizeof(*cfg->rules));
 	if (shrink)
 		cfg->rules = shrink;
-	cfg->idx = match_build(cfg->rules, cfg->nrules);
+	if (prev && config_same_namesets(prev, cfg))
+		cfg->idx = match_get(prev->idx);
+	else
+		cfg->idx = match_build(cfg->rules, cfg->nrules);
 	if (!cfg->idx) {
 		fail(&L, "out of memory building match index");
 		goto fail;
@@ -1410,7 +1462,7 @@ void config_free(struct config *cfg)
 {
 	if (!cfg)
 		return;
-	match_free(cfg->idx);		/* borrows the nameset files' blobs */
+	match_free(cfg->idx);		/* borrows the nameset files' blobs: first */
 	for (uint16_t i = 0; i < cfg->nrules; i++) {
 		struct rule *r = &cfg->rules[i];
 

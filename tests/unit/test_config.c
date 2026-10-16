@@ -52,7 +52,7 @@ static const char *P(const char *name)
 
 static char err[512];
 
-static struct config *load_text(const char *text)
+static struct config *reload_text(const struct config *prev, const char *text)
 {
 	FILE *f = fopen(P("omnitest"), "w");
 
@@ -61,7 +61,12 @@ static struct config *load_text(const char *text)
 	fputs(text, f);
 	fclose(f);
 	err[0] = 0;
-	return config_load(P("omnitest"), &nsc, err, sizeof(err));
+	return config_reload(P("omnitest"), &nsc, prev, err, sizeof(err));
+}
+
+static struct config *load_text(const char *text)
+{
+	return reload_text(NULL, text);
 }
 
 static struct config *loadf(const char *fmt, ...)
@@ -412,6 +417,159 @@ TEST(fingerprints)
 #undef fmt
 }
 
+static void touch_later(const char *name, int secs)
+{
+	struct timespec ts[2];
+
+	clock_gettime(CLOCK_REALTIME, &ts[0]);
+	ts[0].tv_sec += secs;
+	ts[1] = ts[0];
+	if (utimensat(AT_FDCWD, P(name), ts, 0))
+		abort();
+}
+
+static struct config *reloadf(const struct config *prev, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+
+static struct config *reloadf(const struct config *prev, const char *fmt, ...)
+{
+	char text[8192];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(text, sizeof(text), fmt, ap);
+	va_end(ap);
+	return reload_text(prev, text);
+}
+
+static uint16_t lk(const struct config *c, const char *name)
+{
+	return match_lookup(c->idx, name, strlen(name));
+}
+
+/* r1 (glob: s1, s2), r2 (s2 again, then s1), catchall */
+#define RL_RULES(up2, mark)							\
+	"config rule 'r1'\n\toption action 'block'\n"			\
+	"\tlist nameset '%s/rl/s*.txt'\n"					\
+	"config rule 'r2'\n\toption action 'fakeip'\n"			\
+	"\toption fwmark '" mark "'\n\toption upstream '%s/" up2 "'\n"	\
+	"\tlist nameset '%s/rl/s2.txt'\n\tlist nameset '%s/rl/s1.txt'\n"
+#define RL(up2, mark) GLOBAL RL_RULES(up2, mark) CATCHALL, dir, dir, dir, dir, dir
+
+TEST(reload_shares_index)
+{
+	struct config *c[8] = { 0 };
+	struct match_index *idx;
+
+	mkdir(P("rl"), 0755);
+	wfile("rl/s1.txt", "a.example\n*.b.example\n");
+	wfile("rl/s2.txt", "c.example\n");
+	c[0] = reloadf(NULL, RL("up2.conf", "1"));
+	REQUIRE(c[0]);
+	CHECK_EQ(c[0]->rules[1].nfiles, 2);
+	CHECK(c[0]->rules[0].files[0] == c[0]->rules[1].files[1]);
+
+	/* unchanged: same index object, same policy */
+	c[1] = reloadf(c[0], RL("up2.conf", "1"));
+	REQUIRE(c[1]);
+	idx = c[0]->idx;
+	CHECK(c[1]->idx == idx);
+	CHECK(config_same_namesets(c[0], c[1]));
+	CHECK(config_same_policy(c[0], c[1]));
+	config_free(c[0]);		/* the shared index survives */
+	c[0] = NULL;
+	CHECK_EQ(lk(c[1], "x.b.example"), 0);
+	CHECK_EQ(lk(c[1], "c.example"), 0);
+
+	/* a failed reload in between changes nothing */
+	CHECK(!reload_text(c[1], "config omnidns 'main'\n"));
+	nsc_sweep(&nsc);
+
+	/* touched and atomically replaced with identical content: still shared */
+	touch_later("rl/s1.txt", 10);
+	wfile("rl/s2.tmp", "c.example\n");
+	REQUIRE(!rename(P("rl/s2.tmp"), P("rl/s2.txt")));
+	c[2] = reloadf(c[1], RL("up2.conf", "1"));
+	REQUIRE(c[2]);
+	CHECK(c[2]->idx == idx);
+	CHECK(config_same_policy(c[1], c[2]));
+	nsc_sweep(&nsc);
+
+	/* edited file: new nameset_file, new index, different policy */
+	wfile("rl/s2.txt", "c.example\nd.example\n");
+	c[3] = reloadf(c[2], RL("up2.conf", "1"));
+	REQUIRE(c[3]);
+	CHECK(c[3]->idx != idx);
+	CHECK(!config_same_namesets(c[2], c[3]));
+	CHECK(!config_same_policy(c[2], c[3]));
+	CHECK_EQ(lk(c[3], "d.example"), 0);
+	CHECK_EQ(lk(c[2], "d.example"), 2);	/* old config keeps its view */
+	config_free(c[1]);
+	config_free(c[2]);
+	c[1] = c[2] = NULL;
+	nsc_sweep(&nsc);
+	idx = c[3]->idx;
+
+	/* changed upstream identity: index shared, policy differs */
+	c[4] = reloadf(c[3], RL("up1.conf", "1"));
+	REQUIRE(c[4]);
+	CHECK(c[4]->idx == idx);
+	CHECK(!config_same_policy(c[3], c[4]));
+
+	/* changed mark: index shared, policy differs */
+	c[5] = reloadf(c[4], RL("up1.conf", "2"));
+	REQUIRE(c[5]);
+	CHECK(c[5]->idx == idx);
+	CHECK(!config_same_policy(c[4], c[5]));
+
+	/* reordered rules: rebuilt */
+	c[6] = reloadf(c[5], GLOBAL
+	               "config rule 'r2'\n\toption action 'fakeip'\n"
+	               "\toption fwmark '2'\n\toption upstream '%s/up1.conf'\n"
+	               "\tlist nameset '%s/rl/s2.txt'\n\tlist nameset '%s/rl/s1.txt'\n"
+	               "config rule 'r1'\n\toption action 'block'\n"
+	               "\tlist nameset '%s/rl/s*.txt'\n" CATCHALL, dir, dir, dir, dir, dir);
+	REQUIRE(c[6]);
+	CHECK(c[6]->idx != idx);
+	CHECK(!config_same_policy(c[5], c[6]));
+	CHECK_EQ(lk(c[6], "x.b.example"), 0);
+
+	/* same files in another order within a rule: rebuilt (conservative) */
+	c[7] = reloadf(c[6], GLOBAL
+	               "config rule 'r2'\n\toption action 'fakeip'\n"
+	               "\toption fwmark '2'\n\toption upstream '%s/up1.conf'\n"
+	               "\tlist nameset '%s/rl/s1.txt'\n\tlist nameset '%s/rl/s2.txt'\n"
+	               "config rule 'r1'\n\toption action 'block'\n"
+	               "\tlist nameset '%s/rl/s*.txt'\n" CATCHALL, dir, dir, dir, dir, dir);
+	REQUIRE(c[7]);
+	CHECK(c[7]->idx != c[6]->idx);
+	CHECK(!config_same_policy(c[6], c[7]));
+	for (int i = 0; i < 8; i++)
+		config_free(c[i]);
+	nsc_sweep(&nsc);
+	CHECK_EQ(hmap_len(&nsc.by_path), 0);
+}
+
+TEST(reload_fwmask_policy)
+{
+	struct config *a, *b;
+
+	wfile("rl/s1.txt", "a.example\n");
+	a = reloadf(NULL, GLOBAL "config rule 'r'\n\toption action 'block'\n"
+	            "\tlist nameset '%s/rl/s1.txt'\n" CATCHALL, dir, dir);
+	REQUIRE(a);
+	/* fingerprints of these rules don't cover fwmask: still a new policy */
+	b = reloadf(a, GLOBAL "\toption fwmask '0x00ff0000'\n"
+	            "config rule 'r'\n\toption action 'block'\n"
+	            "\tlist nameset '%s/rl/s1.txt'\n" CATCHALL, dir, dir);
+	REQUIRE(b);
+	CHECK(a->idx == b->idx);
+	CHECK_EQ(a->rules[0].fingerprint, b->rules[0].fingerprint);
+	CHECK(!config_same_policy(a, b));
+	config_free(a);
+	config_free(b);
+}
+
 static int rc(const char *text, struct upstream_server *out, int max, int *skipped)
 {
 	return resolvconf_parse(text, strlen(text), out, max, skipped);
@@ -732,6 +890,8 @@ int main(void)
 	RUN(nsc_reuse);
 	RUN(unreadable_nameset);
 	RUN(fingerprints);
+	RUN(reload_shares_index);
+	RUN(reload_fwmask_policy);
 	RUN(resolvconf);
 	RUN(nameset_edge);
 	RUN(nameset_long_lines);

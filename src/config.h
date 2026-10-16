@@ -151,7 +151,10 @@ static inline const char *ns_next(const char *e)
 /*
  * Cache of parsed nameset files keyed by path. nsc_get() stats the file and
  * returns the cached parse if (dev, ino, mtime, size) are unchanged,
- * otherwise re-parses. Returns a new reference or NULL (*err = -errno) if
+ * otherwise re-parses. A re-parse yielding the same patterns as the cached
+ * entry returns that entry (with updated stat fields), so a touched or
+ * atomically replaced but identical file keeps its identity. Returns a new
+ * reference or NULL (*err = -errno) if
  * unreadable. Files with refcnt 0 are dropped by nsc_sweep().
  */
 struct nameset_cache {
@@ -231,6 +234,30 @@ struct config {
  */
 struct config *config_load(const char *path, struct nameset_cache *nsc,
                            char *err, size_t errlen);
+
+/*
+ * Like config_load(), as the successor of `prev` (NULL: plain load). If
+ * config_same_namesets(prev, new), the new config shares prev's match index
+ * instead of building one.
+ */
+struct config *config_reload(const char *path, struct nameset_cache *nsc,
+                             const struct config *prev, char *err, size_t errlen);
+
+/*
+ * True if a and b have the same rule count and catchall, and each rule
+ * (by ordinal) references the same nameset_file objects in the same order.
+ * The match index depends on nothing else, so b can share a's index, and
+ * the files it borrows are referenced by both configs.
+ */
+bool config_same_namesets(const struct config *a, const struct config *b);
+
+/*
+ * True if b resolves every name exactly like a: same match index, same
+ * fwmask, and equal rule fingerprints by ordinal. Cached answers validated
+ * against a are then valid against b, so b may keep a's generation.
+ */
+bool config_same_policy(const struct config *a, const struct config *b);
+
 void config_free(struct config *cfg);
 
 /* Shift an unshifted fwmark value into mask; returns 0 if it does not fit
