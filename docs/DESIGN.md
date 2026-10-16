@@ -375,9 +375,15 @@ output_reject      (filter, output,     filter-1):  same
 
 - **Startup**: one transaction deletes and recreates the table.
 - **Reload**: one transaction reconciles chains and rules against the
-  desired state. It never flushes maps. Mark chains are kept across reloads
+  desired state. It never flushes maps, except on an fwmask change (see
+  below). Mark chains are kept across reloads
   until the fwmask changes, because walks in flight may still bind with a
-  mark the new config no longer uses. At most 4096 mark chains are
+  mark the new config no longer uses. An fwmask change is only accepted
+  with no live binding (see [Reload](#reload)), yet a failed element batch
+  rolls back the deletes it carried, so the kernel may still hold elements
+  the binding table already dropped, jumping to an old mark chain. Their
+  chain could then never be deleted (EBUSY), so that transaction flushes
+  the four maps before it deletes the old chains. At most 4096 mark chains are
   installed, which bounds the transaction (a bootstrap is then about
   12000 messages and 2.1 MB, a reconcile replacing every chain 16000 and
   2.4 MB; the socket send buffer is 4 MB, doubled by the kernel, and must
@@ -551,7 +557,7 @@ step succeeds does it replace the old one:
 
 On any failure, the previous configuration stays in effect and the reason
 goes to syslog. Live bindings and their map elements are never touched by a
-reload. A walk that latched a mark before an fwmask change and binds after
+reload (an fwmask change, which needs none to be live, flushes the maps). A walk that latched a mark before an fwmask change and binds after
 it finds that mark's chain gone, so that query alone gets SERVFAIL.
 
 The procd service sends SIGHUP on config changes and whenever an interface

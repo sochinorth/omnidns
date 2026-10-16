@@ -841,6 +841,70 @@ TEST(fakeip_failed_batch)
 	nft_set_fail_hook(n, fail_hook, NULL);
 }
 
+/*
+ * A failed batch rolls back the deletes it carried, so the kernel may keep
+ * elements the binding table already forgot, jumping to old mark chains. An
+ * fwmask change (accepted only with no live binding) must still be able to
+ * delete those chains: it flushes the maps in the same transaction. Any
+ * other reconcile leaves the maps alone.
+ */
+TEST(reconcile_fwmask_stale_elems)
+{
+	static const uint32_t m1[] = { 0x01000000 };
+	static const uint32_t m2[] = { 0x01000000, 0x02000000 };
+	static const uint32_t m3[] = { 0x00010000 };
+	struct nft_desired d = desired(true, true, m1, 1);
+	uint8_t f1[4], r1[4], f2[4], f6[16], r6[16];
+	struct twait a, b;
+	char *o;
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	v4(f1, "198.18.0.21"); v4(r1, "10.2.1.1"); v4(f2, "198.18.0.22");
+	inet_pton(AF_INET6, "fc00::21", f6);
+	inet_pton(AF_INET6, "2001:db8::21", r6);
+	nft_elem_add(n, AF_INET, f1, r1, 0x01000000, false);
+	wait_on(&a, nft_elem_add(n, AF_INET6, f6, r6, 0x01000000, false));
+	run_loop();
+	CHECK_EQ(a.err, 0);
+	/* the delete shares a batch with an add the kernel rejects (no chain) */
+	nft_elem_del(n, AF_INET, f1);
+	nft_elem_del(n, AF_INET6, f6);
+	wait_on(&b, nft_elem_add(n, AF_INET, f2, r1, 0x05000000, false));
+	run_loop();
+	CHECK(b.err < 0);
+	CHECK_EQ(count_elems("fake2mark_v4"), 1);
+	CHECK_EQ(count_elems("fake2real_v6"), 1);
+
+	/* a reload keeping the fwmask keeps the elements */
+	d.marks = m2;
+	d.nmarks = 2;
+	CHECK_EQ(nft_reconcile(n, &d), 0);
+	CHECK_EQ(count_elems("fake2real_v4"), 1);
+	CHECK_EQ(count_elems("fake2mark_v6"), 1);
+
+	/* an fwmask change drops them with the old chains */
+	d.fwmask = 0x00ff0000;
+	d.marks = m3;
+	d.nmarks = 1;
+	CHECK_EQ(nft_reconcile(n, &d), 0);
+	CHECK(nft_mark_known(n, 0x00010000));
+	CHECK(!nft_mark_known(n, 0x01000000));
+	CHECK_EQ(count_elems("fake2real_v4"), 0);
+	CHECK_EQ(count_elems("fake2mark_v4"), 0);
+	CHECK_EQ(count_elems("fake2real_v6"), 0);
+	CHECK_EQ(count_elems("fake2mark_v6"), 0);
+	o = list_table();
+	CHECK(lacks(o, "mark_01000000"));
+	CHECK(has(o, "chain mark_00010000"));
+	free(o);
+
+	/* the maps still work */
+	wait_on(&a, nft_elem_add(n, AF_INET, f1, r1, 0x00010000, false));
+	run_loop();
+	CHECK_EQ(a.err, 0);
+	CHECK_EQ(count_elems("fake2mark_v4"), 1);
+}
+
 /* ---- real packets in the netns ---- */
 
 static int tcp_connect(const char *dst, int port)
@@ -1240,6 +1304,7 @@ int main(int argc, char **argv)
 	RUN(async_big_batch);
 	RUN(async_burst_inflight);
 	RUN(fakeip_failed_batch);
+	RUN(reconcile_fwmask_stale_elems);
 	RUN(wire_v4v6_all_marks);
 	RUN(wire_batch_max);
 	RUN(batch_buffers);

@@ -240,6 +240,16 @@ static void txn_flush_chain(struct nft_ctx *n, struct txn *t, const char *chain)
 	nftnl_rule_free(r);
 }
 
+/* A DELSETELEM without elements flushes the set. */
+static void txn_flush_set(struct nft_ctx *n, struct txn *t, const char *set)
+{
+	struct nlmsghdr *nlh = txn_msg(n, t, NFT_MSG_DELSETELEM, 0, 1024);
+
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, n->table);
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set);
+	nbuf_commit(&t->b, nlh);
+}
+
 static void txn_set(struct nft_ctx *n, struct txn *t, struct nftnl_set *s)
 {
 	struct nlmsghdr *nlh;
@@ -857,6 +867,13 @@ int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d)
 		txn_flush_chain(n, t, reject_chains[i]);
 	}
 	txn_policy_rules(n, t, &s);
+	/*
+	 * A new fwmask comes with no live binding (main.c), but a failed element
+	 * batch may have left elements jumping to an old chain, and the chain
+	 * delete would fail with EBUSY on every retry: flush the maps first.
+	 */
+	for (int i = 0; remask && i < S_NUM; i++)
+		txn_flush_set(n, t, set_names[i]);
 	for (uint32_t i = 0; i < n->sh.nmarks; i++) {
 		if (has_mark(&s, n->sh.marks[i]))
 			continue;
