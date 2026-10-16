@@ -24,11 +24,11 @@
 #include "log.h"
 #include "nft.h"
 #include "util/hash.h"
-#include "util/hmap.h"
 
 #define NFT_TABLE_MAX	64
-#define CHUNK_MAX	256		/* elements per NEWSETELEM/DELSETELEM msg */
-#define BATCH_MSG_MAX	256		/* messages per async batch */
+#define CHUNK_MAX	256		/* elements per NEWSETELEM/DESTROYSETELEM msg */
+#define PENDING_SLOTS	(2 * NFT_BATCH_MAX)	/* power of two, load <= 1/2 */
+#define SPARE_MAX	8		/* recycled struct ebatch */
 #define FAIL_RING	32
 #define RECV_TIMEOUT_MS	10000
 #define SOCK_BUF	(4 << 20)
@@ -46,6 +46,7 @@ static const char *const set_names[S_NUM] = {
 struct nbuf {
 	char *p;
 	size_t len, cap;
+	uint32_t low;		/* consecutive uses below cap / 4 (nbuf_trim) */
 };
 
 /* One transaction under construction: BEGIN, msgs (all NLM_F_ACK), END. */
@@ -54,29 +55,22 @@ struct txn {
 	uint32_t seq_first, seq_last, nmsg;
 };
 
-struct echunk {
-	struct list_head list;
-	int type;
-	uint32_t n;
-	struct nftnl_set *s;
-};
-
 struct ebatch {
 	struct list_head list;
 	uint64_t ticket;
-	/*
-	 * chunks and added exist only while the batch is open: they are
-	 * freed as soon as nft_flush() has serialised it (batch_release_elems).
-	 * [set * 2 + 0] destroys, [set * 2 + 1] adds; destroys are sent first.
-	 */
-	struct list_head chunks[S_NUM * 2];
-	struct hmap added;		/* struct ekey: keys with a pending add */
-	uint32_t nops, nmsgs;
+	uint32_t nops;
 	uint32_t seq_first, seq_last, acks_left;
 	int err;
 };
 
-struct ekey {
+/* encoded elements of the open batch for one (set, phase), see queue_elem() */
+struct ebuf {
+	struct nbuf b;		/* closed messages, then the open one */
+	uint32_t nelem;		/* elements in the open message, 0: none open */
+	uint32_t nest_off;	/* NFTA_SET_ELEM_LIST_ELEMENTS in the open message */
+};
+
+struct pend_key {
 	uint8_t family;
 	uint8_t addr[16];
 };
@@ -102,7 +96,15 @@ struct nft_ctx {
 	struct uloop_fd ufd;
 	struct uloop_timeout submit_tmo, ready_tmo, kick_tmo;
 	struct ebatch *open;
+	struct ebatch *spare[SPARE_MAX];
+	uint32_t nspare;
 	struct list_head inflight;
+	struct txn etx;				/* element batch being sent */
+	struct ebuf ebuf[S_NUM * 2];		/* [set * 2 + add] */
+	uint16_t pend_gen;			/* generation of the open batch */
+	uint32_t pend_n;
+	uint32_t pend_slot[PENDING_SLOTS];	/* gen << 16 | pend_key index + 1 */
+	struct pend_key pend_key[NFT_BATCH_MAX];
 	struct list_head waiters, ready;
 	uint64_t next_ticket;
 	void (*fail_fn)(void *priv, uint64_t ticket, int err);
@@ -126,7 +128,7 @@ static void *oom(void *p)
 
 static void nbuf_reserve(struct nbuf *b, size_t n)
 {
-	size_t cap = b->cap ? b->cap : 16384;
+	size_t cap = b->cap ? b->cap : 1024;
 
 	if (b->len + n <= b->cap)
 		return;
@@ -830,45 +832,77 @@ int nft_destroy_table(struct nft_ctx *n)
 
 /* ---- async element batches ---- */
 
+/*
+ * Elements of the open batch are encoded straight into netlink messages, one
+ * persistent buffer per (set, phase), in the exact layout libnftnl's
+ * nftnl_set_elems_nlmsg_build_payload() produces:
+ *
+ *   nlmsghdr + nfgenmsg (NFPROTO_INET), seq filled in at flush
+ *   NFTA_SET_ELEM_LIST_SET     "fake2real_v4" ...
+ *   NFTA_SET_ELEM_LIST_TABLE   table
+ *   NFTA_SET_ELEM_LIST_ELEMENTS (nested)
+ *     [1..CHUNK_MAX] (nested; libnftnl numbers the elements, the kernel
+ *                     ignores the attribute type)
+ *       NFTA_SET_ELEM_KEY  { NFTA_DATA_VALUE fake }
+ *       NFTA_SET_ELEM_DATA { NFTA_DATA_VALUE real }                (adds, real)
+ *       NFTA_SET_ELEM_DATA { NFTA_DATA_VERDICT { NFTA_VERDICT_CODE NFT_JUMP,
+ *                            NFTA_VERDICT_CHAIN "mark_%08x" } }   (adds, mark)
+ *
+ * A message is closed at CHUNK_MAX elements (the ELEMENTS nest length is 16
+ * bits: 256 elements of at most 64 bytes stay well below it). nft_flush()
+ * copies the messages, destroys first, into the transaction buffer between
+ * BEGIN and END, numbering them.
+ */
+#define EBUF_FLOOR	1024		/* per (set, phase) buffer */
+#define ETX_FLOOR	4096		/* transaction buffer */
+#define NBUF_LOW_RUN	64
+/* message head (<= 112 bytes with a NFT_TABLE_MAX table name) + one element
+ * (<= 64 bytes: a v6 key and a jump verdict) */
+#define ELEM_ROOM	256
+
+/*
+ * Shrink back after a burst: halve once NBUF_LOW_RUN consecutive batches used
+ * at most a quarter of the capacity (the run keeps batch sizes that merely
+ * vary from bouncing between two sizes), never below `floor`.
+ */
+static void nbuf_trim(struct nbuf *b, size_t used, size_t floor)
+{
+	if (b->cap <= floor || used > b->cap / 4) {
+		b->low = 0;
+		return;
+	}
+	if (++b->low < NBUF_LOW_RUN)
+		return;
+	b->low = 0;
+	b->cap /= 2;
+	b->p = oom(realloc(b->p, b->cap));
+}
+
 static struct ebatch *batch_new(struct nft_ctx *n)
 {
-	struct ebatch *b = oom(calloc(1, sizeof(*b)));
+	struct ebatch *b;
 
+	if (n->nspare)
+		b = n->spare[--n->nspare];
+	else
+		b = oom(malloc(sizeof(*b)));
+	memset(b, 0, sizeof(*b));
 	b->ticket = n->next_ticket++;
-	for (int i = 0; i < S_NUM * 2; i++)
-		INIT_LIST_HEAD(&b->chunks[i]);
+	/* new pending-add generation: older slots read as empty */
+	if (!++n->pend_gen) {
+		memset(n->pend_slot, 0, sizeof(n->pend_slot));
+		n->pend_gen = 1;
+	}
+	n->pend_n = 0;
 	return b;
 }
 
-/*
- * Free the element objects and the pending-add keys. They are only needed
- * while the batch is open (ordering checks) and to serialise it; once it is
- * sent, completion and failure handling use only the ticket, the sequence
- * range and the ack count. Idempotent.
- */
-static void batch_release_elems(struct ebatch *b)
+static void batch_free(struct nft_ctx *n, struct ebatch *b)
 {
-	uint32_t it = 0;
-	void *k;
-
-	while ((k = hmap_next(&b->added, &it)))
-		free(k);
-	hmap_free(&b->added);
-	for (int i = 0; i < S_NUM * 2; i++) {
-		struct echunk *c, *tmp;
-
-		list_for_each_entry_safe(c, tmp, &b->chunks[i], list) {
-			nftnl_set_free(c->s);
-			free(c);
-		}
-		INIT_LIST_HEAD(&b->chunks[i]);
-	}
-}
-
-static void batch_free(struct ebatch *b)
-{
-	batch_release_elems(b);
-	free(b);
+	if (n->nspare < SPARE_MAX)
+		n->spare[n->nspare++] = b;
+	else
+		free(b);
 }
 
 static int fail_lookup(const struct nft_ctx *n, uint64_t ticket)
@@ -896,7 +930,7 @@ static void batch_complete(struct nft_ctx *n, struct ebatch *b, int err)
 	LIST_HEAD(done);
 
 	list_del(&b->list);
-	batch_free(b);
+	batch_free(n, b);
 	if (err) {
 		log_err("nft: element batch %llu failed: %s",
 			(unsigned long long)ticket, strerror(-err));
@@ -928,41 +962,63 @@ static void kick_cb(struct uloop_timeout *tmo)
 	complete_failed(container_of(tmo, struct nft_ctx, kick_tmo));
 }
 
-static void batch_build(struct nft_ctx *n, struct ebatch *b, struct txn *t)
+static void ebuf_close(struct ebuf *e)
 {
-	txn_begin(n, t);
-	for (int phase = 0; phase < 2; phase++) {
-		for (int i = 0; i < S_NUM; i++) {
-			struct echunk *c;
+	struct nlmsghdr *nlh = (struct nlmsghdr *)(e->b.p + e->b.len);
 
-			list_for_each_entry(c, &b->chunks[i * 2 + phase], list)
-				txn_elems(n, t, c->type, c->s, c->n);
-		}
+	if (!e->nelem)
+		return;
+	mnl_attr_nest_end(nlh, (struct nlattr *)((char *)nlh + e->nest_off));
+	e->b.len += MNL_ALIGN(nlh->nlmsg_len);
+	e->nelem = 0;
+}
+
+/* Append the closed messages of `e` to `t`, numbering them; empty `e`. */
+static void ebuf_move(struct nft_ctx *n, struct ebuf *e, struct txn *t)
+{
+	size_t used;
+
+	ebuf_close(e);
+	used = e->b.len;
+	nbuf_reserve(&t->b, e->b.len);
+	for (size_t off = 0; off < e->b.len;) {
+		struct nlmsghdr *nlh = (struct nlmsghdr *)(t->b.p + t->b.len);
+		size_t len = MNL_ALIGN(((struct nlmsghdr *)(e->b.p + off))->nlmsg_len);
+
+		memcpy(nlh, e->b.p + off, len);
+		nlh->nlmsg_seq = n->seq++;
+		t->b.len += len;
+		t->nmsg++;
+		off += len;
 	}
-	txn_end(n, t);
+	e->b.len = 0;
+	nbuf_trim(&e->b, used, EBUF_FLOOR);
 }
 
 void nft_flush(struct nft_ctx *n)
 {
 	struct ebatch *b = n->open;
-	struct txn t = { 0 };
+	struct txn *t = &n->etx;
 
 	uloop_timeout_cancel(&n->submit_tmo);
 	if (!b)
 		return;
 	n->open = NULL;
-	batch_build(n, b, &t);
-	/* closed and serialised: the elements are never read again */
-	batch_release_elems(b);
-	b->seq_first = t.seq_first;
-	b->seq_last = t.seq_last;
-	b->acks_left = t.nmsg;
+	txn_begin(n, t);
+	/* [set * 2 + 0] destroys, [set * 2 + 1] adds; destroys go first */
+	for (int phase = 0; phase < 2; phase++)
+		for (int i = 0; i < S_NUM; i++)
+			ebuf_move(n, &n->ebuf[i * 2 + phase], t);
+	txn_end(n, t);
+	b->seq_first = t->seq_first;
+	b->seq_last = t->seq_last;
+	b->acks_left = t->nmsg;
 	list_add_tail(&b->list, &n->inflight);
-	if (mnl_socket_sendto(n->async, t.b.p, t.b.len) < 0) {
+	if (mnl_socket_sendto(n->async, t->b.p, t->b.len) < 0) {
 		b->err = -errno;
 		uloop_timeout_set(&n->kick_tmo, 0);
 	}
-	free(t.b.p);
+	nbuf_trim(&t->b, t->b.len, ETX_FLOOR);
 }
 
 static void submit_cb(struct uloop_timeout *tmo)
@@ -970,33 +1026,50 @@ static void submit_cb(struct uloop_timeout *tmo)
 	nft_flush(container_of(tmo, struct nft_ctx, submit_tmo));
 }
 
-static void append_elem(struct nft_ctx *n, int set, int type, struct nftnl_set_elem *e)
+/*
+ * Encode one element into the (set, phase) buffer: key only (destroy), key
+ * and data (add to fake2real) or key and jump verdict (add to fake2mark).
+ */
+static void queue_elem(struct nft_ctx *n, int set, bool add, const uint8_t *key,
+                       uint32_t alen, const uint8_t *real, uint32_t mark)
 {
-	struct ebatch *b = n->open;
-	struct list_head *head = &b->chunks[set * 2 + (type == NFT_MSG_NEWSETELEM)];
-	struct echunk *c = NULL;
+	struct ebuf *e = &n->ebuf[set * 2 + add];
+	struct nlmsghdr *nlh;
+	struct nlattr *elem, *data, *verdict, *k;
+	char chain[32];
 
-	if (!list_empty(head))
-		c = list_last_entry(head, struct echunk, list);
-	if (!c || c->type != type || c->n >= CHUNK_MAX) {
-		c = oom(calloc(1, sizeof(*c)));
-		c->type = type;
-		c->s = oom(nftnl_set_alloc());
-		nftnl_set_set_str(c->s, NFTNL_SET_TABLE, n->table);
-		nftnl_set_set_str(c->s, NFTNL_SET_NAME, set_names[set]);
-		list_add_tail(&c->list, head);
-		b->nmsgs++;
+	if (e->nelem == CHUNK_MAX)
+		ebuf_close(e);
+	nbuf_reserve(&e->b, ELEM_ROOM +
+	             (e->nelem ? ((struct nlmsghdr *)(e->b.p + e->b.len))->nlmsg_len : 0));
+	nlh = (struct nlmsghdr *)(e->b.p + e->b.len);
+	if (!e->nelem) {
+		nlh = nftnl_nlmsg_build_hdr((char *)nlh,
+		        add ? NFT_MSG_NEWSETELEM : NFT_MSG_DESTROYSETELEM, NFPROTO_INET,
+		        (add ? NLM_F_CREATE : 0) | NLM_F_ACK, 0);
+		mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set_names[set]);
+		mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, n->table);
+		e->nest_off = nlh->nlmsg_len;
+		mnl_attr_nest_start(nlh, NFTA_SET_ELEM_LIST_ELEMENTS);
 	}
-	nftnl_set_elem_add(c->s, e);
-	c->n++;
-}
-
-static struct nftnl_set_elem *elem_key(const uint8_t *key, uint32_t len)
-{
-	struct nftnl_set_elem *e = oom(nftnl_set_elem_alloc());
-
-	nftnl_set_elem_set(e, NFTNL_SET_ELEM_KEY, key, len);
-	return e;
+	elem = mnl_attr_nest_start(nlh, (uint16_t)++e->nelem);
+	k = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_KEY);
+	mnl_attr_put(nlh, NFTA_DATA_VALUE, alen, key);
+	mnl_attr_nest_end(nlh, k);
+	if (add) {
+		data = mnl_attr_nest_start(nlh, NFTA_SET_ELEM_DATA);
+		if (real) {
+			mnl_attr_put(nlh, NFTA_DATA_VALUE, alen, real);
+		} else {
+			mark_chain_name(chain, mark);
+			verdict = mnl_attr_nest_start(nlh, NFTA_DATA_VERDICT);
+			mnl_attr_put_u32(nlh, NFTA_VERDICT_CODE, htonl((uint32_t)NFT_JUMP));
+			mnl_attr_put_strz(nlh, NFTA_VERDICT_CHAIN, chain);
+			mnl_attr_nest_end(nlh, verdict);
+		}
+		mnl_attr_nest_end(nlh, data);
+	}
+	mnl_attr_nest_end(nlh, elem);
 }
 
 /*
@@ -1008,8 +1081,8 @@ static struct nftnl_set_elem *elem_key(const uint8_t *key, uint32_t len)
 static void queue_destroy(struct nft_ctx *n, int real, int mark, const uint8_t *fake,
                           uint32_t alen)
 {
-	append_elem(n, real, NFT_MSG_DESTROYSETELEM, elem_key(fake, alen));
-	append_elem(n, mark, NFT_MSG_DESTROYSETELEM, elem_key(fake, alen));
+	queue_elem(n, real, false, fake, alen, NULL, 0);
+	queue_elem(n, mark, false, fake, alen, NULL, 0);
 }
 
 static uint64_t op_done(struct nft_ctx *n)
@@ -1018,47 +1091,50 @@ static uint64_t op_done(struct nft_ctx *n)
 	uint64_t ticket = b->ticket;
 
 	b->nops++;
-	if (b->nops >= NFT_BATCH_MAX || b->nmsgs >= BATCH_MSG_MAX)
+	if (b->nops >= NFT_BATCH_MAX)
 		nft_flush(n);
 	else if (b->nops == 1)
 		uloop_timeout_set(&n->submit_tmo, 0);
 	return ticket;
 }
 
-static bool ekey_eq(const void *val, const void *key, void *ctx)
-{
-	return !memcmp(val, key, sizeof(struct ekey));
-}
-
-static void ekey_make(struct ekey *k, int family, const uint8_t *fake)
-{
-	memset(k, 0, sizeof(*k));
-	k->family = family == AF_INET6 ? 6 : 4;
-	memcpy(k->addr, fake, family == AF_INET6 ? 16 : 4);
-}
-
 /*
  * Destroys are emitted before adds within a batch, which is only correct
  * while each key has at most one add and nothing after it. A second op on
  * a key with a pending add therefore starts a new batch.
+ *
+ * Keys with a pending add live in a fixed open-addressing table (at most
+ * NFT_BATCH_MAX adds per batch, load <= 1/2): slots hold the batch's
+ * generation and an index into pend_key, so a new batch empties the table
+ * by bumping the generation.
  */
 static void op_order_key(struct nft_ctx *n, int family, const uint8_t *fake, bool add)
 {
-	struct ekey k, *nk;
-	uint64_t h;
+	struct pend_key k = { 0 };
+	uint32_t h, s, slot = 0;
 
-	ekey_make(&k, family, fake);
-	h = omni_hash(&k, sizeof(k));
-	if (n->open && hmap_get(&n->open->added, h, &k, ekey_eq, NULL))
-		nft_flush(n);
+	k.family = family == AF_INET6 ? 6 : 4;
+	memcpy(k.addr, fake, family == AF_INET6 ? 16 : 4);
+	h = (uint32_t)omni_hash(&k, sizeof(k));
+	if (n->open) {
+		for (s = h; ; s++) {
+			slot = n->pend_slot[s & (PENDING_SLOTS - 1)];
+			if (slot >> 16 != n->pend_gen)
+				break;
+			if (!memcmp(&n->pend_key[(slot & 0xffff) - 1], &k, sizeof(k))) {
+				nft_flush(n);
+				break;
+			}
+		}
+	}
 	if (!add)
 		return;
 	if (!n->open)
 		n->open = batch_new(n);
-	nk = oom(malloc(sizeof(*nk)));
-	*nk = k;
-	if (hmap_put(&n->open->added, h, nk))
-		oom(NULL);
+	for (s = h; n->pend_slot[s & (PENDING_SLOTS - 1)] >> 16 == n->pend_gen; s++)
+		;
+	n->pend_key[n->pend_n++] = k;
+	n->pend_slot[s & (PENDING_SLOTS - 1)] = (uint32_t)n->pend_gen << 16 | n->pend_n;
 }
 
 /* accepts 4/6 as well as AF_INET/AF_INET6 */
@@ -1093,8 +1169,6 @@ uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
 	bool v6;
 	int rs, ms;
 	uint32_t alen;
-	struct nftnl_set_elem *e;
-	char chain[32];
 
 	family = norm_family(family);
 	if (!op_begin(n, family))
@@ -1105,16 +1179,8 @@ uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
 	ms = v6 ? S_MARK6 : S_MARK4;
 	alen = v6 ? 16 : 4;
 	queue_destroy(n, rs, ms, fake, alen);
-
-	e = elem_key(fake, alen);
-	nftnl_set_elem_set(e, NFTNL_SET_ELEM_DATA, real, alen);
-	append_elem(n, rs, NFT_MSG_NEWSETELEM, e);
-
-	mark_chain_name(chain, mark);
-	e = elem_key(fake, alen);
-	nftnl_set_elem_set_u32(e, NFTNL_SET_ELEM_VERDICT, NFT_JUMP);
-	nftnl_set_elem_set_str(e, NFTNL_SET_ELEM_CHAIN, chain);
-	append_elem(n, ms, NFT_MSG_NEWSETELEM, e);
+	queue_elem(n, rs, true, fake, alen, real, 0);
+	queue_elem(n, ms, true, fake, alen, NULL, mark);
 	return op_done(n);
 }
 
@@ -1132,6 +1198,15 @@ uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 	queue_destroy(n, v6 ? S_REAL6 : S_REAL4, v6 ? S_MARK6 : S_MARK4, fake,
 	          v6 ? 16 : 4);
 	return op_done(n);
+}
+
+size_t nft_batch_mem(const struct nft_ctx *n)
+{
+	size_t sum = n->etx.b.cap;
+
+	for (int i = 0; i < S_NUM * 2; i++)
+		sum += n->ebuf[i].b.cap;
+	return sum;
 }
 
 bool nft_ticket_done(const struct nft_ctx *n, uint64_t ticket)
@@ -1318,9 +1393,14 @@ void nft_close(struct nft_ctx *n)
 	uloop_timeout_cancel(&n->kick_tmo);
 	uloop_fd_delete(&n->ufd);
 	if (n->open)
-		batch_free(n->open);
+		batch_free(n, n->open);
 	list_for_each_entry_safe(b, tmp, &n->inflight, list)
-		batch_free(b);
+		batch_free(n, b);
+	while (n->nspare)
+		free(n->spare[--n->nspare]);
+	free(n->etx.b.p);
+	for (int i = 0; i < S_NUM * 2; i++)
+		free(n->ebuf[i].b.p);
 	list_for_each_entry_safe(w, wt, &n->waiters, list)
 		list_del_init(&w->list);
 	list_for_each_entry_safe(w, wt, &n->ready, list)

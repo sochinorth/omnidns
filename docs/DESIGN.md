@@ -335,6 +335,14 @@ output_reject      (filter, output,     filter-1):  same
     operation on a key that already has a pending add starts a new batch.
   - **Failure**: if a batch fails, the bindings it carried are dropped and
     their waiters get SERVFAIL.
+  - **Encoding**: elements are encoded straight into netlink messages (256
+    elements each, the same bytes libnftnl would produce), one persistent
+    buffer per map and phase, and copied into a persistent transaction
+    buffer at submission. Keys with a pending add sit in a fixed
+    open-addressing table emptied per batch. In steady state an element
+    update allocates nothing; buffers grown by a burst (at most a few
+    hundred KB at 1024 operations) halve after 64 batches that use under a
+    quarter of them.
 
 ## Answer cache
 

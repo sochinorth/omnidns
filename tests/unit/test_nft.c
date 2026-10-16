@@ -529,7 +529,7 @@ TEST(async_big_batch)
 
 /*
  * Several batches in flight at once (each flushed synchronously at
- * NFT_BATCH_MAX ops, so their element objects are already freed when the
+ * NFT_BATCH_MAX ops, so their encoded elements are already gone when the
  * acks arrive), one of them failing in the kernel.
  */
 TEST(async_burst_inflight)
@@ -629,7 +629,7 @@ TEST(fakeip_failed_batch)
 	memcpy(afake, a->fake, 4);
 	memcpy(bfake, b->fake, 4);
 	fakeip_ref(a);		/* a cache entry still holds it */
-	nft_flush(n);		/* sent; element objects released */
+	nft_flush(n);		/* sent; encoded elements discarded */
 	c = fakeip_bind(db, "r", 0x02000000, (const uint8_t *)"\1c\0", 3, 4, r, 60, &err);
 	REQUIRE(c);
 	CHECK(c->ticket > a->ticket);
@@ -999,6 +999,43 @@ TEST(wire_batch_max)
 	CHECK_EQ(count_elems("fake2real_v4"), 547);
 }
 
+/* batches of one shape reuse the buffers; a burst's growth decays again */
+TEST(batch_buffers)
+{
+	struct nft_desired d = desired(true, true, wire_marks, 3);
+	struct rop r = { .add = true, .mark = 0x02000000, .real = { 10, 0, 0, 9 } };
+	size_t warm, peak;
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	nfails = 0;
+	for (int round = 0; round < 6; round++) {
+		for (uint32_t i = 0; i < 300; i++) {
+			rop_key(&r, i & 1 ? 6 : 4, i);
+			r.add = i % 7 != 0;
+			rop_queue(&r);
+		}
+		CHECK_EQ(nft_drain(n), 0);
+		if (round == 1)
+			warm = nft_batch_mem(n);
+		else if (round > 1)
+			CHECK_EQ(nft_batch_mem(n), warm);
+	}
+	wire_burst(NFT_BATCH_MAX);
+	peak = nft_batch_mem(n);
+	CHECK(peak >= warm);
+	CHECK(peak <= 1024 * 1024);
+	/* single-op batches: each buffer halves after every 64 of them,
+	 * down to its floor */
+	for (int i = 0; i < 8 * 64; i++) {
+		rop_key(&r, 4, 5000);
+		r.add = true;
+		rop_queue(&r);
+		CHECK_EQ(nft_drain(n), 0);
+	}
+	CHECK(nft_batch_mem(n) <= 8 * 1024 + 4096);
+	CHECK_EQ(nfails, 0);
+}
+
 int main(int argc, char **argv)
 {
 	test_require_netns(argv);
@@ -1023,6 +1060,7 @@ int main(int argc, char **argv)
 	RUN(fakeip_failed_batch);
 	RUN(wire_v4v6_all_marks);
 	RUN(wire_batch_max);
+	RUN(batch_buffers);
 	RUN(packets);
 	RUN(destroy);
 	nft_close(n);

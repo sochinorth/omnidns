@@ -3,6 +3,7 @@
 #define OMNI_NFT_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <libubox/list.h>
 
@@ -46,8 +47,10 @@
  * Control-plane operations (bootstrap/reconcile) are synchronous netlink
  * transactions. Element updates are queued into an open batch which is
  * submitted asynchronously (from a uloop timeout of 0 ms, or immediately
- * when it reaches NFT_BATCH_MAX elements); completion is tracked by
- * "tickets" (monotonic batch sequence numbers).
+ * when it reaches NFT_BATCH_MAX operations); completion is tracked by
+ * "tickets" (monotonic batch sequence numbers). Elements are encoded
+ * straight into persistent netlink buffers (see nft.c), which grow during
+ * a burst and shrink back afterwards.
  */
 
 #define NFT_BATCH_MAX 1024
@@ -123,5 +126,8 @@ void nft_wait_cancel(struct nft_waiter *w);	/* safe if not waiting */
 void nft_flush(struct nft_ctx *n);
 /* Block until all submitted batches are acked (shutdown/tests). */
 int nft_drain(struct nft_ctx *n);
+
+/* Bytes currently held by the element batch buffers (tests/diagnostics). */
+size_t nft_batch_mem(const struct nft_ctx *n);
 
 #endif
