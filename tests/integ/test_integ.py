@@ -249,8 +249,8 @@ EOF""")
         cmd = "%s -c %s" % (sys.executable, sh_quote(code))
         return (sh(cmd) if router else self.cl(cmd)).strip()
 
-    def nft_map(self, name):
-        out = json.loads(sh("nft -j list map inet %s %s" % (TABLE, name)))
+    def nft_map(self, name, table=TABLE):
+        out = json.loads(sh("nft -j list map inet %s %s" % (table, name)))
         for o in out["nftables"]:
             if "map" in o:
                 return {e[0]: e[1] for e in o["map"].get("elem", [])}
@@ -509,6 +509,83 @@ def reload_noop_keeps_generation(env):
     env.hup()
     check(answers(env.q("plain.test", "A"), "A") == [REAL_B], "plain.test after restore")
     check(answers(env.q("warp.test", "A"), "A") == [fake], "same fake after restore")
+
+
+@test
+def rejected_fwmask_reload_keeps_cache(env):
+    """Bindings are live, so an fwmask change is rejected: the cache (and the
+    bindings its answers pin) must survive the rejected reload."""
+    fake = answers(env.q("warp.test", "A"), "A")[0]
+    check(in_pool(fake), "no fake for warp.test")
+    check(answers(env.q("plain.test", "A"), "A") == [REAL_B], "plain.test")
+    env.clear_upstream_logs()
+    env.write_config(CONFIG.replace("0xff000000", "0x0000ff00"))
+    off = len(env.daemon_log())
+    env.hup()
+    check("fwmask change rejected" in env.daemon_log()[off:],
+          "fwmask change not rejected:\n" + env.daemon_log()[off:])
+    check(answers(env.q("plain.test", "A"), "A") == [REAL_B], "plain.test after")
+    check(answers(env.q("warp.test", "A"), "A") == [fake], "warp.test after")
+    check(not env.upstream_log("isp") and not env.upstream_log("cf"),
+          "cache flushed by a rejected reload: %r %r"
+          % (env.upstream_log("isp"), env.upstream_log("cf")))
+    env.write_config(CONFIG)
+    env.hup()
+
+
+@test
+def accepted_fwmask_reload_flushes_cache(env):
+    """With no live bindings an fwmask change is accepted: cached answers are
+    dropped and new bindings jump to mark chains under the new mask. Runs a
+    second daemon (own port, table and pool), as the main one has bindings."""
+    table, port = TABLE + "f", 5398
+    d = env.dir + "/fwmask"
+    os.makedirs(d, exist_ok=True)
+    cfg = (CONFIG.replace("option port '53'", "option port '%d'" % port)
+           .replace("198.18.0.0/15", "100.64.0.0/16"))
+
+    def config(text):
+        with open(d + "/omnidns", "w") as f:
+            f.write(text.format(lan=LAN, d=env.dir))
+
+    def log():
+        with open(d + "/daemon.log") as f:
+            return f.read()
+
+    def q(name):
+        return answers(dnsmini.query(LAN, port, name, "A"), "A")
+
+    config(cfg)
+    lf = open(d + "/daemon.log", "a")
+    p = subprocess.Popen([env.binary, "-f", "-t", table, "-x", "-c", d + "/omnidns"],
+                         stdout=lf, stderr=lf)
+    try:
+        for _ in range(100):
+            try:
+                dnsmini.query(LAN, port, "plain.test", "A", timeout=0.2)
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("second daemon did not come up:\n" + log()[-800:])
+        check(q("plain.test") == [REAL_B], "plain.test")
+        env.clear_upstream_logs()
+        config(cfg.replace("0xff000000", "0x00ff0000"))
+        off = len(log())
+        p.send_signal(signal.SIGHUP)
+        time.sleep(0.5)
+        check("configuration reloaded" in log()[off:], "fwmask reload failed:\n" + log()[off:])
+        check(q("plain.test") == [REAL_B], "plain.test after")
+        check(env.upstream_log("isp"), "cache not flushed by an fwmask change")
+        fake = q("warp.test")[0]
+        check(fake.startswith("100.64."), "no fake for warp.test: %r" % fake)
+        check("0x00010000" in sh("nft list chain inet %s mark_00010000" % table),
+              "no mark chain under the new mask")
+        check(env.nft_map("fake2real_v4", table).get(fake) == REAL_A,
+              "binding missing under the new mask")
+    finally:
+        p.terminate()
+        p.wait(10)
 
 
 @test
