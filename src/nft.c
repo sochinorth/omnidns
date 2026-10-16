@@ -688,6 +688,11 @@ static bool has_mark(const struct shadow *s, uint32_t v)
 	return bsearch(&v, s->marks, s->nmarks, sizeof(v), cmp_u32) != NULL;
 }
 
+bool nft_mark_known(const struct nft_ctx *n, uint32_t mark)
+{
+	return n->have_state && has_mark(&n->sh, mark);
+}
+
 /* ---- control plane ---- */
 
 int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d)

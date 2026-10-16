@@ -27,6 +27,11 @@ uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 	return 1;
 }
 
+bool nft_mark_known(const struct nft_ctx *n, uint32_t mark)
+{
+	return true;
+}
+
 void nft_set_fail_hook(struct nft_ctx *n, void (*fn)(void *priv, uint64_t ticket, int err),
                        void *priv)
 {

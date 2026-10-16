@@ -83,7 +83,8 @@ bool fakeip_has_pool(const struct fakeip_db *db, int family);
  * Get or create the binding for the key and extend
  *   safe_until = max(safe_until, now + ttl + grace).
  * New/reclaimed bindings queue nft ops. Returns NULL with *err =
- * -EAFNOSUPPORT (no pool for family), -ENOSPC (exhausted), -ENOMEM.
+ * -EAFNOSUPPORT (no pool for family), -ESTALE (no nft chain for `mark`:
+ * a walk latched it before an fwmask change), -ENOSPC (exhausted), -ENOMEM.
  */
 struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t mark,
                             const uint8_t *endpoint, uint8_t endpoint_len,

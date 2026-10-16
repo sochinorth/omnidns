@@ -78,6 +78,10 @@ int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d);
  */
 int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d);
 
+/* true if chain mark_<mark> exists (desired at the last successful
+ * bootstrap/reconcile), i.e. nft_elem_add() with this mark can succeed. */
+bool nft_mark_known(const struct nft_ctx *n, uint32_t mark);
+
 /* Delete the whole table (shutdown with -x / tests). Sync. */
 int nft_destroy_table(struct nft_ctx *n);
 

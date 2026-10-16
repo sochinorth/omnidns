@@ -507,6 +507,16 @@ struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t 
 		*err = -EAFNOSUPPORT;
 		return NULL;
 	}
+	/*
+	 * A walk that latched its mark before a reload changed the fwmask
+	 * would queue an element jumping to a deleted chain, failing the whole
+	 * batch and with it every unrelated binding in it. Fail only this one.
+	 * (Existing bindings always have a known mark, see kept_marks in main.c.)
+	 */
+	if (!nft_mark_known(db->nft, mark)) {
+		*err = -ESTALE;
+		return NULL;
+	}
 	memcpy(ep, endpoint, endpoint_len);
 	dns_name_lower(ep, endpoint_len);
 	khash = key_hash(db, &k);

@@ -42,9 +42,8 @@ static bool log_to_stderr;
  * kept_marks is carried into the new desired state, so no chain a binding
  * uses is deleted. An fwmask change is only accepted once the DB is empty
  * (live bindings reject it, expired ones are evicted). A walk that latched
- * a mark before the change and binds after it cannot break this either:
- * its batch fails (the chain is gone) and is drained before the next
- * reconcile.
+ * a mark before the change and binds after it is refused by fakeip_bind()
+ * (nft_mark_known(): the chain is gone), so it never creates a binding.
  */
 static uint32_t kept_marks[MAX_MARKS];
 static uint32_t nkept_marks;

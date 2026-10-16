@@ -109,6 +109,14 @@ void nft_set_fail_hook(struct nft_ctx *n, void (*fn)(void *priv, uint64_t ticket
 	fail_priv = priv;
 }
 
+/* marks without a chain (deleted by an fwmask change) */
+static uint32_t dead_mark = 0xdead;
+
+bool nft_mark_known(const struct nft_ctx *n, uint32_t mark)
+{
+	return mark != dead_mark;
+}
+
 bool nft_ticket_done(const struct nft_ctx *n, uint64_t ticket)
 {
 	return ticket < cur_ticket;
@@ -606,6 +614,23 @@ TEST(set_config)
 	fakeip_free(db);
 }
 
+TEST(stale_mark)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db = fakeip_new(&p4, NULL, 100, 0, SECRET, NFT);
+	int err = 0;
+
+	reset();
+	REQUIRE(bind4(db, "r", 7, "a.example", 1, 60, &err));
+	CHECK(!bind4(db, "r", dead_mark, "b.example", 1, 60, &err));
+	CHECK_EQ(err, -ESTALE);
+	CHECK_EQ(fakeip_count(db), 1);
+	CHECK_EQ(n_add, 1);
+	CHECK_EQ(n_kern, 1);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
 TEST(capacity)
 {
 	struct ip_prefix p4 = pfx("198.18.0.0", 15);
@@ -903,6 +928,7 @@ int main(void)
 	RUN(v6_pools);
 	RUN(fail_hook);
 	RUN(set_config);
+	RUN(stale_mark);
 	RUN(capacity);
 	RUN(stress);
 	RUN(pinned);

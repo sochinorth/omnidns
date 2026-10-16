@@ -41,6 +41,7 @@ static int nscripts;
 static char qlog[4096];
 static int nqueries, live_handles;
 static void (*after_cb)(void);
+static struct upstream_query *last_q;
 
 struct upstream_query {
 	struct uloop_timeout t;
@@ -278,6 +279,7 @@ struct upstream_query *upstream_query(struct upstream_set *u,
 		    scripts[i].qtype == qtype)
 			q->s = &scripts[i];
 	live_handles++;
+	last_q = q;
 	if (!q->s || q->s->err != HOLD)
 		uloop_timeout_set(&q->t, 0);
 	return q;
@@ -1202,6 +1204,103 @@ TEST(t_other_qtypes_steered)
 	CHECK_EQ(count(DNS_S_AR), 0);
 }
 
+struct pending {
+	int ncb;
+	struct dns_msg m;
+};
+
+static int npending;
+
+static void pending_cb(void *ctx, const struct dns_msg *m)
+{
+	struct pending *p = ctx;
+
+	p->ncb++;
+	dns_msg_copy(&p->m, m);
+	if (!--npending)
+		uloop_end();
+}
+
+static struct resolve_req *start_pending(const char *qname, struct pending *p)
+{
+	struct dns_name n = N(qname);
+	struct resolve_req *r;
+	struct dns_msg q;
+
+	dns_msg_init(&q);
+	dns_msg_set_question(&q, n.data, n.len, DNS_T_A, DNS_C_IN);
+	q.flags = DNS_F_RD;
+	r = resolve_start(&o, &q, pending_cb, p);
+	dns_msg_free(&q);
+	if (r)
+		npending++;
+	return r;
+}
+
+/*
+ * A walk latched a mark before a reload changed the fwmask (which deletes
+ * the old mark chains) and binds after it. Only that walk may fail: a
+ * fresh query whose binding lands in the same nft batch must still get
+ * its fake.
+ */
+TEST(u_fwmask_change_in_flight)
+{
+	const char *remasked = "config omnidns 'main'\n\tlist listen_addr '127.0.0.1'\n"
+		"\toption fakeip_v4 '198.18.0.0/15'\n\toption fwmask '0x00ff0000'\n" RULES;
+	struct pending stale = { 0 }, fresh = { 0 };
+	uint32_t marks[2] = { 0x00010000u, 0x00020000u };
+	struct nft_desired d = { 0 };
+	struct upstream_query *held;
+	struct config *ncfg;
+	struct binding *b;
+
+	setup(CFG_DEFAULT);
+	dns_msg_init(&stale.m);
+	dns_msg_init(&fresh.m);
+	npending = 0;
+	S_err("10.0.0.2", "old.vpn.example", DNS_T_A, HOLD);
+	REQUIRE(start_pending("old.vpn.example", &stale));
+	held = last_q;
+	run_loop(20);
+	CHECK_EQ(stale.ncb, 0);
+	CHECK_EQ(fakeip_count(o.fdb), 0);
+
+	/* reload with another fwmask, as main.c does: old chains go away */
+	ncfg = load(remasked);
+	REQUIRE(ncfg->fwmask == 0x00ff0000u);
+	d.fwmask = ncfg->fwmask;
+	d.has_pool4 = ncfg->has_pool4;
+	d.pool4 = ncfg->pool4;
+	d.marks = marks;
+	d.nmarks = 2;
+	nft_flush(nft);
+	nft_drain(nft);
+	REQUIRE(nft_reconcile(nft, &d) == 0);
+	config_free(o.cfg);
+	o.cfg = ncfg;
+
+	/* the held walk answers now; a fresh one binds in the same batch */
+	scripts[nscripts - 1].err = 0;
+	scripts[nscripts - 1].rrs = "an old.vpn.example 300 A 1.2.3.4";
+	uloop_timeout_set(&held->t, 0);
+	S("10.0.0.2", "new.vpn.example", DNS_T_A, 0, "an new.vpn.example 300 A 1.2.3.5");
+	REQUIRE(start_pending("new.vpn.example", &fresh));
+	run_loop(3000);
+	CHECK_EQ(stale.ncb, 1);
+	CHECK_EQ(fresh.ncb, 1);
+	CHECK_EQ(dns_msg_rcode(&stale.m), DNS_R_SERVFAIL);
+	CHECK_EQ(stale.m.nrr, 0);	/* never the real address */
+	CHECK_EQ(dns_msg_rcode(&fresh.m), DNS_R_NOERROR);
+	REQUIRE(fresh.m.nrr == 1);
+	b = fakeip_lookup(o.fdb, 4, fresh.m.rr[0].rdata);
+	REQUIRE(b);
+	CHECK_EQ(b->mark, 0x00010000u);
+	CHECK(in_kernel(4, b->fake, "1.2.3.5", 0x00010000u));
+	CHECK_EQ(fakeip_count(o.fdb), 1);
+	dns_msg_free(&stale.m);
+	dns_msg_free(&fresh.m);
+}
+
 static int rm_cb(const char *p, const struct stat *st, int flag, struct FTW *f)
 {
 	return remove(p);
@@ -1254,6 +1353,7 @@ int main(int argc, char **argv)
 	RUN(r_reload_revalidation);
 	RUN(s_upstream_error);
 	RUN(t_other_qtypes_steered);
+	RUN(u_fwmask_change_in_flight);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);

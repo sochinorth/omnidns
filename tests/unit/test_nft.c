@@ -197,7 +197,11 @@ TEST(reconcile_fwmask)
 	REQUIRE(nft_bootstrap(n, &d) == 0);
 	d.fwmask = 0x0f000000;
 	d.marks = m2;
+	CHECK(nft_mark_known(n, 0x02000000));
 	REQUIRE(nft_reconcile(n, &d) == 0);
+	CHECK(nft_mark_known(n, 0x01000000));
+	CHECK(nft_mark_known(n, 0x04000000));
+	CHECK(!nft_mark_known(n, 0x02000000));
 	o = list_table();
 	/* nft prints (x & m) ^ v as "x & (m | v) | v" */
 	CHECK(has(o, "meta mark set meta mark & 0xf1ffffff | 0x01000000"));
@@ -560,9 +564,18 @@ TEST(fakeip_failed_batch)
 	uint8_t r[4] = { 10, 3, 3, 3 }, afake[4], bfake[4];
 	char *o, buf[64];
 
-	bootstrap_marks();
+	static const uint32_t marks[] = { 0x01000000, 0x02000000, 0x05000000 };
+	struct nft_desired d = desired(true, false, marks, 3);
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
 	db = fakeip_new(&p4, NULL, 100, 0, secret, n);	/* takes the fail hook */
 	REQUIRE(db);
+	/* a mark without a chain is refused up front */
+	CHECK(!fakeip_bind(db, "r", 0x06000000, (const uint8_t *)"\1x\0", 3, 4, r, 60, &err));
+	CHECK_EQ(err, -ESTALE);
+	/* a chain deleted behind our back: the batch fails in the kernel */
+	free(sh("nft flush chain inet " TABLE " restore_marks; "
+	        "nft delete chain inet " TABLE " mark_05000000"));
 	a = fakeip_bind(db, "r", 0x01000000, (const uint8_t *)"\1a\0", 3, 4, r, 60, &err);
 	b = fakeip_bind(db, "r", 0x05000000, (const uint8_t *)"\1b\0", 3, 4, r, 60, &err);
 	REQUIRE(a && b);
