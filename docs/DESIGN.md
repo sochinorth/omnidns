@@ -567,7 +567,10 @@ step succeeds does it replace the old one:
 3. If `fwmask` changed:
    - drop expired cache entries, which pin their bindings;
    - evict expired bindings;
-   - reject the reload if any binding is still live. A binding outlives
+   - reject the reload if any binding is left. Eviction and this check
+     use one clock reading, so every binding left is live at that instant;
+     one that expires a second later still holds the table, and accepting
+     would flush its map elements while it is still served. A binding outlives
      the answers carrying it (by `fakeip_grace`), so a cached answer still
      valid holds only live bindings, and a rejected reload keeps the
      cache.

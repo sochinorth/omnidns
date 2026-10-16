@@ -765,6 +765,13 @@ uint32_t fakeip_evict_expired(struct fakeip_db *db)
 	return n;
 }
 
+uint32_t fakeip_remask_blockers(struct fakeip_db *db)
+{
+	/* not evict_expired() + live_count(): those read the clock apart */
+	fakeip_evict_expired(db);
+	return fakeip_count(db);
+}
+
 void fakeip_maybe_evict(struct fakeip_db *db)
 {
 	/* s3_maybe_evict()'s watermark, through the stall check */

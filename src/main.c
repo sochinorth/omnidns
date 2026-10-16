@@ -132,6 +132,8 @@ static int reload(void)
 		goto fail;
 	}
 	if (mask_changed) {
+		uint32_t live;
+
 		/*
 		 * Cached answers pin bindings. Only expired ones are dropped
 		 * here: a binding outlives an answer carrying it (by
@@ -139,11 +141,10 @@ static int reload(void)
 		 * anyway, and a rejected reload keeps the cache.
 		 */
 		cache_sweep_expired(omni.cache);
-		fakeip_evict_expired(omni.fdb);
-		if (fakeip_live_count(omni.fdb)) {
+		live = fakeip_remask_blockers(omni.fdb);
+		if (live) {
 			log_err("reload: fwmask change rejected while %u fake IP bindings are "
-				"live; keeping previous configuration",
-				fakeip_live_count(omni.fdb));
+				"live; keeping previous configuration", live);
 			ret = -EBUSY;
 			goto fail;
 		}

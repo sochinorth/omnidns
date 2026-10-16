@@ -128,12 +128,21 @@ bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr)
  */
 int fakeip_set_config(struct fakeip_db *db, const struct ip_prefix *p4,
                       const struct ip_prefix *p6, uint32_t max_bindings, uint32_t grace);
-/* Number of non-evictable bindings (used to reject fwmask changes). */
+/* Number of non-evictable bindings now. */
 uint32_t fakeip_live_count(struct fakeip_db *db);
 
 /* Evict ALL expired, unreferenced bindings now (e.g. before an fwmask
  * change, whose old marks they still carry). Returns the number evicted. */
 uint32_t fakeip_evict_expired(struct fakeip_db *db);
+
+/*
+ * Before an fwmask change: evict every expired, unreferenced binding and
+ * return how many bindings are left. All of it is decided at one clock
+ * reading, so each binding left was non-evictable at that instant (live);
+ * the change is safe only when this returns 0 (the maps are then flushed,
+ * and a binding left behind would be served without kernel elements).
+ */
+uint32_t fakeip_remask_blockers(struct fakeip_db *db);
 
 /* Evict expired, unreferenced bindings while over the capacity watermark;
  * called periodically (also releases an idle S3-FIFO ghost). */

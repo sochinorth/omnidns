@@ -13,5 +13,8 @@ uint64_t omni_now_ms(void);
 
 void time_override_set(uint32_t now_s);	/* 0 disables the override */
 void time_override_advance(uint32_t delta_s);
+/* With the override on: advance it by one second right after the `nreads`th
+ * clock read from now (tests of decisions racing a tick); 0 cancels. */
+void time_override_tick_after(uint32_t nreads);
 
 #endif

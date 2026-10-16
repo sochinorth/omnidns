@@ -623,6 +623,35 @@ TEST(set_config)
 	fakeip_free(db);
 }
 
+/*
+ * The fwmask-change gate decides at one clock reading: a binding with
+ * safe_until == now is kept (not evictable), so it must also block the
+ * change, even if the clock ticks right after (it is then evictable, but
+ * still in the table: accepting would flush its kernel elements while
+ * fakeip_bind() keeps serving it).
+ */
+TEST(remask_one_clock)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db = fakeip_new(&p4, NULL, 100, 0, SECRET, NFT);
+	struct binding *a;
+	int err;
+
+	reset();
+	a = bind4(db, "r", 0, "a.example", 1, 10, &err);
+	REQUIRE(a);
+	time_override_advance(10);		/* a: safe_until == now */
+	time_override_tick_after(1);		/* the second ticks after one read */
+	CHECK_EQ(fakeip_remask_blockers(db), fakeip_count(db));
+	CHECK_EQ(fakeip_count(db), 1);
+	time_override_tick_after(0);
+	/* now evictable: nothing blocks */
+	CHECK_EQ(fakeip_remask_blockers(db), 0);
+	CHECK_EQ(fakeip_count(db), 0);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
 TEST(stale_mark)
 {
 	struct ip_prefix p4 = pfx("198.18.0.0", 15);
@@ -1254,6 +1283,7 @@ int main(void)
 	RUN(v6_pools);
 	RUN(fail_hook);
 	RUN(set_config);
+	RUN(remask_one_clock);
 	RUN(stale_mark);
 	RUN(capacity);
 	RUN(evict_stall);
