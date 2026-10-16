@@ -200,6 +200,9 @@ final response's, filtered:
 
 - when a terminal record was rewritten or dropped, RRSIG, NSEC, NSEC3 and
   (unless DS was asked for) DS records are removed;
+- A/AAAA/SVCB/HTTPS records in the authority section are always dropped:
+  they never belong there, and whatever their owner's rule they would carry
+  real addresses past the policy;
 - additional A/AAAA/SVCB/HTTPS records are dropped entirely when a latch is
   in force or the answer made bindings. Otherwise each is kept only if its
   owner's rule is a plain `forward`, and that owner is recorded as a
@@ -207,15 +210,17 @@ final response's, filtered:
   addresses of fakeip or blocked names.
 
 A negative answer is the prefix plus the final response's authority and
-additional sections, with the same glue filtering and DNSSEC records kept.
+additional sections, with the same address filtering and DNSSEC records
+kept.
 
 The header is always omnidns's own: QR, RA, the client's RD and CD, and the
 upstream's 4-bit rcode. AA and AD are never set.
 
 When a single upstream response needed no change at all (no alias
-synthesized from a DNAME, no latch, no bindings, no glue to filter, nothing
-rewritten), its records are passed through as received; only the header is
-replaced and OPT dropped.
+synthesized from a DNAME, no latch, no bindings, no address record to
+filter from the authority or additional section, nothing rewritten), its
+records are passed through as received; only the header is replaced and
+OPT dropped.
 
 The finished answer is serialized once, with name compression, into the
 bytes the cache stores and every reply is rendered from (see

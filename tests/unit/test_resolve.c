@@ -1411,6 +1411,63 @@ TEST(w_deps_dedup)
 	CHECK_EQ(count(DNS_S_AN), 40);
 }
 
+/* No A/AAAA/SVCB/HTTPS record of the authority section reaches the client. */
+static bool ns_only_soa(void)
+{
+	uint16_t i;
+	int n = 0;
+
+	for (i = 0; i < res.nrr; i++)
+		if (res.rr[i].section == DNS_S_NS && (n++ || res.rr[i].type != DNS_T_SOA)) {
+			fprintf(stderr, "    unexpected authority record %s\n", R(i));
+			return false;
+		}
+	return n == 1;
+}
+
+/*
+ * Address records never belong in the authority section: they are dropped
+ * there whatever their owner's rule, in assembled, negative and otherwise
+ * passed-through answers (and the cached copies).
+ */
+TEST(x_authority_addresses)
+{
+	int k;
+
+	setup(CFG_DEFAULT);
+	S("10.0.0.2", "www.vpn.example", DNS_T_A, 0,
+	  "an www.vpn.example 300 A 1.2.3.4;ns www.vpn.example 300 A 1.2.3.9;"
+	  "ns vpn.example 300 SOA 60");
+	S("10.0.0.2", "n.vpn.example", DNS_T_AAAA, 0,
+	  "ns n.vpn.example 300 A 1.2.3.8;ns vpn.example 300 SOA 60");
+	S("10.0.0.1", "x.plain.example", DNS_T_A, 0,
+	  "an x.plain.example 300 A 1.1.1.1;ns x.plain.example 300 AAAA 2001:db8::9;"
+	  "ns plain.example 300 SOA 60;ar ns.plain.example 300 A 5.5.5.5");
+	S("10.0.0.1", "nx.plain.example", DNS_T_A, DNS_R_NXDOMAIN,
+	  "ns nx.vpn.example 300 HTTPS 1 . ipv4hint=1.2.3.7;ns plain.example 300 SOA 60");
+	for (k = 0; k < 2; k++) {	/* fresh, then cached */
+		CHECK(run("www.vpn.example", DNS_T_A));
+		CHECK_EQ(count(DNS_S_AN), 1);
+		CHECK(res.nrr && fakeip_in_pool(o.fdb, 4, res.rr[0].rdata));
+		CHECK(ns_only_soa());
+
+		CHECK(run("n.vpn.example", DNS_T_AAAA));
+		CHECK_EQ(rcode(), 0);
+		CHECK_EQ(count(DNS_S_AN), 0);
+		CHECK(ns_only_soa());
+
+		CHECK(run("x.plain.example", DNS_T_A));
+		CHECK_STR(R(0), "x.plain.example 300 A 1.1.1.1");
+		CHECK(ns_only_soa());
+		CHECK_EQ(count(DNS_S_AR), 1);	/* forward glue still kept */
+
+		CHECK(run("nx.plain.example", DNS_T_A));
+		CHECK_EQ(rcode(), DNS_R_NXDOMAIN);
+		CHECK(ns_only_soa());
+		CHECK(k == 0 || no_queries());
+	}
+}
+
 struct pending {
 	int ncb;
 	struct dns_msg m;
@@ -1564,6 +1621,7 @@ int main(int argc, char **argv)
 	RUN(u_fwmask_change_in_flight);
 	RUN(v_wire_compat);
 	RUN(w_deps_dedup);
+	RUN(x_authority_addresses);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);

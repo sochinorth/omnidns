@@ -582,21 +582,23 @@ static bool strip_type(const struct resolve_req *r, uint16_t t)
 }
 
 /*
- * Additional-section address records (A/AAAA/SVCB/HTTPS) are kept only for
- * names whose rule is a plain forward, and only when nothing in this walk
- * latched or bound: real addresses of fakeip or blocked names must never
- * reach the client via glue (e.g. SRV/MX additional data). The decision
- * depends on rules, so the owner is recorded as a cache dependency.
+ * Address records (A/AAAA/SVCB/HTTPS) outside the answer section. In the
+ * authority section they never belong, so they are always dropped. In the
+ * additional section they are kept only for names whose rule is a plain
+ * forward, and only when nothing in this walk latched or bound: real
+ * addresses of fakeip or blocked names must never reach the client via glue
+ * (e.g. SRV/MX additional data). That decision depends on rules, so the
+ * owner is recorded as a cache dependency.
  */
 static bool glue_ok(struct resolve_req *r, const struct dns_rr *rr)
 {
 	const struct rule *rule;
 
-	if (rr->section != DNS_S_AR ||
+	if (rr->section == DNS_S_AN ||
 	    (rr->type != DNS_T_A && rr->type != DNS_T_AAAA &&
 	     rr->type != DNS_T_SVCB && rr->type != DNS_T_HTTPS))
 		return true;
-	if (r->latch.on || r->nbinds)
+	if (rr->section == DNS_S_NS || r->latch.on || r->nbinds)
 		return false;
 	rule = dep_match(r, rr->owner, rr->owner_len);
 	return rule && rule->action == RULE_FORWARD;
