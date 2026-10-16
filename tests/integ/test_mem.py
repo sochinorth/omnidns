@@ -12,15 +12,27 @@ list, catchall forward); RSS is sampled from /proc/<pid>/status after:
     cache 10k      10,000 distinct forwarded names (fills cache_size)
     bindings 20k   ~20,000 distinct names under fakeip suffix patterns
     reload         one block list grown, SIGHUP, "configuration reloaded"
+    reload x5      5 more reloads, each replacing the block list (same pattern
+                   count, one pattern different) so the match table is
+                   rebuilt every time (the generation must advance)
 
-Results are compared with tests/integ/mem_baseline.json when it exists
-(--save-baseline rewrites it). Exits non-zero if the daemon fails or any
-row's RssAnon is more than 10% above the baseline.
+Each row records VmRSS, RssAnon and VmHWM (peak RSS so far). The daemon
+runs with glibc's mmap threshold pinned (see run()). Exits non-zero
+if the daemon fails, if RssAnon grows by more than 512 kB from the first
+reload to any later one (repeated rebuilds must not leak or fragment), or,
+against tests/integ/mem_baseline.json when it exists (--save-baseline
+rewrites it), if any row's
+
+    RssAnon  is more than 10% above the baseline's,
+    VmHWM    is more than 10% above the baseline's, or
+    dAnon    (RssAnon growth since the previous row) is more than
+             max(10%, 512 kB) above the baseline's.
 """
 import ipaddress
 import json
 import os
 import random
+import re
 import select
 import signal
 import socket
@@ -33,7 +45,10 @@ import dnsmini  # noqa: E402
 import test_integ as ti  # noqa: E402
 
 BASELINE = os.path.join(HERE, "mem_baseline.json")
-TOLERANCE = 0.10
+TOLERANCE = 0.10        # relative slack: RssAnon, VmHWM, per-phase dAnon
+DELTA_SLACK = 512       # kB, absolute slack for a phase's dAnon
+N_RELOADS = 5
+RELOAD_GROWTH = 512     # kB RssAnon may grow over the N_RELOADS extra reloads
 SEED = 20261016
 N_BLOCK_A, N_BLOCK_B, N_FAKE, N_EXTRA = 35000, 25000, 15000, 50
 N_CACHE, N_BIND = 10000, 20000
@@ -174,7 +189,7 @@ def sample(pid):
     with open("/proc/%d/status" % pid) as f:
         for line in f:
             k, _, v = line.partition(":")
-            if k in ("VmRSS", "RssAnon"):
+            if k in ("VmRSS", "RssAnon", "VmHWM"):
                 out[k] = int(v.split()[0])
     try:
         with open("/proc/%d/smaps_rollup" % pid) as f:
@@ -198,32 +213,47 @@ def wait_log(env, offset, needle, timeout=30):
     raise RuntimeError("no %r in daemon log:\n%s" % (needle, env.daemon_log()[offset:][-2000:]))
 
 
-def report(rows, baseline):
-    start = rows[0][1]
-    print("\n%-13s %9s %9s %10s %9s" % ("row", "VmRSS kB", "RssAnon", "dAnon", "Anon(sm)"))
+def with_deltas(rows):
+    """{name: metrics + dAnon (RssAnon growth since the previous row)}."""
+    out, prev = {}, 0
     for name, m in rows:
-        print("%-13s %9d %9d %+10d %9s" % (name, m["VmRSS"], m["RssAnon"],
-                                          m["RssAnon"] - start["RssAnon"],
-                                          m.get("Anonymous", "-")))
+        out[name] = dict(m, dAnon=m["RssAnon"] - prev)
+        prev = m["RssAnon"]
+    return out
+
+
+def report(rows, baseline):
+    cur = with_deltas(rows)
+    print("\n%-13s %9s %9s %9s %9s %9s" %
+          ("row", "VmRSS kB", "RssAnon", "dAnon", "VmHWM", "Anon(sm)"))
+    for name, _ in rows:
+        m = cur[name]
+        print("%-13s %9d %9d %+9d %9d %9s" % (name, m["VmRSS"], m["RssAnon"], m["dAnon"],
+                                             m["VmHWM"], m.get("Anonymous", "-")))
     if not baseline:
         print("\n(no baseline at %s)" % os.path.relpath(BASELINE, ti.ROOT))
         return []
+    base = with_deltas((n, baseline[n]) for n, _ in rows if n in baseline)
+    limits = {"RssAnon": lambda b: b * (1 + TOLERANCE),
+              "VmHWM": lambda b: b * (1 + TOLERANCE),
+              "dAnon": lambda b: b + max(abs(b) * TOLERANCE, DELTA_SLACK)}
     worse = []
-    print("\nvs baseline:\n%-13s %9s %9s %8s %9s %9s %8s" %
-          ("row", "base RSS", "VmRSS", "%", "base Anon", "RssAnon", "%"))
-    for name, m in rows:
-        b = baseline.get(name)
+    print("\nvs baseline (VmRSS informational):\n%-13s %9s %9s %9s %9s %9s %9s %9s %9s" %
+          ("row", "base RSS", "VmRSS", "base Anon", "RssAnon", "base dAn", "dAnon",
+           "base HWM", "VmHWM"))
+    for name, _ in rows:
+        m, b = cur[name], base.get(name)
         if not b:
             print("%-13s (not in baseline)" % name)
             continue
-        drss = 100.0 * (m["VmRSS"] - b["VmRSS"]) / b["VmRSS"]
-        danon = 100.0 * (m["RssAnon"] - b["RssAnon"]) / b["RssAnon"]
+        bad = [k for k in limits if k in b and m[k] > limits[k](b[k])]
         flag = ""
-        if m["RssAnon"] > b["RssAnon"] * (1 + TOLERANCE):
-            worse.append(name)
-            flag = "  WORSE"
-        print("%-13s %9d %9d %+7.1f%% %9d %9d %+7.1f%%%s" %
-              (name, b["VmRSS"], m["VmRSS"], drss, b["RssAnon"], m["RssAnon"], danon, flag))
+        if bad:
+            worse.append("%s (%s)" % (name, "+".join(bad)))
+            flag = "  WORSE: " + "+".join(bad)
+        print("%-13s %9d %9d %9d %9d %+9d %+9d %9s %9d%s" %
+              (name, b["VmRSS"], m["VmRSS"], b["RssAnon"], m["RssAnon"], b["dAnon"],
+               m["dAnon"], b.get("VmHWM", "-"), m["VmHWM"], flag))
     return worse
 
 
@@ -256,7 +286,16 @@ def run(env):
         "fake.txt": "\n".join(fake) + "\n"})
     env.upstreams()
     t0 = time.time()
-    env.start_daemon()
+    # glibc raises its mmap threshold to the size of each freed mmapped
+    # chunk, so after a reload or two the big match-table arrays come from
+    # the heap and RssAnon settles ~3 MB higher, which would hide a real
+    # per-reload leak. Pin the threshold at glibc's default (as musl, the
+    # target libc, always unmaps large chunks) for the daemon only.
+    os.environ["GLIBC_TUNABLES"] = "glibc.malloc.mmap_threshold=131072"
+    try:
+        env.start_daemon()
+    finally:
+        os.environ.pop("GLIBC_TUNABLES", None)
     print("daemon up in %.2fs" % (time.time() - t0))
     for line in env.daemon_log().splitlines():
         if "started" in line or "pattern" in line:
@@ -279,18 +318,45 @@ def run(env):
     print("fake2real_v4 elements: %d" % nft)
     rows.append(("bindings 20k", sample(pid)))
 
-    with open(env.dir + "/block_a.txt", "a") as f:
-        f.write("\n".join(extra) + "\n")
-    off = len(env.daemon_log())
-    env.daemon.send_signal(signal.SIGHUP)
-    t0 = time.time()
-    line = wait_log(env, off, "configuration reloaded")
-    print("reload in %.2fs: %s" % (time.time() - t0, line.strip().splitlines()[-1]))
+    gen = [1]
+
+    def reload(patterns):
+        """Replace block_a.txt (new inode, so the nameset is re-read and the
+        match table rebuilt), SIGHUP, and wait for the next generation."""
+        path = env.dir + "/block_a.txt"
+        with open(path + ".new", "w") as f:
+            f.write("\n".join(patterns) + "\n")
+        os.rename(path + ".new", path)
+        off = len(env.daemon_log())
+        env.daemon.send_signal(signal.SIGHUP)
+        t0 = time.time()
+        line = wait_log(env, off, "configuration reloaded").strip().splitlines()[-1]
+        m = re.search(r"generation (\d+)(.*?),", line)
+        ti.check(m and int(m.group(1)) > gen[0] and "kept" not in m.group(2),
+                 "reload did not rebuild the match table: %s" % line)
+        gen[0] = int(m.group(1))
+        return time.time() - t0, line
+
+    dt, line = reload(block_a + extra)
+    print("reload in %.2fs: %s" % (dt, line))
     probe = "z." + next(p for p in extra if p.startswith("*."))[2:]
     r = dnsmini.query(ti.LAN, 53, probe, "A")
     ti.check(r["rcode"] == 0 and not r["an"], "appended pattern not blocked: %r" % r)
     rows.append(("reload", sample(pid)))
+
+    anon = [rows[-1][1]["RssAnon"]]
+    t0 = time.time()
+    for i in range(N_RELOADS):
+        reload(block_a + extra[:-1] + ["r%d.reload.test" % i])
+        last = sample(pid)
+        anon.append(last["RssAnon"])
+    print("%d reloads in %.1fs, RssAnon after each: %s" %
+          (N_RELOADS, time.time() - t0, " ".join(map(str, anon))))
+    rows.append(("reload x%d" % N_RELOADS, last))
     ti.check(env.daemon.poll() is None, "daemon died")
+    growth = max(anon) - anon[0]
+    ti.check(growth <= RELOAD_GROWTH, "RssAnon grew %d kB over %d reloads (limit %d kB)" %
+             (growth, N_RELOADS, RELOAD_GROWTH))
     return rows
 
 
@@ -319,12 +385,12 @@ def main():
     if "--save-baseline" in sys.argv:
         worse = []
         with open(BASELINE, "w") as f:
-            json.dump({n: {"VmRSS": m["VmRSS"], "RssAnon": m["RssAnon"]} for n, m in rows},
+            json.dump({n: {k: m[k] for k in ("VmRSS", "RssAnon", "VmHWM")} for n, m in rows},
                       f, indent=1)
             f.write("\n")
         print("\nbaseline saved to %s" % os.path.relpath(BASELINE, ti.ROOT))
     if worse:
-        print("\nRssAnon more than %d%% above baseline: %s" % (TOLERANCE * 100, ", ".join(worse)))
+        print("\nmemory above the baseline's limit: %s" % ", ".join(worse))
         sys.exit(1)
     print("\nok")
 
