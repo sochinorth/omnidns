@@ -45,7 +45,7 @@ struct upstream_query {
 
 struct exchange {
 	void *pool_link;		/* first: the pool's while kept */
-	uint32_t hash;			/* low 32 bits, as kept by hmap */
+	uint32_t hash;			/* low 32 bits (hmap keeps 31) */
 	uint8_t qnlen;			/* wire length of the name at qbuf + EX_QNAME_OFF */
 	uint16_t qtype;
 	struct upstream_set *set;

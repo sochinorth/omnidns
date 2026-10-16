@@ -17,7 +17,7 @@
  * (attached or detached-but-referenced) whose b->policy is its id.
  */
 struct policy {
-	uint32_t hash;		/* low 32 bits of policy_hash() (all hmap keeps) */
+	uint32_t hash;		/* low 32 bits of policy_hash() (hmap keeps 31) */
 	uint32_t mark;
 	uint32_t ref;
 	uint16_t id;

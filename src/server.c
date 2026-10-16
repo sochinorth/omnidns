@@ -47,7 +47,7 @@ struct listener {
 struct client_cnt {
 	uint8_t family;
 	uint8_t ip[16];
-	uint32_t hash;			/* of the key, as kept by hmap (low 32 bits) */
+	uint32_t hash;			/* of the key, low 32 bits (hmap keeps 31) */
 	uint32_t n;
 };
 
@@ -186,7 +186,7 @@ static void client_release(struct client_cnt *c)
 	n_pending--;
 	if (--c->n)
 		return;
-	hmap_del_ptr(&clients, c->hash, c);	/* hmap only uses the low 32 bits */
+	hmap_del_ptr(&clients, c->hash, c);	/* hmap only uses the low 31 bits */
 	pool_put(&client_pool, c);
 }
 

@@ -54,15 +54,15 @@ struct nft_ctx;
 /*
  * Layout: no padding holes, the endpoint follows the fixed part directly
  * and bindings are allocated as offsetof(endpoint) + endpoint_len. The key
- * hash is not stored: by_key uses s3.hash (its low 32 bits, all hmap
- * keeps), and the 64-bit value is only needed when allocating. The
+ * hash is not stored: by_key uses s3.hash (its low 32 bits; hmap keeps
+ * only 31), and the 64-bit value is only needed when allocating. The
  * by_fake hash is recomputed from (family, fake) on removal.
  *
  * Rule id and mark live in the db's policy table: read them with
  * fakeip_rule_id() / fakeip_mark().
  */
 struct binding {
-	struct s3_node s3;	/* s3.hash: low 32 bits of the key hash */
+	struct s3_node s3;	/* s3.hash: low 32 bits of the key hash (hmap keeps 31) */
 	uint64_t ticket;	/* nft batch that installed it */
 	uint32_t safe_until;	/* omni_now() seconds */
 	uint32_t refcnt;	/* cache entries referencing it */
