@@ -671,6 +671,10 @@ struct nameset_file *nsc_get(struct nameset_cache *c, const char *path, int *err
 		*err = -errno;
 		return NULL;
 	}
+	if (!S_ISREG(st.st_mode)) {	/* never open a FIFO or device */
+		*err = -EINVAL;
+		return NULL;
+	}
 	old = hmap_get(&c->by_path, h, path, nsf_eq, NULL);
 	if (old && nsf_unchanged(old, &st)) {
 		old->refcnt++;
@@ -1098,8 +1102,12 @@ static int rule_add_file(struct loader *L, struct rule *r, const char *path)
 	if (!f) {
 		if (err == -ENOMEM)
 			return fail(L, "out of memory");
-		log_warn("rule '%s': nameset '%s' unreadable (%s), skipped",
-		         r->id, path, strerror(-err));
+		if (err == -EINVAL)
+			log_warn("rule '%s': nameset '%s' is not a readable regular file, "
+			         "skipped", r->id, path);
+		else
+			log_warn("rule '%s': nameset '%s' unreadable (%s), skipped",
+			         r->id, path, strerror(-err));
 		return 0;
 	}
 	for (uint16_t i = 0; i < r->nfiles; i++) {
@@ -1140,16 +1148,9 @@ static int rule_glob(struct loader *L, struct rule *r, const char *pattern)
 		log_warn("rule '%s': nameset glob '%s' failed", r->id, pattern);
 		return 0;
 	}
-	for (size_t i = 0; i < g.gl_pathc && !ret; i++) {
-		struct stat st;
-
-		if (stat(g.gl_pathv[i], &st) || !S_ISREG(st.st_mode)) {
-			log_warn("rule '%s': nameset '%s' is not a readable regular file, skipped",
-			         r->id, g.gl_pathv[i]);
-			continue;
-		}
+	/* nsc_get() stats each file and refuses anything but regular files */
+	for (size_t i = 0; i < g.gl_pathc && !ret; i++)
 		ret = rule_add_file(L, r, g.gl_pathv[i]);
-	}
 	globfree(&g);
 	return ret;
 }

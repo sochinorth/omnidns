@@ -154,7 +154,7 @@ static inline const char *ns_next(const char *e)
  * otherwise re-parses. A re-parse yielding the same patterns as the cached
  * entry returns that entry (with updated stat fields), so a touched or
  * atomically replaced but identical file keeps its identity. Returns a new
- * reference or NULL (*err = -errno) if
+ * reference or NULL (*err = -errno; -EINVAL if not a regular file) if
  * unreadable. Files with refcnt 0 are dropped by nsc_sweep().
  */
 struct nameset_cache {

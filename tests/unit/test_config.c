@@ -365,6 +365,27 @@ TEST(unreadable_nameset)
 	chmod(P("ns/secret.txt"), 0644);
 }
 
+TEST(irregular_nameset)
+{
+	struct config *c;
+	int e = 0;
+
+	mkdir(P("odd"), 0755);
+	mkdir(P("odd/dir.txt"), 0755);
+	REQUIRE(!mkfifo(P("odd/fifo.txt"), 0644));
+	wfile("odd/ok.txt", "ok.example\n");
+	CHECK(!nsc_get(&nsc, P("odd/dir.txt"), &e));
+	CHECK_EQ(e, -EINVAL);
+	CHECK(!nsc_get(&nsc, P("odd/fifo.txt"), &e));	/* must not block in open */
+	CHECK_EQ(e, -EINVAL);
+	c = loadf(GLOBAL "config rule 'r'\n\toption action 'block'\n"
+	          "\tlist nameset '%s/odd/*.txt'\n" CATCHALL, dir, dir);
+	REQUIRE(c);
+	REQUIRE(c->rules[0].nfiles == 1);
+	CHECK_STR(c->rules[0].files[0]->blob, "ok.example");
+	config_free(c);
+}
+
 TEST(fingerprints)
 {
 	struct config *a, *b, *c, *d;
@@ -889,6 +910,7 @@ int main(void)
 	RUN(too_many_rules);
 	RUN(nsc_reuse);
 	RUN(unreadable_nameset);
+	RUN(irregular_nameset);
 	RUN(fingerprints);
 	RUN(reload_shares_index);
 	RUN(reload_fwmask_policy);
