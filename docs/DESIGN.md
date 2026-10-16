@@ -341,17 +341,27 @@ output_reject      (filter, output,     filter-1):  same
 - **Reload**: one transaction reconciles chains and rules against the
   desired state. It never flushes maps. Mark chains are kept across reloads
   until the fwmask changes, because walks in flight may still bind with a
-  mark the new config no longer uses. At most 2048 mark chains are
-  installed (the `restore_marks` vmap travels in one netlink element
-  message, whose 16-bit length would overflow near 3800): a reload that
-  would need more, counting the kept ones, is rejected rather than drop a
-  chain that may still be in use; a restart starts over with the
-  configuration's own marks. If the desired state (pools, fwmask,
-  mark set) equals what the last successful transaction installed, no
-  transaction is sent. The cost is that a no-op reload no longer repairs
-  rules someone edited inside our chains; the next real change, or a
-  restart, does. That repair was only ever partial: a deleted chain or table
-  made every reconcile fail instead.
+  mark the new config no longer uses. At most 4096 mark chains are
+  installed, which bounds the transaction (a bootstrap is then about
+  12000 messages and 2.1 MB, a reconcile replacing every chain 16000 and
+  2.4 MB; the socket send buffer is 4 MB, doubled by the kernel, and must
+  hold the whole transaction): a reload that would
+  need more, counting the kept ones, is rejected rather than drop a chain
+  that may still be in use; a restart starts over with the configuration's
+  own marks. If the desired state (pools, fwmask, mark set) equals what
+  the last successful transaction installed, no transaction is sent. The
+  cost is that a no-op reload no longer repairs rules someone edited
+  inside our chains; the next real change, or a restart, does. That repair
+  was only ever partial: a deleted chain or table made every reconcile
+  fail instead.
+- **Large transactions** stay one transaction each. Element lists (only
+  the `restore_marks` vmap) go in messages of 256 elements, since a
+  message's elements share one nest with a 16-bit length (at most 1023
+  elements of the worst-case 64 bytes). The kernel queues all replies of a
+  batch at once, so only the last message before END asks for an ack:
+  failing messages are reported regardless, and before that final ack. A
+  transaction failing in more messages than the receive buffer holds
+  still reports its first error.
 - **Element updates** go through a separate netlink socket.
   - **Batching**: they are coalesced into batches, submitted at the end of
     the loop iteration or at 1024 operations. Each batch has a monotonically
@@ -490,7 +500,7 @@ step succeeds does it replace the old one:
    match table is shared instead of rebuilt.
 2. Compute the dataplane state: the configuration's marks plus, unless
    `fwmask` changed, every mark chain installed before. Reject the reload if
-   that is more than 2048 marks.
+   that is more than 4096 marks.
 3. If `fwmask` changed:
    - flush the cache, since every cached fake embeds old marks;
    - evict expired bindings;

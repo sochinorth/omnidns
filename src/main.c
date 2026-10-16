@@ -20,11 +20,13 @@
 #include "util/hash.h"
 
 /*
- * Mark chains installed at once. restore_marks' vmap goes to the kernel in
- * one element message, whose 16-bit nest length holds about 3780 marks;
- * stay well below. A config has at most CONFIG_MAX_RULES marks of its own.
+ * Mark chains installed at once: bounds the bootstrap/reconcile transaction,
+ * which must fit the netlink socket's send buffer (with 4096 chains a
+ * bootstrap is about 12000 messages and 2.1 MB, a reconcile replacing every
+ * chain 16000 and 2.4 MB; both tested on the real kernel in test_nft).
+ * A config has at most CONFIG_MAX_RULES marks of its own.
  */
-#define MAX_MARKS 2048
+#define MAX_MARKS 4096
 _Static_assert(CONFIG_MAX_RULES <= MAX_MARKS, "a config's own marks must fit");
 
 static struct omni omni;

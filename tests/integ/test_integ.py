@@ -601,21 +601,25 @@ def mark_chain_overflow_rejects_reload(env):
         fake = answers(r, "A")[0]
         check(fake.startswith("100.64."), "no fake: %r" % r)
         mark = "mark_%08x" % nrules  # rule r999 of config 0, installed last
-        # a reload adds 1000 new mark chains and keeps the old ones
-        config(1)
-        out = hup()
-        check("reloaded" in out, "reload failed:\n" + out)
-        config(2)  # would need 3000 mark chains (the cap is 2048)
+        # each reload adds 1000 new mark chains and keeps the old ones
+        for k in range(1, 4):
+            config(k)
+            out = hup()
+            check("reloaded" in out, "reload %d failed:\n" % k + out)
+        restore = sh("nft list chain inet %s restore_marks" % table)
+        check(restore.count(" : jump mark_") == 4 * nrules,
+              "restore_marks has %d marks" % restore.count(" : jump mark_"))
+        config(4)  # would need 5000 mark chains (the cap is 4096)
         out = hup()
         check("fwmark chains needed" in out, "overflow not reported:\n" + out)
         check("reloaded" not in out, "overflowing reload accepted:\n" + out)
         elems = sh("nft list map inet %s fake2mark_v4" % table)
         check(fake in elems and mark in elems, "binding lost:\n" + elems)
         check(mark in sh("nft list chain inet %s %s" % (table, mark)), "mark chain deleted")
-        # config 1 still in force: a new name binds with its mark
+        # config 3 still in force: a new name binds with its mark
         fake2 = answers(dnsmini.query(LAN, port, "inner.warp.test", "A"), "A")[0]
         elems = sh("nft list map inet %s fake2mark_v4" % table)
-        check("%s : jump mark_%08x" % (fake2, 2 * nrules) in elems,
+        check("%s : jump mark_%08x" % (fake2, 4 * nrules) in elems,
               "previous configuration not kept:\n" + elems)
         # a config within the kept chains still reloads
         config(0)
