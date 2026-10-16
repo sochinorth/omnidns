@@ -391,6 +391,11 @@ static void req_free(struct resolve_req *r)
 	pool_put(&req_pool, r);
 }
 
+void resolve_shutdown(void)
+{
+	pool_drain(&req_pool);
+}
+
 static void out_init(struct resolve_req *r, int rcode);
 
 /*

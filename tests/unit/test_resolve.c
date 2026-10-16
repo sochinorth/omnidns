@@ -1683,5 +1683,6 @@ int main(int argc, char **argv)
 	uloop_done();
 	nsc_destroy(&o.nsc);
 	nftw(dir, rm_cb, 16, FTW_DEPTH | FTW_PHYS);
+	resolve_shutdown();
 	return test_summary();
 }

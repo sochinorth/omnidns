@@ -15,6 +15,7 @@
 #include "log.h"
 #include "nft.h"
 #include "omnidns.h"
+#include "resolve.h"
 #include "server.h"
 #include "upstream.h"
 #include "util/hash.h"
@@ -289,6 +290,7 @@ int main(int argc, char **argv)
 	ret = 0;
 
 	server_stop();
+	resolve_shutdown();
 out_upstream:
 	upstream_shutdown();
 out_state:

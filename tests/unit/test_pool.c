@@ -2,6 +2,10 @@
 #include "test.h"
 #include "util/pool.h"
 
+#if defined(__SANITIZE_ADDRESS__)
+#include <sanitizer/asan_interface.h>
+#endif
+
 struct obj {
 	void *link;			/* the pool's while kept */
 	int payload;
@@ -43,9 +47,17 @@ TEST(reuse)
 	pool_put(&p, a);
 	CHECK_EQ(p.used, 0);
 	CHECK_EQ(p.nfree, 1);
+#if defined(__SANITIZE_ADDRESS__)
+	/* kept objects are poisoned past the link word, like freed memory */
+	CHECK(__asan_address_is_poisoned(&a->payload));
+	CHECK(!__asan_address_is_poisoned(&a->link));
+#endif
 	b = pool_get(&p, &fresh);
 	CHECK(b == a);
 	CHECK(!fresh);
+#if defined(__SANITIZE_ADDRESS__)
+	CHECK(!__asan_address_is_poisoned(&b->payload));
+#endif
 	CHECK_EQ(b->payload, 42);
 	CHECK(b->own != NULL);
 	CHECK_EQ(p.nfree, 0);
