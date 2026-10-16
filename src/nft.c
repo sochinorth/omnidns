@@ -58,10 +58,15 @@ struct nbuf {
 	uint32_t low;		/* consecutive uses below cap / 4 (nbuf_trim) */
 };
 
-/* One transaction under construction: BEGIN, msgs (all NLM_F_ACK), END. */
+/*
+ * One transaction under construction: BEGIN, msgs, END. Element batches set
+ * NLM_F_ACK on every message; control-plane transactions only on the last
+ * one (see ctl_commit()).
+ */
 struct txn {
 	struct nbuf b;
 	uint32_t seq_first, seq_last, nmsg;
+	size_t last_off;	/* offset of the last message added by txn_msg() */
 };
 
 struct ebatch {
@@ -173,8 +178,9 @@ static struct nlmsghdr *txn_msg(struct nft_ctx *n, struct txn *t, int type,
 {
 	nbuf_reserve(&t->b, room);
 	t->nmsg++;
-	return nftnl_nlmsg_build_hdr(t->b.p + t->b.len, type, NFPROTO_INET,
-	                             flags | NLM_F_ACK, n->seq++);
+	t->last_off = t->b.len;
+	return nftnl_nlmsg_build_hdr(t->b.p + t->b.len, type, NFPROTO_INET, flags,
+	                             n->seq++);
 }
 
 static void txn_table(struct nft_ctx *n, struct txn *t, int type, uint16_t flags)
@@ -600,8 +606,28 @@ static void parse_acks(const char *buf, int len, ack_fn fn, void *priv)
 	}
 }
 
+/*
+ * Control-plane transactions can be large (bootstrap with 4096 mark chains
+ * is about 12000 messages), and the kernel queues all replies at once,
+ * after processing the whole batch inside sendmsg(): an ack per message
+ * would overrun the receive buffer (ENOBUFS). So only the last message
+ * before END asks for an ack. nfnetlink reports every failing message
+ * regardless of NLM_F_ACK, and a failed commit with an error for BEGIN,
+ * all before the acks of the batch's own messages are delivered in message
+ * order; so an error in the transaction's sequence range always arrives no
+ * later than the final ack, and the final ack without an earlier error
+ * means the transaction committed. Errors keep their message's sequence
+ * number for diagnostics; the first one is returned.
+ *
+ * A transaction failing in thousands of messages can still overrun the
+ * buffer: the first errors are queued before the overrun, so after ENOBUFS
+ * the queue is read without blocking, and ENOBUFS is returned only if it
+ * holds no error. Replies left over from an earlier transaction (after its
+ * first error) are discarded before sending.
+ */
 struct sync_state {
-	uint32_t first, last, left;
+	uint32_t first, last, want;
+	bool done;
 	int err;
 };
 
@@ -615,34 +641,50 @@ static bool sync_ack(void *priv, uint32_t seq, int err)
 		st->err = err;
 		return false;
 	}
-	if (st->left)
-		st->left--;
-	return st->left > 0;
+	if (seq == st->want)
+		st->done = true;
+	return !st->done;
+}
+
+static void ctl_discard(int fd, char *buf, size_t size)
+{
+	while (recv(fd, buf, size, MSG_DONTWAIT) >= 0 || errno == EINTR || errno == ENOBUFS)
+		;
 }
 
 static int ctl_commit(struct nft_ctx *n, struct txn *t, const char *what)
 {
-	struct sync_state st = { t->seq_first, t->seq_last, t->nmsg, 0 };
+	struct nlmsghdr *last = (struct nlmsghdr *)(t->b.p + t->last_off);
+	struct sync_state st = { t->seq_first, t->seq_last, last->nlmsg_seq, false, 0 };
 	int fd = mnl_socket_get_fd(n->ctl);
+	bool overrun = false;
 	char buf[16384];
 
+	last->nlmsg_flags |= NLM_F_ACK;
+	ctl_discard(fd, buf, sizeof(buf));
 	if (mnl_socket_sendto(n->ctl, t->b.p, t->b.len) < 0) {
 		st.err = -errno;
 		goto out;
 	}
-	while (st.left && !st.err) {
+	while (!st.done && !st.err) {
 		struct pollfd pfd = { .fd = fd, .events = POLLIN };
 		ssize_t len;
 
-		if (poll(&pfd, 1, RECV_TIMEOUT_MS) <= 0) {
+		if (!overrun && poll(&pfd, 1, RECV_TIMEOUT_MS) <= 0) {
 			st.err = -ETIMEDOUT;
 			break;
 		}
-		len = recv(fd, buf, sizeof(buf), 0);
+		len = recv(fd, buf, sizeof(buf), overrun ? MSG_DONTWAIT : 0);
 		if (len < 0) {
 			if (errno == EINTR)
 				continue;
-			st.err = -errno;
+			if (errno == ENOBUFS && !overrun) {
+				log_debug("nft: %s: replies overran the receive buffer", what);
+				overrun = true;
+				continue;
+			}
+			st.err = overrun && (errno == EAGAIN || errno == EWOULDBLOCK) ?
+			         -ENOBUFS : -errno;
 			break;
 		}
 		parse_acks(buf, (int)len, sync_ack, &st);

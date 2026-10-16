@@ -352,6 +352,23 @@ static int big_check(uint32_t first, uint32_t cnt)
 	return ok;
 }
 
+TEST(big_bootstrap)
+{
+	struct nft_desired d = big_desired(0, BIG_N);
+	char *o;
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	CHECK(big_check(0, BIG_N));
+	CHECK(nft_mark_known(n, 1u << 16));
+	CHECK(nft_mark_known(n, (uint32_t)BIG_N << 16));
+	o = sh("nft list chain inet " TABLE " mark_10000000");
+	CHECK(has(o, "meta mark set meta mark & 0xd000ffff | 0x10000000"));
+	free(o);
+	/* again over the full table: delete and recreate */
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	CHECK(big_check(0, BIG_N));
+}
+
 /*
  * Growing 1 -> 4096 marks across reconciles: around the CHUNK_MAX element
  * message boundary, and past the counts where restore_marks' vmap, sent in
@@ -362,6 +379,7 @@ TEST(big_reconcile)
 	static const uint32_t steps[] = { 1, 2, 255, 256, 257, 512, 1260, 1261, 2048,
 	                                  2521, 3780, 3800, BIG_N };
 	struct nft_desired d = big_desired(0, 1);
+	char *o;
 
 	REQUIRE(nft_bootstrap(n, &d) == 0);
 	CHECK(big_check(0, 1));
@@ -370,6 +388,74 @@ TEST(big_reconcile)
 		REQUIRE(nft_reconcile(n, &d) == 0);
 		CHECK(big_check(0, steps[i]));
 	}
+	/* replace all 4096 chains by 4096 others in one transaction */
+	d = big_desired(BIG_N, BIG_N);
+	REQUIRE(nft_reconcile(n, &d) == 0);
+	CHECK(big_check(BIG_N, BIG_N));
+	CHECK(!nft_mark_known(n, 1u << 16));
+	CHECK(nft_mark_known(n, (uint32_t)(BIG_N + 1) << 16));
+	/* a new fwmask rewrites every chain */
+	d.fwmask = 0x7fff0000;	/* printed keep masks: 0xc000ffff | V -> 0x8000ffff | V */
+	REQUIRE(nft_reconcile(n, &d) == 0);
+	o = sh("nft list table inet " TABLE " | grep -c 'meta mark set meta mark & 0x[89ab]'");
+	CHECK_EQ(strtol(o, NULL, 10), BIG_N);
+	free(o);
+	o = sh("nft list table inet " TABLE " | grep -c 'mark & 0x[c-f]'");
+	CHECK_EQ(strtol(o, NULL, 10), 0);
+	free(o);
+	d = big_desired(0, 3);
+	REQUIRE(nft_reconcile(n, &d) == 0);
+	CHECK(big_check(0, 3));
+}
+
+/*
+ * setsockopt() is interposed (like mnl_socket_sendto() below) so a context
+ * can be opened with a small receive buffer: control-plane transactions must
+ * not depend on its size.
+ */
+static int small_rcvbuf;
+
+int setsockopt(int fd, int level, int opt, const void *val, socklen_t len)
+{
+	static int (*real_setsockopt)(int, int, int, const void *, socklen_t);
+
+	if (!real_setsockopt)
+		*(void **)&real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+	if (small_rcvbuf && level == SOL_SOCKET && (opt == SO_RCVBUF || opt == SO_RCVBUFFORCE))
+		val = &small_rcvbuf;
+	return real_setsockopt(fd, level, opt, val, len);
+}
+
+/* a failing message deep in a big transaction is reported, nothing changes */
+TEST(big_reconcile_failure)
+{
+	struct nft_desired d = big_desired(0, BIG_N);
+	struct nft_ctx *m;
+
+	small_rcvbuf = 32 << 10;
+	m = nft_open(TABLE);
+	small_rcvbuf = 0;
+	REQUIRE(m);
+	REQUIRE(nft_bootstrap(m, &d) == 0);
+	CHECK(big_check(0, BIG_N));
+	free(sh("nft delete chain inet " TABLE " output_reject"));
+	d = big_desired(BIG_N / 2, BIG_N);
+	CHECK_EQ(nft_reconcile(m, &d), -ENOENT);
+	CHECK(big_check(0, BIG_N));
+	CHECK(nft_mark_known(m, 1u << 16));
+	CHECK(!nft_mark_known(m, (uint32_t)(BIG_N + 1) << 16));
+	/* the table gone: every message fails, with far more errors than the
+	 * receive buffer holds; the first one is still reported */
+	free(sh("nft delete table inet " TABLE));
+	CHECK_EQ(nft_reconcile(m, &d), -ENOENT);
+	/* the leftover errors are not taken for the next transaction's reply */
+	d = big_desired(0, BIG_N);
+	REQUIRE(nft_bootstrap(m, &d) == 0);
+	CHECK(big_check(0, BIG_N));
+	d = big_desired(1, 2);
+	REQUIRE(nft_reconcile(m, &d) == 0);
+	CHECK(big_check(1, 2));
+	nft_close(m);
 }
 
 /* ---- async ---- */
@@ -1146,7 +1232,9 @@ int main(int argc, char **argv)
 	RUN(reconcile_fwmask);
 	RUN(reconcile_noop);
 	RUN(reconcile_kernel_failure);
+	RUN(big_bootstrap);
 	RUN(big_reconcile);
+	RUN(big_reconcile_failure);
 	RUN(async_add_del);
 	RUN(async_failure);
 	RUN(async_big_batch);
