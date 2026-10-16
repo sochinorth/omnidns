@@ -442,7 +442,7 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 	list_add_tail(&q->list, reqs);
 	if (q->conn)
 		q->conn->inflight++;
-	q->rr = resolve_start(q->o, &m, creq_done, q);
+	q->rr = resolve_start_miss(q->o, &m, &hit, creq_done, q);
 	if (!q->rr) {
 		/* could not start: answer SERVFAIL right away */
 		if (q->conn)

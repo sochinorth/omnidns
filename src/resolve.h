@@ -58,7 +58,8 @@ typedef void (*resolve_cb)(void *ctx, const uint8_t *msg, size_t len);
  * response and its age, valid until the next cache call), or -ENOENT when
  * the query must go through resolve_start(): a miss, an entry that failed
  * revalidation, or a query that ANY/fake-PTR handling answers instead.
- * Counts as a request when it hits.
+ * Counts as a request when it hits. For a query with a question, hit->hash
+ * is set either way (see resolve_start_miss()).
  */
 int resolve_lookup(struct omni *o, const struct dns_msg *query, struct cache_hit *hit);
 
@@ -67,6 +68,11 @@ int resolve_lookup(struct omni *o, const struct dns_msg *query, struct cache_hit
  * synchronously. */
 struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
                                   resolve_cb cb, void *ctx);
+/* The same, after resolve_lookup() returned -ENOENT for this query into
+ * `miss`: takes the key hash it computed (miss->hash) instead of hashing
+ * the question again. */
+struct resolve_req *resolve_start_miss(struct omni *o, const struct dns_msg *query,
+                                       const struct cache_hit *miss, resolve_cb cb, void *ctx);
 /* No callback after cancel. */
 void resolve_cancel(struct resolve_req *r);
 /* Free the requests kept for reuse (shutdown); none may be in flight. */

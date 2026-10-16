@@ -54,6 +54,7 @@ struct resolve_req {
 
 	struct dns_name qname;
 	uint16_t qtype, qclass, rd;
+	uint64_t key_hash;		/* cache_hash() of the question, computed once */
 
 	/* walk state */
 	struct dns_name name;
@@ -445,7 +446,7 @@ static void deliver_now(struct resolve_req *r)
 	/* not when the config changed under the walk (its deps are stale) */
 	if (r->cache_it && o->cfg->gen == r->gen0)
 		cache_insert(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype,
-		             r->qclass, cache_hash(r->qname.data, r->qname.len, r->qtype, r->qclass),
+		             r->qclass, r->key_hash,
 		             wire, (size_t)len, r->lifetime, r->deps, r->dsz, r->ndeps,
 		             r->binds, r->nbinds);
 	r->cb(r->ctx, wire, (size_t)len);
@@ -1360,20 +1361,24 @@ int resolve_lookup(struct omni *o, const struct dns_msg *query, struct cache_hit
 	const uint8_t *qname = dns_msg_qname(query);
 	uint8_t addr[16];
 
+	if (!query->has_q)
+		return -ENOENT;
+	/* for resolve_start_miss(): the insert after a miss hashes no more */
+	hit->hash = cache_hash(qname, query->qlen, query->qtype, query->qclass);
 	/* the precedence resolve_start() applies: ANY and fake PTR come first */
-	if (!o->cache || !query->has_q || query->qtype == DNS_T_ANY ||
+	if (!o->cache || query->qtype == DNS_T_ANY ||
 	    ptr_fake(o->fdb, qname, query->qlen, query->qtype, addr))
 		return -ENOENT;
 	if (cache_lookup(o->cache, o->cfg, qname, query->qlen, query->qtype, query->qclass,
-	                 cache_hash(qname, query->qlen, query->qtype, query->qclass), hit))
+	                 hit->hash, hit))
 		return -ENOENT;
 	stats.requests++;
 	stats.cache_hits++;
 	return 0;
 }
 
-struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
-                                  resolve_cb cb, void *ctx)
+static struct resolve_req *start(struct omni *o, const struct dns_msg *query,
+                                 uint64_t key_hash, resolve_cb cb, void *ctx)
 {
 	struct resolve_req *r;
 
@@ -1392,6 +1397,7 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 	r->qname.len = query->qlen;
 	r->qtype = query->qtype;
 	r->qclass = query->qclass;
+	r->key_hash = key_hash;
 	r->rd = query->flags & DNS_F_RD;
 	r->name = r->qname;
 	r->deps = r->deps_inline;
@@ -1409,6 +1415,21 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 		walk(r, false);
 	r->starting = false;
 	return r;
+}
+
+struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
+                                  resolve_cb cb, void *ctx)
+{
+	if (!query->has_q)
+		return NULL;
+	return start(o, query, cache_hash(dns_msg_qname(query), query->qlen, query->qtype,
+	                                  query->qclass), cb, ctx);
+}
+
+struct resolve_req *resolve_start_miss(struct omni *o, const struct dns_msg *query,
+                                       const struct cache_hit *miss, resolve_cb cb, void *ctx)
+{
+	return start(o, query, miss->hash, cb, ctx);
 }
 
 void resolve_cancel(struct resolve_req *r)

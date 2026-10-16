@@ -74,6 +74,8 @@ struct cache_hit {
 	const uint8_t *msg;	/* the stored response (see above) */
 	uint16_t len;
 	uint32_t age;		/* seconds since insert: subtract from TTLs */
+	uint64_t hash;		/* not set by the cache: resolve_lookup() keeps
+				 * the key hash here, hit or miss */
 };
 
 /* Returns 0 on hit, or -ENOENT. hit->msg points into the entry and stays
