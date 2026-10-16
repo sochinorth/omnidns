@@ -119,7 +119,7 @@ def measure(env, mfile, name, warm, names, ok):
             "qps": n / dt, "p50": pct(lat, 0.5) * 1e3, "p99": pct(lat, 0.99) * 1e3, "n": n}
 
 
-def run(env, mfile):
+def run(env, so, mfile):
     hit = ["h%d.hit.test" % i for i in range(N_HIT_NAMES)]
     cname_names = ["n%d.chain.test" % i for i in range(N_WARM + N_CNAME)]
     zone = {"records": [["plain.test", "A", 300, ti.REAL_B]] +
@@ -128,7 +128,15 @@ def run(env, mfile):
     env.files(zone=zone, config=CONFIG,
               namesets={"block.txt": "*.blk.test\n", "fake.txt": "*.fake.test\n"})
     env.upstreams()
-    env.start_daemon()
+    # only the daemon gets the preload (Env.start_daemon copies os.environ):
+    # anything else inheriting it (the Python fake upstreams) would map the
+    # same counter file and add its own allocations to the daemon's
+    os.environ.update(LD_PRELOAD=so, MCOUNT_FILE=mfile)
+    try:
+        env.start_daemon()
+    finally:
+        os.environ.pop("LD_PRELOAD", None)
+        os.environ.pop("MCOUNT_FILE", None)
     ti.check(counters(mfile)["malloc"] > 0, "mcount not active in the daemon")
 
     def distinct(fmt, n):
@@ -190,13 +198,7 @@ def main():
     rows, err = None, None
     try:
         env.netns()
-        # only the daemon gets the preload (Env.start_daemon copies os.environ)
-        os.environ.update(LD_PRELOAD=so, MCOUNT_FILE=mfile)
-        try:
-            rows = run(env, mfile)
-        finally:
-            os.environ.pop("LD_PRELOAD", None)
-            os.environ.pop("MCOUNT_FILE", None)
+        rows = run(env, so, mfile)
     except Exception as e:  # noqa: BLE001
         err = e
     finally:

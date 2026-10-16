@@ -10,6 +10,8 @@
  * any time by reading the file (MCOUNT_NFIELDS native-endian uint64s, in the
  * order of struct counters) -- no signals, nothing runs inside the process.
  * Without $MCOUNT_FILE (or if mapping fails) counting goes to a static block.
+ * The constructor removes LD_PRELOAD and MCOUNT_FILE from the environment, so
+ * children of the counted process do not add to (or reset) its counters.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -77,9 +79,11 @@ __attribute__((constructor)) static void mcount_init(void)
 {
 	resolve();
 	const char *path = getenv("MCOUNT_FILE");
+	unsetenv("LD_PRELOAD");
 	if (!path)
 		return;
 	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	unsetenv("MCOUNT_FILE");
 	if (fd < 0)
 		return;
 	if (ftruncate(fd, sizeof(struct counters)) == 0) {
