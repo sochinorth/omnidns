@@ -1154,6 +1154,11 @@ TEST(r_reload_revalidation)
 	CHECK(fakeip_in_pool(o.fdb, 4, res.rr[0].rdata));
 	S("10.0.0.1", "www.plain.example", DNS_T_A, 0, "an www.plain.example 300 A 1.1.1.1");
 	REQUIRE(run("www.plain.example", DNS_T_A));
+	/* glue of a fakeip name is dropped; that depends on its rule too */
+	S("10.0.0.1", "m.plain.example", DNS_T_MX, 0,
+	  "an m.plain.example 300 MX 10 mx.vpn.example;ar mx.vpn.example 300 A 1.2.3.5");
+	REQUIRE(run("m.plain.example", DNS_T_MX));
+	CHECK_EQ(count(DNS_S_AR), 0);
 
 	/* reload with the same rules: still hits */
 	ncfg = load(CFG_DEFAULT);
@@ -1171,6 +1176,10 @@ TEST(r_reload_revalidation)
 	CHECK_STR(R(0), "www.vpn.example 300 A 1.2.3.4");
 	REQUIRE(run("www.plain.example", DNS_T_A));
 	CHECK(no_queries());
+	/* the glue owner is a plain forward now: the answer is redone, glue kept */
+	REQUIRE(run("m.plain.example", DNS_T_MX));
+	CHECK_EQ(nqueries, 1);
+	CHECK_EQ(count(DNS_S_AR), 1);
 }
 
 TEST(s_upstream_error)
