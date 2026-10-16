@@ -418,8 +418,9 @@ output_reject      (filter, output,     filter-1):  same
 `SIGHUP` builds a complete new configuration on the side. Only if every
 step succeeds does it replace the old one:
 
-1. Load and validate the UCI file. Nameset and upstream files are re-read
-   only if changed.
+1. Load and validate the UCI file. Nameset files are re-read only if
+   changed. If every rule references the same nameset files as before, the
+   match table is shared instead of rebuilt.
 2. If `fwmask` changed:
    - flush the cache, since every cached fake embeds old marks;
    - evict expired bindings;
@@ -427,14 +428,23 @@ step succeeds does it replace the old one:
 3. Apply new pool and capacity settings to the binding table. Reject the
    reload if a live binding would fall outside a new pool.
 4. Drain pending nftables deletes, then reconcile chains and rules in one
-   transaction.
-5. Swap in the new configuration with a new generation number, and re-bind
-   the listeners if they changed.
+   transaction, or send none if the dataplane state is unchanged.
+5. Swap in the new configuration and re-bind the listeners if they changed.
+   It gets a new generation number unless resolution is unchanged: a shared
+   match table, the same fwmask and equal rule fingerprints by ordinal.
 
 On any failure, the previous configuration stays in effect and the reason
 goes to syslog. Live bindings and their map elements are never touched by a
-reload. The procd service sends SIGHUP on config changes and whenever an
-interface comes up, since WAN reconnects rewrite `resolv.conf.auto`.
+reload. A walk that latched a mark before an fwmask change and binds after
+it finds that mark's chain gone, so that query alone gets SERVFAIL.
+
+The procd service sends SIGHUP on config changes and whenever an interface
+comes up, since WAN reconnects rewrite `resolv.conf.auto`. Most of these
+reloads change nothing, and such a no-op reload costs a UCI parse, one
+`stat` per nameset file and a re-read of each upstream file. It builds no
+match table, sends no nftables transaction and keeps the generation, so
+cached answers skip revalidation. The log still says
+`configuration reloaded (generation N kept: resolution unchanged, ...)`.
 
 ## Limitations
 

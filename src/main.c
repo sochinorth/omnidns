@@ -158,7 +158,7 @@ static int reload(void)
 	config_free(old);
 	nsc_sweep(&omni.nsc);
 	log_info("configuration reloaded (generation %llu%s, %u rules)",
-	         (unsigned long long)ncfg->gen, same ? " kept, rules unchanged" : "",
+	         (unsigned long long)ncfg->gen, same ? " kept: resolution unchanged" : "",
 	         ncfg->nrules);
 	return 0;
 
