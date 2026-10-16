@@ -29,8 +29,8 @@ struct fakeip_db {
 	uint32_t grace;
 	uint8_t secret[16];
 	struct nft_ctx *nft;
-	struct hmap by_key;	/* khash -> binding */
-	struct hmap by_fake;	/* fhash -> binding */
+	struct hmap by_key;	/* key_hash() -> binding (= b->s3.hash) */
+	struct hmap by_fake;	/* fake_hash() -> binding */
 	struct hmap rules;	/* interned rule_id strings */
 	struct hmap marks;	/* mark -> count */
 	struct s3fifo s3;
@@ -316,8 +316,8 @@ static void binding_free(struct fakeip_db *db, struct binding *b)
 /* Remove from the maps (not from s3) and release the mark. */
 static void binding_unmap(struct fakeip_db *db, struct binding *b)
 {
-	hmap_del_ptr(&db->by_key, b->khash, b);
-	hmap_del_ptr(&db->by_fake, b->fhash, b);
+	hmap_del_ptr(&db->by_key, b->s3.hash, b);
+	hmap_del_ptr(&db->by_fake, fake_hash(b->family, b->fake), b);
 	mark_dec(db, b->mark);
 }
 
@@ -508,7 +508,7 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 		}
 	}
 	r = -ENOMEM;
-	b = calloc(1, sizeof(*b) + k->endpoint_len);
+	b = calloc(1, offsetof(struct binding, endpoint) + k->endpoint_len);
 	if (!b)
 		goto fail;
 	b->rule_id = rule_get(db, k->rule_id);
@@ -516,18 +516,16 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 		goto fail_free;
 	if (mark_inc(db, k->mark))
 		goto fail_rule;
-	b->khash = khash;
 	b->mark = k->mark;
 	b->family = k->family;
 	memcpy(b->fake, fake, alen(k->family));
 	memcpy(b->real, k->real, alen(k->family));
-	b->fhash = fake_hash(b->family, b->fake);
 	b->endpoint_len = k->endpoint_len;
 	memcpy(b->endpoint, k->endpoint, k->endpoint_len);
 	b->safe_until = safe_until_for(db, now, ttl);
 	if (hmap_put(&db->by_key, khash, b))
 		goto fail_mark;
-	if (hmap_put(&db->by_fake, b->fhash, b)) {
+	if (hmap_put(&db->by_fake, fake_hash(b->family, b->fake), b)) {
 		hmap_del_ptr(&db->by_key, khash, b);
 		goto fail_mark;
 	}

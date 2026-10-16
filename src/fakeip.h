@@ -3,6 +3,7 @@
 #define OMNI_FAKEIP_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "config.h"
@@ -42,21 +43,31 @@
 
 struct nft_ctx;
 
+/*
+ * Layout: no padding holes, the endpoint follows the fixed part directly
+ * and bindings are allocated as offsetof(endpoint) + endpoint_len. The key
+ * hash is not stored: by_key uses s3.hash (its low 32 bits, all hmap
+ * keeps), and the 64-bit value is only needed when allocating. The
+ * by_fake hash is recomputed from (family, fake) on removal.
+ */
 struct binding {
-	struct s3_node s3;
-	uint64_t khash;		/* key hash */
-	uint64_t fhash;		/* hash of (family, fake) */
+	struct s3_node s3;	/* s3.hash: low 32 bits of the key hash */
+	uint64_t ticket;	/* nft batch that installed it */
 	const char *rule_id;	/* interned (owned by db) */
 	uint32_t mark;
+	uint32_t safe_until;	/* omni_now() seconds */
+	uint32_t refcnt;	/* cache entries referencing it */
 	uint8_t family;		/* 4 or 6 */
+	uint8_t endpoint_len;
 	uint8_t fake[16];
 	uint8_t real[16];
-	uint32_t safe_until;	/* omni_now() seconds */
-	uint64_t ticket;	/* nft batch that installed it */
-	uint32_t refcnt;	/* cache entries referencing it */
-	uint8_t endpoint_len;
 	uint8_t endpoint[];	/* lowercased wire name */
 };
+
+/* s3 (2 pointers + 8) + ticket + rule_id + 3 * u32 + 2 + 2 * 16:
+ * 86 bytes on LP64, 74 on ILP32 */
+_Static_assert(offsetof(struct binding, endpoint) == 3 * sizeof(void *) + 62,
+               "binding layout");
 
 struct fakeip_db;
 

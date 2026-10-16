@@ -9,6 +9,17 @@
 #include "util/hash.h"
 #include "util/time.h"
 
+#define PIN_V4 0x5ad003565eae26dbull
+#define PIN_V4_0 0xc6120708
+#define PIN_V4_1 0xc6120729
+#define PIN_V4_2 0xc61207fb
+#define PIN_V4_3 0xc6120796
+#define PIN_V6_80 0x7ed8b11c88d6aa37ull
+#define PIN_V6_48 0x79d624e34f225742ull
+#define PIN_V6_120 0x4a7d7670eeea6cd1ull
+#define PIN_RECLAIM 0xd67ef546d77e254dull
+#define PIN_RELOAD 0x99c5b34e1f26e159ull
+
 /* ---- nft stubs with a model of the kernel maps ---- */
 
 struct kelem {
@@ -746,6 +757,170 @@ TEST(stress)
 	fakeip_free(db);
 }
 
+/* ---- pinned allocations (regression guard for the binding layout) ---- */
+
+static uint64_t fnv(uint64_t h, const void *p, size_t n)
+{
+	const uint8_t *c = p;
+
+	while (n--)
+		h = (h ^ *c++) * 0x100000001b3ull;
+	return h;
+}
+
+#define FNV0 0xcbf29ce484222325ull
+
+/* v4 under heavy probing: 200 keys into a /24 (254 usable) */
+static uint64_t pin_v4(struct fakeip_db *db, uint32_t *first)
+{
+	static const char *rules[] = { "r1", "rule-two", "x" };
+	uint64_t h = FNV0;
+	int err;
+
+	for (uint32_t i = 0; i < 200; i++) {
+		char name[32];
+		struct binding *b;
+
+		snprintf(name, sizeof(name), "Host%u.Example.%s", i % 37, i & 1 ? "com" : "net");
+		b = bind4(db, rules[i % 3], (i % 5) << 24, name, 0x0a000000 + i * 7919, 60, &err);
+		if (!b) {
+			h = fnv(h, &err, sizeof(err));
+			continue;
+		}
+		if (i < 4)
+			first[i] = fake4(b);
+		h = fnv(h, b->fake, 4);
+		CHECK(fakeip_lookup(db, 4, b->fake) == b);
+	}
+	return h;
+}
+
+static uint64_t pin_v6(const char *base, int plen)
+{
+	struct ip_prefix p6 = pfx(base, plen);
+	struct fakeip_db *db = fakeip_new(NULL, &p6, 1000, 0, SECRET, NFT);
+	uint64_t h = FNV0;
+	int err;
+
+	for (uint32_t i = 0; i < 300; i++) {
+		char name[32];
+		struct binding *b;
+
+		snprintf(name, sizeof(name), "v6-%u.example", i % 50);
+		b = bind6(db, i & 1 ? "a" : "bb", i % 3, name, i, 60, &err);
+		if (!b) {
+			h = fnv(h, &err, sizeof(err));
+			continue;
+		}
+		h = fnv(h, b->fake, 16);
+		CHECK(fakeip_lookup(db, 6, b->fake) == b);
+	}
+	fakeip_free(db);
+	return h;
+}
+
+TEST(pinned)
+{
+	static const uint8_t hkey[16] = { 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+	struct ip_prefix p24 = pfx("198.18.7.0", 24), p28 = pfx("10.9.0.0", 28);
+	struct ip_prefix p15 = pfx("198.18.0.0", 15), p16 = pfx("198.18.0.0", 16);
+	struct fakeip_db *db;
+	struct binding *b, *olds[14];
+	uint32_t first[4] = { 0 }, it;
+	uint64_t h;
+	int err;
+
+	hash_init_fixed(hkey);
+	reset();
+	db = fakeip_new(&p24, NULL, 1000, 0, SECRET, NFT);
+	h = pin_v4(db, first);
+	fprintf(stderr, "  pin v4 %#llx %#x %#x %#x %#x\n", (unsigned long long)h,
+		first[0], first[1], first[2], first[3]);
+	CHECK_EQ(h, PIN_V4);
+	CHECK_EQ(first[0], PIN_V4_0);
+	CHECK_EQ(first[1], PIN_V4_1);
+	CHECK_EQ(first[2], PIN_V4_2);
+	CHECK_EQ(first[3], PIN_V4_3);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+
+	/* v6: usable = 2^48-1 and 2^64-1 (both > 2^32: the full 64-bit key
+	 * hash picks the first candidate), and a tiny /120 that probes */
+	reset();
+	h = pin_v6("fd00:1:2::", 80);
+	fprintf(stderr, "  pin v6/80 %#llx\n", (unsigned long long)h);
+	CHECK_EQ(h, PIN_V6_80);
+	h = pin_v6("64:ff9b:1::", 48);
+	fprintf(stderr, "  pin v6/48 %#llx\n", (unsigned long long)h);
+	CHECK_EQ(h, PIN_V6_48);
+	h = pin_v6("fd00:9::100", 120);
+	fprintf(stderr, "  pin v6/120 %#llx\n", (unsigned long long)h);
+	CHECK_EQ(h, PIN_V6_120);
+	CHECK_EQ(kern_bad, 0);
+
+	/* reclaim of expired slots and PTR lookups through by_fake */
+	reset();
+	db = fakeip_new(&p28, NULL, 1000, 0, SECRET, NFT);
+	h = FNV0;
+	for (int i = 0; i < 14; i++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "old%d", i);
+		olds[i] = bind4(db, "r", 0, name, i, 5, &err);
+		REQUIRE(olds[i]);
+		h = fnv(h, olds[i]->fake, 4);
+	}
+	CHECK(!bind4(db, "r", 0, "new0", 1, 5, &err));
+	time_override_advance(10);
+	for (int i = 0; i < 14; i++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "new%d", i);
+		b = bind4(db, "r", 0, name, i, 5, &err);
+		REQUIRE(b);
+		h = fnv(h, b->fake, 4);
+		CHECK(fakeip_lookup(db, 4, b->fake) == b);
+		CHECK(!memcmp(b->endpoint + 1, "new", 3));
+	}
+	fprintf(stderr, "  pin reclaim %#llx\n", (unsigned long long)h);
+	CHECK_EQ(h, PIN_RECLAIM);
+	CHECK_EQ(n_add_replace, 14);
+	CHECK_EQ(fakeip_count(db), 14);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+
+	/* reload: shrink the pool, evicted keys come back in the new pool */
+	reset();
+	db = fakeip_new(&p15, NULL, 1000, 0, SECRET, NFT);
+	for (int i = 0; i < 64; i++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "k%d", i);
+		REQUIRE(bind4(db, "r", 1, name, i, 5, &err));
+	}
+	time_override_advance(10);
+	CHECK_EQ(fakeip_set_config(db, &p16, NULL, 1000, 0), 0);
+	it = 0;
+	while ((b = fakeip_next(db, &it))) {
+		CHECK_EQ(b->fake[1], 18);
+		CHECK(fakeip_lookup(db, 4, b->fake) == b);
+	}
+	h = FNV0;
+	for (int i = 0; i < 80; i++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "k%d", i);
+		b = bind4(db, "r", 1, name, i, 5, &err);
+		REQUIRE(b);
+		CHECK_EQ(b->fake[1], 18);
+		h = fnv(h, b->fake, 4);
+	}
+	fprintf(stderr, "  pin reload %#llx\n", (unsigned long long)h);
+	CHECK_EQ(h, PIN_RELOAD);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
 int main(void)
 {
 	RUN(determinism);
@@ -760,5 +935,6 @@ int main(void)
 	RUN(marks);
 	RUN(capacity);
 	RUN(stress);
+	RUN(pinned);
 	return test_summary();
 }
