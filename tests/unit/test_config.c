@@ -596,6 +596,12 @@ TEST(nameset_long_lines)
 	CHECK_EQ(inval, 0);
 	CHECK_STR(ent(1), "abc.def");
 	CHECK_EQ(ns_win("abc.def", 7, 7, &inval), 1);
+	/* a blank (whitespace-only) line filling the window is just blank */
+	CHECK_EQ(ns_win("        \nfoo.com\n", 17, 8, &inval), 1);
+	CHECK_EQ(inval, 0);
+	CHECK_STR(ent(0), "foo.com");
+	CHECK_EQ(ns_win(" \t\r     \r\nfoo.com", 17, 8, &inval), 1);
+	CHECK_EQ(inval, 0);
 	free(t);
 }
 

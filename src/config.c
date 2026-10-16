@@ -502,7 +502,8 @@ static int ns_parse(ns_read_fn rd, void *ctx, size_t window, size_t size,
 				ret = rd(ctx, &c, 1, pos + (uint64_t)n);
 				if (ret > 0) {
 					lineno++;
-					if (*s != '#')
+					/* s == e: whitespace only, i.e. a blank line */
+					if (s < e && *s != '#')
 						ns_invalid(&o, lineno, s, (size_t)(e - s));
 					ret = ns_skip_line(rd, ctx, win, window, pos + (uint64_t)n);
 				}
