@@ -110,7 +110,11 @@ struct dns_msg {
 	bool buf_ext;			/* buf is the caller's (dns_msg_init_buf) */
 };
 
-/* The question name (original case as received); NULL without a question. */
+/*
+ * The question name (original case as received); NULL without a question.
+ * It lives in m's own buffer: do not pass it to a call that may grow that
+ * buffer (e.g. dns_msg_add_rr(m, ...) as an owner) without copying it first.
+ */
 static inline const uint8_t *dns_msg_qname(const struct dns_msg *m)
 {
 	return m->has_q ? m->buf + m->qoff : NULL;

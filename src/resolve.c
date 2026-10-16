@@ -396,7 +396,7 @@ void resolve_shutdown(void)
 	pool_drain(&req_pool);
 }
 
-static void out_init(struct resolve_req *r, int rcode);
+static int out_init(struct resolve_req *r, int rcode);
 
 /*
  * The answer leaves as bytes, built once: the cache stores them and the
@@ -445,12 +445,20 @@ static void deliver(struct resolve_req *r)
 	deliver_now(r);
 }
 
-static void out_init(struct resolve_req *r, int rcode)
+/*
+ * Cannot fail once resolve_start() has run it: the question then has room
+ * in r->out's storage, which a reset keeps (and a swapped-in upstream
+ * message carries the same question, so it has room too).
+ */
+static int out_init(struct resolve_req *r, int rcode)
 {
+	int ret;
+
 	dns_msg_reset(&r->out);
-	dns_msg_set_question(&r->out, r->qname.data, r->qname.len, r->qtype, r->qclass);
+	ret = dns_msg_set_question(&r->out, r->qname.data, r->qname.len, r->qtype, r->qclass);
 	r->out.flags = DNS_F_QR | DNS_F_RA | r->rd;
 	dns_msg_set_rcode(&r->out, rcode);
+	return ret;
 }
 
 static void finish_rcode(struct resolve_req *r, int rcode)
@@ -1314,7 +1322,6 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 	r = req_get();
 	if (!r)
 		return NULL;
-	stats.requests++;
 	r->o = o;
 	r->cb = cb;
 	r->ctx = ctx;
@@ -1329,6 +1336,12 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 	r->name = r->qname;
 	r->deps = r->deps_inline;
 	r->dcap = sizeof(r->deps_inline);
+	/* make room for the question now, so no later answer can lack it */
+	if (out_init(r, DNS_R_SERVFAIL)) {
+		req_free(r);
+		return NULL;
+	}
+	stats.requests++;
 
 	if (r->qtype == DNS_T_ANY)
 		finish_rcode(r, DNS_R_NOTIMP);
