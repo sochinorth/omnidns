@@ -42,6 +42,38 @@ static uint64_t rng(void)
 	return rng_state = x;
 }
 
+/*
+ * Structural check of the raw table: counts, no purge marks left, and every
+ * live entry reachable (no empty slot between its home and its slot).
+ */
+static void check_table(const struct hmap *m)
+{
+	uint32_t live = 0, tomb = 0, i, j;
+
+	if (!m->mask) {
+		CHECK_EQ(m->len, 0);
+		return;
+	}
+	for (i = 0; i <= m->mask; i++) {
+		if (!m->val[i])
+			continue;
+		if (m->val[i] == (void *)(uintptr_t)1) {
+			tomb++;
+			continue;
+		}
+		live++;
+		CHECK((m->hash[i] & 0x80000000u) == 0);
+		for (j = m->hash[i] & m->mask; j != i; j = (j + 1) & m->mask)
+			if (!m->val[j]) {
+				CHECK(0);
+				return;
+			}
+	}
+	CHECK_EQ(live, m->len);
+	CHECK_EQ(live + tomb, m->used);
+	CHECK(m->used * 4 <= (m->mask + 1) * 3);
+}
+
 TEST(siphash_vector)
 {
 	uint8_t key[16], msg[64];
@@ -264,48 +296,173 @@ TEST(hmap_tombstone_churn)
 	free(it);
 }
 
-/* Random ops against a dense reference array. */
+/*
+ * Random ops against a dense reference array. The live set swings between
+ * near-empty and N in phases, so tables grow, purge tombstones in place
+ * (the slot array stays put) and shrink; chains are checked structurally.
+ */
 TEST(hmap_random_model)
 {
-	enum { N = 4096, OPS = 400000 };
+	enum { N = 4096, OPS = 600000, PHASE = 20000 };
 	struct hmap m = HMAP_INIT;
 	struct item *it = calloc(N, sizeof(*it));
 	bool *in = calloc(N, sizeof(*in));
-	uint32_t i, len = 0;
+	uint32_t i, len = 0, purges = 0, shrinks = 0, grows = 0;
 
 	REQUIRE(it && in);
 	for (i = 0; i < N; i++)
 		it[i].key = i;
 	for (i = 0; i < OPS; i++) {
-		uint32_t k = rng() % N;
+		uint32_t k = rng() % N, cap = m.mask + 1, used = m.used;
 		uint64_t h = key_hash(k) & 0xfff;	/* force some hash collisions */
-		switch (rng() % 4) {
-		case 0:
-		case 1:
-			if (!in[k]) {
-				REQUIRE(hmap_put(&m, h, &it[k]) == 0);
-				in[k] = true;
-				len++;
+		/* phases: mostly inserting, balanced, mostly deleting */
+		uint32_t phase = i / PHASE % 4, ins = phase == 0 ? 6 : phase == 2 ? 1 : 3;
+		void **slots = m.val;
+
+		if (k & 1)
+			h |= 0xffffffff80000000ull;	/* the bits a table never keeps */
+		switch (rng() % 8) {
+		case 0: case 1: case 2: case 3: case 4: case 5:
+			if (rng() % 6 < ins) {
+				if (!in[k]) {
+					REQUIRE(hmap_put(&m, h, &it[k]) == 0);
+					in[k] = true;
+					len++;
+					if (m.val == slots && m.used < used)
+						purges++;
+					else if (m.mask + 1 < cap)
+						shrinks++;
+					else if (m.mask + 1 > cap)
+						grows++;
+				}
+			} else {
+				CHECK(del(&m, h, k) == (in[k] ? &it[k] : NULL));
+				len -= in[k];
+				in[k] = false;
 			}
 			break;
-		case 2:
-			CHECK(del(&m, h, k) == (in[k] ? &it[k] : NULL));
-			len -= in[k];
-			in[k] = false;
-			break;
-		case 3:
+		default:
 			CHECK(get(&m, h, k) == (in[k] ? &it[k] : NULL));
 			break;
 		}
+		if (i % 4096 == 0)
+			check_table(&m);
 		if (test_cur_failed)
 			break;
 	}
+	fprintf(stderr, "  model: %u purges in place, %u shrinks, %u grows\n",
+	        purges, shrinks, grows);
+	CHECK(purges > 3 && shrinks > 2 && grows > 2);
 	CHECK_EQ(hmap_len(&m), len);
+	check_table(&m);
 	for (i = 0; i < N; i++)
-		CHECK(get(&m, key_hash(i) & 0xfff, i) == (in[i] ? &it[i] : NULL));
+		CHECK(get(&m, (key_hash(i) & 0xfff) | (i & 1 ? 0xffffffff80000000ull : 0), i) ==
+		      (in[i] ? &it[i] : NULL));
 	hmap_free(&m);
 	free(it);
 	free(in);
+}
+
+/* Tombstone purges reuse the slot array: churn at a steady size allocates once. */
+TEST(hmap_purge_in_place)
+{
+	enum { LIVE = 10000, CYCLES = 200000 };
+	struct hmap m = HMAP_INIT;
+	struct item *it = calloc(LIVE, sizeof(*it));
+	uint64_t next = 0;
+	uint32_t i, purges = 0;
+	void **slots;
+
+	REQUIRE(it);
+	for (i = 0; i < LIVE; i++) {
+		it[i].key = next++;
+		REQUIRE(hmap_put(&m, key_hash(it[i].key), &it[i]) == 0);
+	}
+	slots = m.val;
+	CHECK_EQ(m.mask + 1, 16384);
+	for (i = 0; i < CYCLES; i++) {
+		struct item *x = &it[rng() % LIVE];
+		uint32_t used;
+
+		REQUIRE(del(&m, key_hash(x->key), x->key) == x);
+		x->key = next++;
+		used = m.used;
+		REQUIRE(hmap_put(&m, key_hash(x->key), x) == 0);
+		if (m.used < used) {
+			purges++;
+			CHECK_EQ(m.used, LIVE);
+			check_table(&m);
+		}
+		if (m.val != slots) {
+			CHECK(0);
+			break;
+		}
+	}
+	CHECK(purges > 10);
+	for (i = 0; i < LIVE; i++)
+		CHECK(get(&m, key_hash(it[i].key), it[i].key) == &it[i]);
+	hmap_free(&m);
+	free(it);
+}
+
+/* A burst's table is given back once most of it is gone, without thrashing. */
+TEST(hmap_shrink)
+{
+	enum { N = 100000 };
+	struct hmap m = HMAP_INIT;
+	struct item *it = calloc(N, sizeof(*it));
+	uint32_t i, cap, reallocs = 0;
+	void **slots;
+
+	REQUIRE(it);
+	for (i = 0; i < N; i++) {
+		it[i].key = i;
+		REQUIRE(hmap_put(&m, key_hash(i), &it[i]) == 0);
+	}
+	cap = m.mask + 1;
+	CHECK_EQ(cap, 1u << 18);
+	/* deleting never reallocates (iteration may delete) */
+	for (i = 100; i < N; i++)
+		REQUIRE(del(&m, key_hash(i), i) == &it[i]);
+	CHECK_EQ(m.mask + 1, cap);
+	/* the next put shrinks to 1/4..3/8 full */
+	REQUIRE(hmap_put(&m, key_hash(100), &it[100]) == 0);
+	CHECK_EQ(m.mask + 1, 512);
+	CHECK_EQ(m.used, 101);
+	check_table(&m);
+	for (i = 0; i < N; i++)
+		CHECK(get(&m, key_hash(i), i) == (i <= 100 ? &it[i] : NULL));
+	/* hysteresis: swinging by a factor of 2 around that size never reallocates */
+	slots = m.val;
+	for (int round = 0; round < 50; round++) {
+		for (i = 101; i < 300; i++)
+			REQUIRE(hmap_put(&m, key_hash(i), &it[i]) == 0);
+		for (i = 1; i < 300; i++)
+			if (i < 30 || i > 100)
+				REQUIRE(del(&m, key_hash(i), i) == &it[i]);
+		for (i = 1; i < 30; i++)
+			REQUIRE(hmap_put(&m, key_hash(i), &it[i]) == 0);
+		reallocs += m.val != slots;
+		slots = m.val;
+	}
+	CHECK_EQ(reallocs, 0);
+	check_table(&m);
+	/* a reserve sets a floor */
+	hmap_free(&m);
+	REQUIRE(hmap_reserve(&m, 5000) == 0);
+	cap = m.mask + 1;
+	REQUIRE(hmap_put(&m, key_hash(0), &it[0]) == 0);
+	CHECK_EQ(m.mask + 1, cap);
+	for (i = 1; i < 7000; i++)
+		REQUIRE(hmap_put(&m, key_hash(i), &it[i]) == 0);
+	CHECK(m.mask + 1 > cap);
+	for (i = 1; i < 7000; i++)
+		REQUIRE(del(&m, key_hash(i), i) == &it[i]);
+	REQUIRE(hmap_put(&m, key_hash(1), &it[1]) == 0);
+	CHECK_EQ(m.mask + 1, cap);
+	check_table(&m);
+	hmap_free(&m);
+	free(it);
 }
 
 /*
@@ -415,6 +572,8 @@ int main(void)
 	RUN(hmap_iter_delete);
 	RUN(hmap_tombstone_churn);
 	RUN(hmap_random_model);
+	RUN(hmap_purge_in_place);
+	RUN(hmap_shrink);
 	RUN(hmap_upper_bits);
 	RUN(hmap_growth_churn);
 	return test_summary();

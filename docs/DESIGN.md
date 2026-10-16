@@ -481,6 +481,12 @@ output_reject      (filter, output,     filter-1):  same
   Dropping a cache entry never deletes a binding.
 - **Eviction**: an S3-FIFO bounded by entry count and bytes, run in batches
   down to 7/8 of the limit.
+- **Index**: the cache, like the binding table, indexes entries in an
+  open-addressing hash map (`util/hmap`, linear probing, tombstones). The
+  tombstones that churn leaves behind are purged in place, without
+  allocating, so a steady cache allocates only its entries; a table less
+  than 1/8 full is shrunk on the next insert, so the index of a burst is
+  given back once the burst's entries are gone.
 
 ## Upstream client
 
