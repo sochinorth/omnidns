@@ -762,6 +762,136 @@ TEST(truncate_512)
 	dns_msg_free(&b);
 }
 
+/* Names compress regardless of case and take the earlier name's case. */
+TEST(compress_nocase)
+{
+	struct dns_msg m, b;
+	uint8_t q[256], o[256], t[256], o2[256], out[1024];
+	uint8_t ql, ol, tl, o2l;
+	int n;
+
+	dns_msg_init(&m);
+	dns_msg_init(&b);
+	ql = wn(q, "WwW.ExAmple.COM");
+	ol = wn(o, "www.example.com");
+	tl = wn(t, "CDN.example.com");
+	o2l = wn(o2, "cdn.EXAMPLE.com");
+	REQUIRE(dns_msg_set_question(&m, q, ql, DNS_T_A, DNS_C_IN) == 0);
+	REQUIRE(dns_msg_add_rr(&m, DNS_S_AN, o, ol, DNS_T_CNAME, 1, 30, t, tl) == 0);
+	REQUIRE(dns_msg_add_rr(&m, DNS_S_AN, o2, o2l, DNS_T_A, 1, 30,
+	                       (const uint8_t *)"\x0a\0\0\x01", 4) == 0);
+	n = dns_build(&m, out, sizeof(out));
+	/* header, question, CNAME (c00c, rdata "CDN" + c010), A (pointer to CDN...) */
+	CHECK_EQ(n, 12 + ql + 4 + (2 + 10 + 6) + (2 + 10 + 4));
+	CHECK(out[12 + ql + 4] == 0xc0 && out[12 + ql + 5] == 12);
+	REQUIRE(dns_parse(&b, out, (size_t)n) == 0);
+	CHECK(!memcmp(b.rr[0].owner, q, ql));
+	CHECK(!memcmp(b.rr[0].rdata, "\x03" "CDN" "\x07" "ExAmple" "\x03" "COM", tl));
+	CHECK(!memcmp(b.rr[1].owner, b.rr[0].rdata, tl));
+	dns_msg_free(&m);
+	dns_msg_free(&b);
+}
+
+/* Build m with question name q, id and flags as a server stamps them. */
+static int stamped_build(const struct dns_msg *src, const uint8_t *q, uint8_t ql, uint16_t id,
+                         uint16_t rdcd, bool edns, uint32_t age, uint8_t *out, size_t maxlen)
+{
+	struct dns_msg m;
+	uint16_t i;
+	int n;
+
+	dns_msg_init(&m);
+	if (dns_msg_copy(&m, src))
+		return -ENOMEM;
+	for (i = 0; i < m.nrr; i++)
+		m.rr[i].ttl = m.rr[i].ttl > age ? m.rr[i].ttl - age : 0;
+	m.id = id;
+	m.flags = (m.flags & ~(DNS_F_RD | DNS_F_CD | DNS_F_OPCODE | DNS_F_AA)) |
+	          DNS_F_QR | DNS_F_RA | rdcd;
+	dns_msg_set_question(&m, q, ql, src->qtype, src->qclass);
+	memset(&m.edns, 0, sizeof(m.edns));
+	m.edns.present = edns;
+	m.edns.udp_size = edns ? 1232 : 0;
+	n = dns_build(&m, out, maxlen);
+	dns_msg_free(&m);
+	return n;
+}
+
+TEST(reply_render)
+{
+	static uint8_t stored[65535], got[65535], want[65535];
+	struct dns_msg m;
+	uint8_t q[256], q2[256], o[256], t[256];
+	uint8_t ql, ol, tl;
+	struct dns_reply rp = { 0 };
+	int n, len, w, i;
+	size_t lim;
+
+	dns_msg_init(&m);
+	ql = wn(q, "a.b.example");
+	wn(q2, "A.B.Example");
+	ol = wn(o, "x.b.example");		/* "x" + pointer into the question */
+	tl = wn(t, "deep.label.x.b.example");
+	REQUIRE(dns_msg_set_question(&m, q, ql, DNS_T_MX, DNS_C_IN) == 0);
+	m.flags = DNS_F_QR | DNS_F_AA | DNS_F_RD | DNS_F_AD | 0x0040 | DNS_R_NXDOMAIN;
+	for (i = 0; i < 40; i++) {
+		uint8_t rd[300] = { 0, (uint8_t)i };
+
+		memcpy(rd + 2, t, tl);
+		REQUIRE(dns_msg_add_rr(&m, i < 20 ? DNS_S_AN : DNS_S_AR, i % 2 ? o : q,
+		                       i % 2 ? ol : ql, DNS_T_MX, 1, (uint32_t)(i * 7), rd,
+		                       (uint16_t)(2 + tl)) == 0);
+	}
+	len = dns_build(&m, stored, sizeof(stored));
+	REQUIRE(len > 512);
+
+	rp.qname = q2;
+	rp.qlen = ql;
+	rp.edns_udp = 1232;
+	/* every limit from "only the question fits" up, with and without OPT and age */
+	for (lim = 12 + ql + 4; lim <= (size_t)len + 20; lim++) {
+		for (i = 0; i < 4; i++) {
+			rp.id = (uint16_t)lim;
+			rp.rdcd = i & 1 ? DNS_F_CD : DNS_F_RD;
+			rp.edns = i & 2;
+			rp.age = i * 33;
+			n = dns_reply_render(stored, (size_t)len, &rp, got, lim);
+			w = stamped_build(&m, q2, ql, rp.id, rp.rdcd, rp.edns, rp.age, want, lim);
+			CHECK_EQ(n, w);
+			if (n != w || (n > 0 && memcmp(got, want, (size_t)n))) {
+				fprintf(stderr, "  limit %zu variant %d\n", lim, i);
+				CHECK(0);
+				goto out;
+			}
+		}
+	}
+	/* maxlen above a message is clamped like dns_build() */
+	rp.edns = true;
+	CHECK_EQ(dns_reply_render(stored, (size_t)len, &rp, got, 100000), len + 11);
+
+	/* not the stored question, not one question, malformed */
+	rp.qname = (const uint8_t *)"\x01" "a" "\x01" "c" "\x07" "example";
+	CHECK_EQ(dns_reply_render(stored, (size_t)len, &rp, got, 512), -EINVAL);
+	rp.qname = q2;
+	rp.qlen = ql - 2;
+	CHECK_EQ(dns_reply_render(stored, (size_t)len, &rp, got, 512), -EINVAL);
+	rp.qlen = ql;
+	CHECK_EQ(dns_reply_render(stored, 11, &rp, got, 512), -EINVAL);
+	rp.age = 1;
+	CHECK_EQ(dns_reply_render(stored, (size_t)len - 1, &rp, got, 65535), -EINVAL);
+	memcpy(want, stored, (size_t)len);
+	want[5] = 2;
+	CHECK_EQ(dns_reply_render(want, (size_t)len, &rp, got, 512), -EINVAL);
+	want[5] = 1;
+	want[7]++;			/* one AN record more than there is */
+	CHECK_EQ(dns_reply_render(want, (size_t)len, &rp, got, 65535), -EINVAL);
+	/* the question alone does not fit */
+	rp.edns = true;
+	CHECK_EQ(dns_reply_render(stored, (size_t)len, &rp, got, 12 + ql + 4 + 10), -ENOSPC);
+out:
+	dns_msg_free(&m);
+}
+
 TEST(names)
 {
 	uint8_t a[256], b[256], z[256], t[256];
@@ -1014,6 +1144,8 @@ int main(void)
 	RUN(round_trip_compress);
 	RUN(round_trip_parsed);
 	RUN(truncate_512);
+	RUN(compress_nocase);
+	RUN(reply_render);
 	RUN(names);
 	RUN(copy_footprint);
 	RUN(growth_rebase);

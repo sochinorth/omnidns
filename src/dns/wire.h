@@ -187,15 +187,52 @@ size_t dns_msg_footprint(const struct dns_msg *m);
 
 /*
  * Serialize with name compression (owner names and the compressible rdata
- * types listed above). `maxlen` is the size limit (512..65535).
+ * types listed above). `maxlen` is the size limit (512..65535). Names
+ * compress case-insensitively: a name equal to an earlier one except for
+ * case becomes a pointer to it (and so takes its case).
  *
- * If the message does not fit, RRs are dropped from the end of AR first;
- * if it still does not fit, the AN/NS sections are dropped entirely, TC is
- * set and only header + question (+ OPT) are emitted.
+ * If the message does not fit, the AR section ends before its first record
+ * that does not fit; if an AN/NS record does not fit, the AN/NS sections
+ * are dropped entirely, TC is set and only header + question (+ OPT) are
+ * emitted.
  * The OPT RR is emitted from m->edns when present.
  * Returns the number of bytes written or a negative errno.
  */
 int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen);
+
+/*
+ * Render a response built once by dns_build() (one question, no OPT) for
+ * one client: the bytes a dns_build() of the same message stamped for that
+ * client would give, without rebuilding it.
+ *
+ *  - id: rp->id; flags: QR and RA set, RD and CD from rp->rdcd, AA and
+ *    opcode cleared, everything else (incl. the 4-bit rcode) as built;
+ *  - the question name is overwritten with rp->qname, which must be the
+ *    same name (any case): compression pointers into it stay valid, and
+ *    since dns_build() compresses case-insensitively the result is what
+ *    building with that question would have produced;
+ *  - every RR TTL is reduced by rp->age, floored at 0;
+ *  - size: with rp->edns an OPT RR (udp size rp->edns_udp, ext rcode,
+ *    version and DO 0) is appended and reserved for. Records that end past
+ *    maxlen are cut exactly as dns_build() does: an AR record that does
+ *    not fit ends the message there; an AN/NS record that does not fit
+ *    leaves header + question (+ OPT) with TC set and zero counts.
+ *
+ * out must hold maxlen bytes. Returns the length, -ENOSPC if not even the
+ * question fits, -EINVAL if msg is not such a message.
+ */
+struct dns_reply {
+	uint16_t id;
+	uint16_t rdcd;			/* RD|CD of the query */
+	const uint8_t *qname;		/* the query's name, case as sent */
+	uint8_t qlen;
+	bool edns;
+	uint16_t edns_udp;
+	uint32_t age;
+};
+
+int dns_reply_render(const uint8_t *msg, size_t len, const struct dns_reply *rp,
+                     uint8_t *out, size_t maxlen);
 
 /* Accessors for well-known rdata (expanded form). Return -EBADMSG when the
  * rdata is malformed. */

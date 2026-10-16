@@ -1235,6 +1235,10 @@ static const char *wire_hex(void)
  * glue; NXDOMAIN; a CNAME chain answered in one response; HTTPS whose
  * fakeip target has no hints to rewrite) and assembled answers (glue
  * filtered; re-query).
+ *
+ * Except the first case's owner names: since names compress
+ * case-insensitively, the lowercase owners point at the 0x20 question
+ * (c00c) instead of being written out up to "example" (18 bytes less).
  */
 TEST(v_wire_compat)
 {
@@ -1248,11 +1252,11 @@ TEST(v_wire_compat)
 		  "an www.pt.example 300 A 1.2.3.4;an www.pt.example 300 RRSIG;"
 		  "ns pt.example 300 SOA 60;ar ns.pt.example 300 A 5.5.5.5",
 		  NULL, NULL, NULL,
-		  "00008180000100020001000103577777025054076578616d706c65000001000103777777"
-		  "027074c013000100010000012c000401020304c020002e00010000012c00180000000000"
-		  "00000000000000000000000000000000000000c024000600010000012c001e026e73c013"
-		  "02686dc013000000010000000000000000000000000000003c026e73c024000100010000"
-		  "012c000405050505" },
+		  "00008180000100020001000103577777025054076578616d706c650000010001c00c0001"
+		  "00010000012c000401020304c00c002e00010000012c0018000000000000000000000000"
+		  "000000000000000000000000c010000600010000012c001e026e73c01302686dc0130000"
+		  "00010000000000000000000000000000003c026e73c010000100010000012c0004050505"
+		  "05" },
 		{ "nx.pt.example", DNS_T_A, DNS_R_NXDOMAIN, "10.0.0.1",
 		  "ns pt.example 900 SOA 100;ns pt.example 900 RRSIG",
 		  NULL, NULL, NULL,

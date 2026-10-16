@@ -15,13 +15,33 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 	}							\
 } while (0)
 
+static bool nocase_eq(const uint8_t *a, const uint8_t *b, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (a[i] != b[i] && ((a[i] | 0x20) != (b[i] | 0x20) ||
+		                     (a[i] | 0x20) < 'a' || (a[i] | 0x20) > 'z'))
+			return false;
+	return true;
+}
+
+/* rdata types whose names dns_build() compresses (and may recase) */
+static bool compressible(uint16_t t)
+{
+	return (t >= DNS_T_NS && t <= 9) || t == DNS_T_PTR || t == 14 || t == DNS_T_MX;
+}
+
+/* Equal, except that names may take the case of a name they compress
+ * against. */
 static bool rr_eq(const struct dns_rr *x, const struct dns_rr *y)
 {
 	return x->section == y->section && x->type == y->type &&
 	       x->cls == y->cls && x->ttl == y->ttl &&
 	       x->owner_len == y->owner_len && x->rdlen == y->rdlen &&
-	       !memcmp(x->owner, y->owner, x->owner_len) &&
-	       !memcmp(x->rdata, y->rdata, x->rdlen);
+	       nocase_eq(x->owner, y->owner, x->owner_len) &&
+	       (compressible(x->type) ? nocase_eq(x->rdata, y->rdata, x->rdlen) :
+	                                !memcmp(x->rdata, y->rdata, x->rdlen));
 }
 
 static void check_rr(const struct dns_msg *m, const struct dns_rr *rr)
@@ -104,7 +124,60 @@ static void check_rebuilt(const struct dns_msg *a, const struct dns_msg *b)
 		ASSERT(rr_eq(&a->rr[i], &b->rr[i]));
 }
 
-static uint8_t out1[DNS_MAX_MSG], out2[DNS_MAX_MSG];
+static uint8_t out1[DNS_MAX_MSG], out2[DNS_MAX_MSG], out3[DNS_MAX_MSG];
+
+/*
+ * Rendering the message built once (id 0, no OPT) for a client must give
+ * exactly what building it stamped for that client gives: the question in
+ * another case, id, RD/CD, OPT, TTLs aged, every size limit's truncation.
+ */
+static void render_check(const struct dns_msg *a, uint32_t seed)
+{
+	static const size_t limits[] = { 512, 1232, DNS_MAX_MSG };
+	struct dns_msg s;
+	struct dns_reply rp;
+	struct dns_name q;
+	uint16_t i;
+	size_t li;
+	int n, r, w;
+
+	if (!a->has_q)
+		return;
+	dns_msg_init(&s);
+	ASSERT(dns_msg_copy(&s, a) == 0);
+	s.id = 0;
+	memset(&s.edns, 0, sizeof(s.edns));
+	n = dns_build(&s, out1, DNS_MAX_MSG);
+	ASSERT(n > 0);
+	q = a->qname;
+	for (i = 0; i < q.len; i++)
+		if ((q.data[i] | 0x20) >= 'a' && (q.data[i] | 0x20) <= 'z' && (seed >> (i % 32)) & 1)
+			q.data[i] ^= 0x20;
+	memset(&rp, 0, sizeof(rp));
+	rp.id = (uint16_t)seed;
+	rp.rdcd = (uint16_t)(seed >> 8) & (DNS_F_RD | DNS_F_CD);
+	rp.qname = q.data;
+	rp.qlen = q.len;
+	rp.edns = seed & 1;
+	rp.edns_udp = 1232;
+	rp.age = seed % 7 == 0 ? 0 : seed % 1000;
+	/* the stamped reference */
+	for (i = 0; i < s.nrr; i++)
+		s.rr[i].ttl = s.rr[i].ttl > rp.age ? s.rr[i].ttl - rp.age : 0;
+	s.id = rp.id;
+	s.flags = (s.flags & ~(DNS_F_RD | DNS_F_CD | DNS_F_OPCODE | DNS_F_AA)) |
+	          DNS_F_QR | DNS_F_RA | rp.rdcd;
+	ASSERT(dns_msg_set_question(&s, q.data, q.len, s.qtype, s.qclass) == 0);
+	s.edns.present = rp.edns;
+	s.edns.udp_size = rp.edns ? 1232 : 0;
+	for (li = 0; li < sizeof(limits) / sizeof(limits[0]); li++) {
+		r = dns_reply_render(out1, (size_t)n, &rp, out2, limits[li]);
+		w = dns_build(&s, out3, limits[li]);
+		ASSERT(r == w);
+		ASSERT(r < 0 || !memcmp(out2, out3, (size_t)r));
+	}
+	dns_msg_free(&s);
+}
 
 static void build_check(const struct dns_msg *a, size_t maxlen)
 {
@@ -143,6 +216,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	check_rebuilt(&m, &c);
 	build_check(&m, DNS_MAX_MSG);
 	build_check(&m, 512);
+	render_check(&m, size >= 4 ? (uint32_t)data[size - 1] << 24 | (uint32_t)data[size - 2] << 16 |
+	                            (uint32_t)data[size - 3] << 8 | data[size - 4] : (uint32_t)size);
 	ASSERT(dns_parse_query(&c, data, size) == 0);
 	ASSERT(c.has_q == m.has_q && c.nrr == 0);
 out:

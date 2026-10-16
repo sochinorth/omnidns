@@ -650,6 +650,12 @@ int dns_parse_query(struct dns_msg *m, const uint8_t *buf, size_t len)
 /*
  * Compression table: remembered name suffixes already written to the
  * output, hashed into buckets so lookups stay O(1) for hostile inputs.
+ * Suffixes match case-insensitively (names are equal regardless of case,
+ * RFC 4343), so a name compresses against an earlier one in another case
+ * and takes that name's case. This makes the compression structure of a
+ * message independent of case: replacing the question by the same name in
+ * another case (dns_reply_render()) yields exactly what building with that
+ * question would have.
  */
 struct ctab_ent {
 	const uint8_t *name;		/* uncompressed suffix in the source */
@@ -696,7 +702,7 @@ static int ctab_find(const struct bctx *b, const uint8_t *s, uint8_t slen,
 	for (i = b->head[h % CTAB_BUCKETS]; i != CTAB_NONE; i = b->ent[i].next) {
 		const struct ctab_ent *e = &b->ent[i];
 
-		if (e->hash == h && e->len == slen && !memcmp(e->name, s, slen))
+		if (e->hash == h && dns_name_eq(e->name, e->len, s, slen))
 			return e->off;
 	}
 	return -1;
@@ -753,7 +759,7 @@ static int put_name(struct bctx *b, const uint8_t *name, uint8_t len)
 	}
 	for (k = nl - 1; k >= 0; k--) {
 		for (j = offs[k]; j <= offs[k] + (size_t)name[offs[k]]; j++)
-			h = (h ^ name[j]) * 16777619u;
+			h = (h ^ lc(name[j])) * 16777619u;
 		hash[k] = h;
 	}
 	for (k = 0; k < nl; k++) {
@@ -819,16 +825,19 @@ static int put_rr(struct bctx *b, const struct dns_rr *rr)
 	return 0;
 }
 
-static void put_opt(struct bctx *b, const struct dns_edns *e)
+static void opt_write(uint8_t *p, const struct dns_edns *e)
 {
-	uint8_t *p = b->out + b->len;
-
 	p[0] = 0;
 	put16(p + 1, DNS_T_OPT);
 	put16(p + 3, e->udp_size);
 	put32(p + 5, (uint32_t)e->ext_rcode << 24 | (uint32_t)e->version << 16 |
 	             (e->do_bit ? 0x8000u : 0));
 	put16(p + 9, 0);
+}
+
+static void put_opt(struct bctx *b, const struct dns_edns *e)
+{
+	opt_write(b->out + b->len, e);
 	b->len += DNS_OPT_LEN;
 }
 
@@ -906,6 +915,101 @@ int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
 	if (m->edns.present)
 		put_opt(b, &m->edns);
 	return (int)b->len;
+}
+
+/* ---- rendering a built response ---- */
+
+/* Offset just past the (possibly compressed) name at off, or 0. */
+static size_t skip_name(const uint8_t *p, size_t off, size_t len)
+{
+	while (off < len) {
+		uint8_t l = p[off];
+
+		if (!l)
+			return off + 1;
+		if ((l & 0xc0) == 0xc0)
+			return off + 2 <= len ? off + 2 : 0;
+		if (l > DNS_MAX_LABEL)
+			return 0;
+		off += (size_t)l + 1;
+	}
+	return 0;
+}
+
+int dns_reply_render(const uint8_t *msg, size_t len, const struct dns_reply *rp,
+                     uint8_t *out, size_t maxlen)
+{
+	size_t optlen = rp->edns ? DNS_OPT_LEN : 0, cap, qend, end, off, n;
+	uint16_t cnt[3], kept[3], flags, i;
+	bool tc = false;
+	int sec;
+
+	if (maxlen > DNS_MAX_MSG)
+		maxlen = DNS_MAX_MSG;
+	if (len < DNS_HDR_LEN || len > DNS_MAX_MSG || get16(msg + 4) != 1)
+		return -EINVAL;
+	qend = DNS_HDR_LEN + (size_t)rp->qlen + 4;
+	if (qend > len || dns_name_check(msg + DNS_HDR_LEN, len - DNS_HDR_LEN) != rp->qlen ||
+	    !dns_name_eq(msg + DNS_HDR_LEN, rp->qlen, rp->qname, rp->qlen))
+		return -EINVAL;
+	if (maxlen < qend + optlen)
+		return -ENOSPC;
+	cap = maxlen - optlen;
+	for (sec = 0; sec < 3; sec++)
+		kept[sec] = cnt[sec] = get16(msg + 6 + 2 * sec);
+	/* everything that fits is copied; the walk below finds where to cut */
+	n = len < cap ? len : cap;
+	memcpy(out, msg, n);
+	end = len;
+	if (len > cap || rp->age) {
+		off = qend;
+		for (sec = 0; sec < 3; sec++) {
+			for (i = 0; i < cnt[sec]; i++) {
+				size_t o = skip_name(msg, off, len), rend;
+				uint32_t ttl;
+
+				if (!o || len - o < DNS_RR_FIXED)
+					return -EINVAL;
+				rend = o + DNS_RR_FIXED + get16(msg + o + 8);
+				if (rend > len)
+					return -EINVAL;
+				/* as dns_build(): AR is cut at the first record that
+				 * does not fit, AN/NS not fitting truncates to TC */
+				if (rend > cap) {
+					end = off;
+					if (sec == DNS_S_AR) {
+						kept[DNS_S_AR] = i;
+					} else {
+						tc = true;
+						end = qend;
+						memset(kept, 0, sizeof(kept));
+					}
+					goto cut;
+				}
+				ttl = get32(msg + o + 4);
+				put32(out + o + 4, ttl > rp->age ? ttl - rp->age : 0);
+				off = rend;
+			}
+		}
+		if (off != len)
+			return -EINVAL;
+	}
+cut:
+	put16(out, rp->id);
+	flags = (get16(msg + 2) & ~(DNS_F_RD | DNS_F_CD | DNS_F_OPCODE | DNS_F_AA)) |
+	        DNS_F_QR | DNS_F_RA | rp->rdcd | (tc ? DNS_F_TC : 0);
+	put16(out + 2, flags);
+	put16(out + 6, kept[0]);
+	put16(out + 8, kept[1]);
+	put16(out + 10, kept[2] + (rp->edns ? 1 : 0));
+	memcpy(out + DNS_HDR_LEN, rp->qname, rp->qlen);
+	if (rp->edns) {
+		struct dns_edns e = { .present = true, .udp_size = rp->edns_udp };
+
+		opt_write(out + end, &e);
+		end += DNS_OPT_LEN;
+	}
+	return (int)end;
 }
 
 /* ---- accessors ---- */
