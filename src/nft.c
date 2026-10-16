@@ -64,7 +64,11 @@ struct echunk {
 struct ebatch {
 	struct list_head list;
 	uint64_t ticket;
-	/* [set * 2 + 0] destroys, [set * 2 + 1] adds; destroys are sent first */
+	/*
+	 * chunks and added exist only while the batch is open: they are
+	 * freed as soon as nft_flush() has serialised it (batch_release_elems).
+	 * [set * 2 + 0] destroys, [set * 2 + 1] adds; destroys are sent first.
+	 */
 	struct list_head chunks[S_NUM * 2];
 	struct hmap added;		/* struct ekey: keys with a pending add */
 	uint32_t nops, nmsgs;
@@ -812,7 +816,13 @@ static struct ebatch *batch_new(struct nft_ctx *n)
 	return b;
 }
 
-static void batch_free(struct ebatch *b)
+/*
+ * Free the element objects and the pending-add keys. They are only needed
+ * while the batch is open (ordering checks) and to serialise it; once it is
+ * sent, completion and failure handling use only the ticket, the sequence
+ * range and the ack count. Idempotent.
+ */
+static void batch_release_elems(struct ebatch *b)
 {
 	uint32_t it = 0;
 	void *k;
@@ -827,7 +837,13 @@ static void batch_free(struct ebatch *b)
 			nftnl_set_free(c->s);
 			free(c);
 		}
+		INIT_LIST_HEAD(&b->chunks[i]);
 	}
+}
+
+static void batch_free(struct ebatch *b)
+{
+	batch_release_elems(b);
 	free(b);
 }
 
@@ -912,6 +928,8 @@ void nft_flush(struct nft_ctx *n)
 		return;
 	n->open = NULL;
 	batch_build(n, b, &t);
+	/* closed and serialised: the elements are never read again */
+	batch_release_elems(b);
 	b->seq_first = t.seq_first;
 	b->seq_last = t.seq_last;
 	b->acks_left = t.nmsg;

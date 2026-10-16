@@ -9,6 +9,7 @@
 #include "test.h"
 #include "log.h"
 #include "nft.h"
+#include "fakeip.h"
 
 #define TABLE "omnitest"
 
@@ -476,6 +477,132 @@ TEST(async_big_batch)
 	CHECK_EQ(nfails, 0);
 }
 
+/*
+ * Several batches in flight at once (each flushed synchronously at
+ * NFT_BATCH_MAX ops, so their element objects are already freed when the
+ * acks arrive), one of them failing in the kernel.
+ */
+TEST(async_burst_inflight)
+{
+	enum { N = 3 * NFT_BATCH_MAX + 100, BAD = NFT_BATCH_MAX + 500, MAXB = 8 };
+	static uint64_t tick[N];
+	uint64_t tickets[MAXB], bad_ticket = 0;
+	struct twait w[MAXB];
+	uint32_t per[MAXB] = { 0 }, nb = 0;
+	uint8_t f[4], r[4] = { 10, 0, 0, 2 };
+
+	bootstrap_marks();
+	nfails = 0;
+	for (int i = 0; i < N; i++) {
+		f[0] = 198; f[1] = 19; f[2] = (uint8_t)(i >> 8); f[3] = (uint8_t)i;
+		if (i == BAD) {
+			uint8_t bf[4] = { 198, 18, 250, 250 };
+
+			/* no chain mark_07000000: fails its whole batch */
+			bad_ticket = nft_elem_add(n, AF_INET, bf, r, 0x07000000, false);
+		}
+		tick[i] = nft_elem_add(n, AF_INET, f, r, 0x02000000, false);
+		if (!nb || tickets[nb - 1] != tick[i]) {
+			REQUIRE(nb < MAXB);
+			tickets[nb++] = tick[i];
+		}
+		per[nb - 1]++;
+	}
+	CHECK(nb >= 4);
+	CHECK(bad_ticket > tickets[0] && bad_ticket < tickets[nb - 1]);
+	for (uint32_t i = 0; i < nb; i++) {
+		CHECK(!nft_ticket_done(n, tickets[i]));
+		wait_on(&w[i], tickets[i]);
+	}
+	run_loop();
+	long expect = 0;
+
+	for (uint32_t i = 0; i < nb; i++) {
+		CHECK_EQ(w[i].fired, 1);
+		if (tickets[i] == bad_ticket) {
+			CHECK(w[i].err < 0);
+		} else {
+			CHECK_EQ(w[i].err, 0);
+			expect += per[i];
+		}
+		CHECK(nft_ticket_done(n, tickets[i]));
+	}
+	CHECK_EQ(nfails, 1);
+	CHECK_EQ(failed_ticket, bad_ticket);
+	CHECK_EQ(count_elems("fake2real_v4"), expect);
+	CHECK_EQ(count_elems("fake2mark_v4"), expect);
+
+	/* a key re-added right after: its pending add forces a new batch,
+	 * also across the many batches already sent */
+	f[0] = 198; f[1] = 19; f[2] = 0; f[3] = 1;
+	uint64_t t1 = nft_elem_add(n, AF_INET, f, r, 0x01000000, false);
+	uint64_t t2 = nft_elem_add(n, AF_INET, f, r, 0x02000000, false);
+	CHECK(t2 == t1 + 1);
+	for (int i = 0; i < N; i++) {
+		f[0] = 198; f[1] = 19; f[2] = (uint8_t)(i >> 8); f[3] = (uint8_t)i;
+		nft_elem_del(n, AF_INET, f);
+	}
+	CHECK_EQ(nft_drain(n), 0);
+	CHECK_EQ(count_elems("fake2real_v4"), 0);
+	CHECK_EQ(count_elems("fake2mark_v4"), 0);
+	CHECK_EQ(nfails, 1);
+}
+
+/* the fakeip DB on the real kernel: a failed batch drops its bindings */
+TEST(fakeip_failed_batch)
+{
+	static const uint8_t secret[16] = { 1 };
+	struct ip_prefix p4 = pfx(AF_INET, "198.18.0.0", 15);
+	struct fakeip_db *db;
+	struct binding *a, *b, *c;
+	struct twait wa, wc;
+	int err;
+	uint8_t r[4] = { 10, 3, 3, 3 }, afake[4], bfake[4];
+	char *o, buf[64];
+
+	bootstrap_marks();
+	db = fakeip_new(&p4, NULL, 100, 0, secret, n);	/* takes the fail hook */
+	REQUIRE(db);
+	a = fakeip_bind(db, "r", 0x01000000, (const uint8_t *)"\1a\0", 3, 4, r, 60, &err);
+	b = fakeip_bind(db, "r", 0x05000000, (const uint8_t *)"\1b\0", 3, 4, r, 60, &err);
+	REQUIRE(a && b);
+	CHECK_EQ(a->ticket, b->ticket);
+	memcpy(afake, a->fake, 4);
+	memcpy(bfake, b->fake, 4);
+	fakeip_ref(a);		/* a cache entry still holds it */
+	nft_flush(n);		/* sent; element objects released */
+	c = fakeip_bind(db, "r", 0x02000000, (const uint8_t *)"\1c\0", 3, 4, r, 60, &err);
+	REQUIRE(c);
+	CHECK(c->ticket > a->ticket);
+	wait_on(&wa, a->ticket);
+	wait_on(&wc, c->ticket);
+	run_loop();
+	CHECK_EQ(wa.fired, 1);
+	CHECK(wa.err < 0);
+	CHECK_EQ(wc.fired, 1);
+	CHECK_EQ(wc.err, 0);
+	CHECK(nft_ticket_done(n, a->ticket));
+	CHECK_EQ(fakeip_count(db), 1);
+	CHECK(!fakeip_lookup(db, 4, afake));
+	CHECK(!fakeip_lookup(db, 4, bfake));
+	CHECK(fakeip_lookup(db, 4, c->fake) == c);
+	/* a later (deferred) wait on the failed ticket still reports it */
+	wait_on(&wa, a->ticket);
+	run_loop();
+	CHECK_EQ(wa.fired, 1);
+	CHECK(wa.err < 0);
+	o = list_table();
+	inet_ntop(AF_INET, afake, buf, sizeof(buf));
+	CHECK(lacks(o, buf));
+	inet_ntop(AF_INET, c->fake, buf, sizeof(buf));
+	strcat(buf, " : 10.3.3.3");
+	CHECK(has(o, buf));
+	free(o);
+	fakeip_unref(db, a);	/* detached: freed now */
+	fakeip_free(db);
+	nft_set_fail_hook(n, fail_hook, NULL);
+}
+
 /* ---- real packets in the netns ---- */
 
 static int tcp_connect(const char *dst, int port)
@@ -579,6 +706,8 @@ int main(int argc, char **argv)
 	RUN(async_add_del);
 	RUN(async_failure);
 	RUN(async_big_batch);
+	RUN(async_burst_inflight);
+	RUN(fakeip_failed_batch);
 	RUN(packets);
 	RUN(destroy);
 	nft_close(n);
