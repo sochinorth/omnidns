@@ -543,6 +543,9 @@ static void tcp_update_events(struct tcp_conn *c)
 		ev |= ULOOP_READ;
 	if (!list_empty(&c->outq))
 		ev |= ULOOP_WRITE;
+	/* every query and reply passes here: no epoll_ctl() when nothing changes */
+	if (ev && c->ufd.registered && c->ufd.flags == (ev | ULOOP_BLOCKING))
+		return;
 	if (ev)
 		uloop_fd_add(&c->ufd, ev | ULOOP_BLOCKING);
 	else
