@@ -279,6 +279,99 @@ TEST(reconcile_kernel_failure)
 	CHECK(nft_bootstrap(n, &d) == 0);
 }
 
+/* ---- many mark chains ---- */
+
+#define BIG_MASK	0x3fff0000u	/* 16383 marks */
+#define BIG_N		4096
+
+/* marks first+1 .. first+cnt, shifted into BIG_MASK, in reverse order */
+static const uint32_t *big_marks(uint32_t first, uint32_t cnt)
+{
+	static uint32_t m[BIG_N];
+
+	for (uint32_t i = 0; i < cnt; i++)
+		m[i] = (first + cnt - i) << 16;
+	return m;
+}
+
+static struct nft_desired big_desired(uint32_t first, uint32_t cnt)
+{
+	struct nft_desired d = desired(true, true, big_marks(first, cnt), cnt);
+
+	d.fwmask = BIG_MASK;
+	return d;
+}
+
+/*
+ * Count "0xV : jump mark_V" (vmap) or "chain mark_V" (!vmap) in `o`; -1 if
+ * any V is not a mark first+1 .. first+cnt or a key jumps to another chain.
+ */
+static long count_marks(const char *o, bool vmap, uint32_t first, uint32_t cnt)
+{
+	const char *lead = vmap ? "0x" : "chain mark_";
+	long k = 0;
+
+	for (const char *p = strstr(o, lead); p; p = strstr(p + 1, lead)) {
+		unsigned a = 0, b = 0;
+		int r = vmap ? sscanf(p, "0x%8x : jump mark_%8x", &a, &b) :
+		               sscanf(p, "chain mark_%8x", &a);
+
+		if (r < 1)
+			continue;
+		if (r == 1)
+			b = a;
+		if (a != b || a >> 16 <= first || a >> 16 > first + cnt || (a & 0xffff))
+			return -1;
+		k++;
+	}
+	return k;
+}
+
+/* restore_marks' vmap holds exactly marks first+1 .. first+cnt, each jumping
+ * to its own chain, and exactly those mark chains exist */
+static int big_check(uint32_t first, uint32_t cnt)
+{
+	char *o = sh("nft list chain inet " TABLE " restore_marks | "
+	             "grep -oE '0x[0-9a-f]{8} : jump mark_[0-9a-f]{8}'");
+	long got;
+	int ok = 1;
+
+	got = count_marks(o, true, first, cnt);
+	if (got != (long)cnt) {
+		fprintf(stderr, "    restore_marks: %ld elements, want %u\n", got, cnt);
+		ok = 0;
+	}
+	free(o);
+	o = sh("nft list chains inet " TABLE);
+	got = count_marks(o, false, first, cnt);
+	if (got != (long)cnt) {
+		fprintf(stderr, "    mark chains: %ld, want %u\n", got, cnt);
+		ok = 0;
+	}
+	free(o);
+	return ok;
+}
+
+/*
+ * Growing 1 -> 4096 marks across reconciles: around the CHUNK_MAX element
+ * message boundary, and past the counts where restore_marks' vmap, sent in
+ * a single message, wrapped the 16-bit nest length (1260 x 52 bytes, ...).
+ */
+TEST(big_reconcile)
+{
+	static const uint32_t steps[] = { 1, 2, 255, 256, 257, 512, 1260, 1261, 2048,
+	                                  2521, 3780, 3800, BIG_N };
+	struct nft_desired d = big_desired(0, 1);
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	CHECK(big_check(0, 1));
+	for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+		d = big_desired(0, steps[i]);
+		REQUIRE(nft_reconcile(n, &d) == 0);
+		CHECK(big_check(0, steps[i]));
+	}
+}
+
 /* ---- async ---- */
 
 struct twait {
@@ -1053,6 +1146,7 @@ int main(int argc, char **argv)
 	RUN(reconcile_fwmask);
 	RUN(reconcile_noop);
 	RUN(reconcile_kernel_failure);
+	RUN(big_reconcile);
 	RUN(async_add_del);
 	RUN(async_failure);
 	RUN(async_big_batch);

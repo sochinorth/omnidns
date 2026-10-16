@@ -26,7 +26,16 @@
 #include "util/hash.h"
 
 #define NFT_TABLE_MAX	64
-#define CHUNK_MAX	256		/* elements per NEWSETELEM/DESTROYSETELEM msg */
+/*
+ * Elements per NEWSETELEM/DESTROYSETELEM message. All of a message's
+ * elements sit in one NFTA_SET_ELEM_LIST_ELEMENTS nest, whose length is
+ * 16 bits (at most 65535 bytes). The largest element is 64 bytes (element
+ * nest 4, key 4 + 4 + 16 for a v6 address, data nest 4, verdict nest 4,
+ * code 8, chain name "mark_%08x" 4 + 16; a restore_marks vmap element is 52
+ * with its 4-byte key), so at most 1023 fit; 256 keeps a 4x margin and
+ * bounds a message to about 16.5 KB.
+ */
+#define CHUNK_MAX	256
 #define PENDING_SLOTS	(2 * NFT_BATCH_MAX)	/* power of two, load <= 1/2 */
 #define SPARE_MAX	8		/* recycled struct ebatch */
 #define FAIL_RING	32
@@ -404,18 +413,29 @@ static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
 	nftnl_set_set_u32(s, NFTNL_SET_DATA_LEN, 0);
 	set_key_host_endian(s);
 	txn_set(n, t, s);
-
-	for (uint32_t i = 0; i < nmarks; i++) {
-		struct nftnl_set_elem *e = oom(nftnl_set_elem_alloc());
-
-		mark_chain_name(name, marks[i]);
-		nftnl_set_elem_set(e, NFTNL_SET_ELEM_KEY, &marks[i], 4);
-		nftnl_set_elem_set_u32(e, NFTNL_SET_ELEM_VERDICT, NFT_JUMP);
-		nftnl_set_elem_set_str(e, NFTNL_SET_ELEM_CHAIN, name);
-		nftnl_set_elem_add(s, e);
-	}
-	txn_elems(n, t, NFT_MSG_NEWSETELEM, s, nmarks);
 	nftnl_set_free(s);
+
+	/* elements in messages of CHUNK_MAX, all before the rule binds the set
+	 * (a bound constant set takes no more elements) */
+	for (uint32_t i = 0; i < nmarks;) {
+		uint32_t end = nmarks - i > CHUNK_MAX ? i + CHUNK_MAX : nmarks;
+
+		s = oom(nftnl_set_alloc());
+		nftnl_set_set_str(s, NFTNL_SET_TABLE, n->table);
+		nftnl_set_set_str(s, NFTNL_SET_NAME, "__map%d");
+		nftnl_set_set_u32(s, NFTNL_SET_ID, id);
+		for (; i < end; i++) {
+			struct nftnl_set_elem *e = oom(nftnl_set_elem_alloc());
+
+			mark_chain_name(name, marks[i]);
+			nftnl_set_elem_set(e, NFTNL_SET_ELEM_KEY, &marks[i], 4);
+			nftnl_set_elem_set_u32(e, NFTNL_SET_ELEM_VERDICT, NFT_JUMP);
+			nftnl_set_elem_set_str(e, NFTNL_SET_ELEM_CHAIN, name);
+			nftnl_set_elem_add(s, e);
+		}
+		txn_elems(n, t, NFT_MSG_NEWSETELEM, s, CHUNK_MAX);
+		nftnl_set_free(s);
+	}
 
 	r = rule_new(n, "restore_marks");
 	e_ct(r, NFT_CT_MARK, false);
