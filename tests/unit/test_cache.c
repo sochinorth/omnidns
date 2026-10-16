@@ -568,6 +568,48 @@ TEST(round_trip)
 	config_free(cfg);
 }
 
+/* Answers whose owners and rdata expand past 64 KiB. */
+TEST(huge_answer)
+{
+	struct config *cfg = load(HDR RULE_FA RULE_ALL);
+	struct cache *c = cache_new(100, 1 << 20, NULL);
+	struct dns_msg m, out;
+	uint8_t rd[255];
+	int i;
+
+	dns_msg_init(&out);
+	time_override_set(1000);
+	/* 300 distinct 255-byte TXT rdata: ~76 KiB, not addressable */
+	qinit(&m, "big.example", DNS_T_TXT, DNS_F_QR | DNS_F_RA);
+	rd[0] = 254;
+	for (i = 0; i < 300; i++) {
+		memset(rd + 1, 'a' + i % 26, 254);
+		rd[1] = (uint8_t)i;
+		rd[2] = (uint8_t)(i >> 8);
+		add(&m, DNS_S_AN, "big.example", DNS_T_TXT, 60, rd, sizeof(rd));
+	}
+	CHECK_EQ(ins_msg(c, cfg, &m, 60), -E2BIG);
+	CHECK_EQ(cache_count(c), 0);
+	CHECK_EQ(cache_bytes(c), 0);
+	dns_msg_free(&m);
+
+	/* the same size, repetitive: interned, cached and served intact */
+	qinit(&m, "big.example", DNS_T_TXT, DNS_F_QR | DNS_F_RA);
+	for (i = 0; i < 300; i++) {
+		memset(rd + 1, 'a' + i % 4, 254);
+		add(&m, DNS_S_AN, "big.example", DNS_T_TXT, 60, rd, sizeof(rd));
+	}
+	CHECK_EQ(ins_msg(c, cfg, &m, 60), 0);
+	CHECK_EQ(cache_count(c), 1);
+	REQUIRE(cache_lookup(c, cfg, m.qname.data, m.qname.len, DNS_T_TXT, DNS_C_IN, &out) == 0);
+	check_hit(&out, &m, 0);
+	dns_msg_free(&m);
+
+	dns_msg_free(&out);
+	cache_free(c);
+	config_free(cfg);
+}
+
 /* ---- dependencies ---- */
 
 static int ins_deps(struct cache *c, const struct config *cfg, const char *qname,
@@ -753,6 +795,7 @@ int main(void)
 	RUN(binding_refs);
 	RUN(byte_limit);
 	RUN(round_trip);
+	RUN(huge_answer);
 	RUN(deps_revalidation);
 	RUN(byte_accounting);
 	nsc_destroy(&nsc);
