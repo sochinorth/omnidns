@@ -132,8 +132,13 @@ static int reload(void)
 		goto fail;
 	}
 	if (mask_changed) {
-		/* cached answers pin bindings and all embed the old marks */
-		cache_flush(omni.cache);
+		/*
+		 * Cached answers pin bindings. Only expired ones are dropped
+		 * here: a binding outlives an answer carrying it (by
+		 * fakeip_grace), so an unexpired answer's bindings are live
+		 * anyway, and a rejected reload keeps the cache.
+		 */
+		cache_sweep_expired(omni.cache);
 		fakeip_evict_expired(omni.fdb);
 		if (fakeip_live_count(omni.fdb)) {
 			log_err("reload: fwmask change rejected while %u fake IP bindings are "
@@ -164,6 +169,9 @@ static int reload(void)
 		                  old->fakeip_max_bindings, old->fakeip_grace);
 		goto fail;
 	}
+	/* answers resolved under the old fwmask (none carries a fake now) */
+	if (mask_changed)
+		cache_flush(omni.cache);
 	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
 	nkept_marks = d.nmarks;
 	/* same index, fwmask and fingerprints: cached answers need no

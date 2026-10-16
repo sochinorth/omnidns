@@ -465,7 +465,8 @@ output_reject      (filter, output,     filter-1):  same
   config's, every dependency name is matched again, and each rule
   fingerprint must equal the recorded one; otherwise the entry is dropped.
   This catches inserted or reordered rules, nameset edits and upstream
-  changes. A reload doesn't flush the cache, and an entry is never served
+  changes. A reload doesn't flush the cache (only an accepted fwmask
+  change does), and an entry is never served
   under the wrong policy. A reload that keeps the match table, the fwmask
   and every fingerprint by ordinal keeps the generation, since every
   revalidation would succeed.
@@ -544,21 +545,27 @@ step succeeds does it replace the old one:
    `fwmask` changed, every mark chain installed before. Reject the reload if
    that is more than 4096 marks.
 3. If `fwmask` changed:
-   - flush the cache, since every cached fake embeds old marks;
+   - drop expired cache entries, which pin their bindings;
    - evict expired bindings;
-   - reject the reload if any binding is still live.
+   - reject the reload if any binding is still live. A binding outlives
+     the answers carrying it (by `fakeip_grace`), so a cached answer still
+     valid holds only live bindings, and a rejected reload keeps the
+     cache.
 4. Apply new pool and capacity settings to the binding table. Reject the
    reload if a live binding would fall outside a new pool.
 5. Drain pending nftables deletes, then reconcile chains and rules in one
-   transaction, or send none if the dataplane state is unchanged.
+   transaction, or send none if the dataplane state is unchanged. If
+   `fwmask` changed, flush the cache now: no fake is left in it, but its
+   answers were resolved under the old marks.
 6. Swap in the new configuration and re-bind the listeners if they changed.
    It gets a new generation number unless resolution is unchanged: a shared
    match table, the same fwmask and equal rule fingerprints by ordinal.
 
 On any failure, the previous configuration stays in effect and the reason
 goes to syslog. Live bindings and their map elements are never touched by a
-reload (an fwmask change, which needs none to be live, flushes the maps). A walk that latched a mark before an fwmask change and binds after
-it finds that mark's chain gone, so that query alone gets SERVFAIL.
+reload (an fwmask change, which needs none to be live, flushes the maps).
+A walk that latched a mark before an fwmask change and binds after it
+finds that mark's chain gone, so that query alone gets SERVFAIL.
 
 The procd service sends SIGHUP on config changes and whenever an interface
 comes up, since WAN reconnects rewrite `resolv.conf.auto`. Most of these
