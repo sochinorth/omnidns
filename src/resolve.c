@@ -79,9 +79,19 @@ enum { LIFE_NONE, LIFE_POS, LIFE_NEG };
 
 struct plan {
 	uint8_t act;
-	const char *rule_id;
 	uint32_t mark;
+	const char *rule_id;
 };
+
+/*
+ * Scratch for terminal processing, one entry per answer record of the
+ * response in hand. It is only used synchronously within one terminal()
+ * call (never across a wait for an upstream or nft), so a single static
+ * array serves every request, and so does one buffer for a rewritten SVCB
+ * rdata (never longer than the original).
+ */
+static struct plan plan[DNS_MAX_RRS];
+static uint8_t hint_buf[UINT16_MAX];
 
 static struct resolve_stats stats;
 
@@ -757,7 +767,6 @@ static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 		.r = r, .rule_id = p->rule_id, .mark = p->mark, .ttl = fake_ttl(r, rr->ttl),
 	};
 	struct svcb_view v;
-	uint8_t *buf;
 	uint16_t len;
 	int ret;
 
@@ -772,19 +781,14 @@ static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 		h.endpoint_len = v.target_len;
 	}
 	/* fakes have the size of the addresses they replace */
-	buf = malloc(rr->rdlen);
-	if (!buf)
-		return -ENOMEM;
 	ret = svcb_rewrite_hints(rr->rdata, rr->rdlen, hint_fn, &h,
-	                         !fakeip_has_pool(r->o->fdb, 6), buf, rr->rdlen, &len);
-	if (!ret) {
-		if (len != rr->rdlen || memcmp(buf, rr->rdata, len))
-			*changed = true;
-		ret = dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len,
-		                     rr->type, rr->cls, h.ttl, buf, len);
-	}
-	free(buf);
-	return ret;
+	                         !fakeip_has_pool(r->o->fdb, 6), hint_buf, rr->rdlen, &len);
+	if (ret)
+		return ret;
+	if (len != rr->rdlen || memcmp(hint_buf, rr->rdata, len))
+		*changed = true;
+	return dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len,
+	                      rr->type, rr->cls, h.ttl, hint_buf, len);
 }
 
 static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struct plan *p)
@@ -850,9 +854,12 @@ static int build_nodata(struct resolve_req *r)
 	return add_synth_soa(r, r->o->cfg->block_ttl);
 }
 
-/* *changed: some record is not kept as is (dropped, bound or hint-rewritten). */
-static int plan_terminal(struct resolve_req *r, struct plan *plan, uint16_t *nkept,
-                         bool *dropped, bool *changed)
+/*
+ * Fill plan[] for the answer records. *changed: some record is not kept as
+ * is (dropped, bound or hint-rewritten).
+ */
+static int plan_terminal(struct resolve_req *r, uint16_t *nkept, bool *dropped,
+                         bool *changed)
 {
 	const struct dns_msg *m = &r->resp;
 	int fam = afamily(r->qtype), ret;
@@ -862,6 +869,7 @@ static int plan_terminal(struct resolve_req *r, struct plan *plan, uint16_t *nke
 		const struct dns_rr *rr = &m->rr[i];
 		struct plan *p = &plan[i];
 
+		p->act = ACT_SKIP;
 		if (rr->type != r->qtype || !owned(rr, &r->name))
 			continue;
 		if (fam && r->latch.on) {
@@ -890,8 +898,7 @@ static int plan_terminal(struct resolve_req *r, struct plan *plan, uint16_t *nke
 }
 
 /* Assemble prefix + planned records + tail; changed as from plan_terminal. */
-static int build_terminal(struct resolve_req *r, const struct plan *plan, bool changed,
-                          bool *rewritten)
+static int build_terminal(struct resolve_req *r, bool changed, bool *rewritten)
 {
 	const struct dns_msg *m = &r->resp;
 	uint16_t i;
@@ -924,16 +931,10 @@ static int build_terminal(struct resolve_req *r, const struct plan *plan, bool c
 static void terminal(struct resolve_req *r)
 {
 	bool dropped = false, changed = false, rewritten;
-	struct plan *plan;
 	uint16_t nkept = 0;
 	int ret, kind = LIFE_POS;
 
-	plan = calloc(r->resp.nrr ? r->resp.nrr : 1, sizeof(*plan));
-	if (!plan) {
-		servfail(r);
-		return;
-	}
-	ret = plan_terminal(r, plan, &nkept, &dropped, &changed);
+	ret = plan_terminal(r, &nkept, &dropped, &changed);
 	rewritten = dropped;
 	if (!ret && !nkept) {
 		ret = build_nodata(r);
@@ -941,9 +942,8 @@ static void terminal(struct resolve_req *r)
 	} else if (!ret && !changed && can_pass_through(r)) {
 		ret = pass_through(r);
 	} else if (!ret) {
-		ret = build_terminal(r, plan, changed, &rewritten);
+		ret = build_terminal(r, changed, &rewritten);
 	}
-	free(plan);
 	if (ret) {
 		servfail(r);
 		return;
