@@ -52,16 +52,6 @@ static struct mslot *find(const struct match_index *idx, const char *name,
 	}
 }
 
-static uint32_t count_patterns(const struct rule *rules, uint16_t nrules)
-{
-	uint64_t n = 0;
-
-	for (uint16_t i = 0; i < nrules; i++)
-		for (uint16_t j = 0; j < rules[i].nfiles; j++)
-			n += rules[i].files[j]->npat;
-	return n > UINT32_MAX / 2 ? UINT32_MAX / 2 : (uint32_t)n;
-}
-
 /* Same rule as util/hmap: power of two, at most 75% full, at least 16. */
 static uint32_t cap_for(uint32_t n)
 {
@@ -124,6 +114,29 @@ static uint16_t base_of(const struct match_index *idx, const char *blob)
 	return (uint16_t)(b - idx->bases);
 }
 
+/* Patterns in the distinct files (a file shared by several rules counts once). */
+static uint32_t count_patterns(const struct match_index *idx, const struct rule *rules,
+                               uint16_t nrules)
+{
+	bool *seen = calloc(idx->nbases ? idx->nbases : 1, sizeof(*seen));
+	uint64_t n = 0;
+
+	if (!seen)
+		return UINT32_MAX;
+	for (uint16_t i = 0; i < nrules; i++)
+		for (uint16_t j = 0; j < rules[i].nfiles; j++) {
+			const struct nameset_file *f = rules[i].files[j];
+			uint16_t b;
+
+			if (!f->npat || seen[b = base_of(idx, f->blob)])
+				continue;
+			seen[b] = true;
+			n += f->npat;
+		}
+	free(seen);
+	return n > UINT32_MAX / 2 ? UINT32_MAX / 2 : (uint32_t)n;
+}
+
 static void add_file(struct match_index *idx, const struct nameset_file *f,
                      uint16_t ord)
 {
@@ -152,14 +165,20 @@ static void add_file(struct match_index *idx, const struct nameset_file *f,
 struct match_index *match_build(const struct rule *rules, uint16_t nrules)
 {
 	struct match_index *idx = calloc(1, sizeof(*idx));
-	uint32_t cap = cap_for(count_patterns(rules, nrules));
+	uint32_t n, cap;
 
 	if (!idx)
 		return NULL;
 	idx->catchall = MATCH_NONE;
+	if (collect_bases(idx, rules, nrules))
+		goto fail;
+	n = count_patterns(idx, rules, nrules);
+	if (n == UINT32_MAX)
+		goto fail;
+	cap = cap_for(n);
 	idx->mask = cap - 1;
 	idx->slots = malloc((size_t)cap * sizeof(*idx->slots));
-	if (!idx->slots || collect_bases(idx, rules, nrules))
+	if (!idx->slots)
 		goto fail;
 	for (uint32_t i = 0; i < cap; i++)
 		idx->slots[i].file = MSLOT_EMPTY;

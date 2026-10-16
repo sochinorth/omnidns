@@ -397,6 +397,36 @@ TEST(multi_file_ords)
 	freefile(e);
 }
 
+/* A file shared by several rules sizes the table once, not once per rule. */
+TEST(shared_file_sizing)
+{
+	struct nameset_file *a = mkfile("a.t\nb.t\nc.t\nd.t\ne.t\nf.t\ng.t\nh.t\n"
+	                                "i.t\nj.t\nk.t\nl.t\nm.t\n");
+	struct nameset_file *fs[] = { a };
+	struct rule r[9];
+	struct match_index *idx, *one;
+
+	memset(r, 0, sizeof(r));
+	for (int i = 0; i < 8; i++) {
+		r[i].ord = (uint16_t)i;
+		r[i].files = fs;
+		r[i].nfiles = 1;
+	}
+	r[8].ord = 8;
+	r[8].catchall = true;
+	idx = match_build(r, 9);
+	one = match_build(r, 1);
+	REQUIRE(idx && one);
+	CHECK_EQ(match_nodes(idx), 13);
+	CHECK_EQ(look(idx, "m.t"), 0);
+	CHECK_EQ(look(idx, "n.t"), 8);
+	/* 13 patterns -> 32 slots either way (104 counted per rule -> 256) */
+	CHECK_EQ(match_footprint(idx), match_footprint(one));
+	match_free(one);
+	match_free(idx);
+	freefile(a);
+}
+
 /*
  * Stored names are compared up to their NUL: a pattern must not match a
  * query that is a prefix of it, or one it is a prefix of. Find a name that
@@ -519,6 +549,7 @@ int main(void)
 	RUN(differential);
 	RUN(differential_shared_files);
 	RUN(multi_file_ords);
+	RUN(shared_file_sizing);
 	RUN(no_prefix_matches);
 	RUN(bulk_100k);
 	return test_summary();
