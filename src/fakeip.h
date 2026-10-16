@@ -36,7 +36,8 @@
  *                                                 op uses replace=true
  *   - occupied by a live binding              -> continue
  * If no candidate is found, run an S3-FIFO eviction pass and retry once;
- * then fail with -ENOSPC.
+ * then fail with -ENOSPC. (A pass is skipped while the last one stalled,
+ * see fakeip_evict_scans().)
  *
  * Capacity: max_bindings; S3-FIFO evicts only bindings that are expired and
  * unreferenced (pinned otherwise). Eviction deletes the nft elements.
@@ -136,6 +137,14 @@ uint32_t fakeip_evict_expired(struct fakeip_db *db);
 
 /* Evict expired, unreferenced bindings while over the capacity watermark. */
 void fakeip_maybe_evict(struct fakeip_db *db);
+
+/*
+ * Eviction passes run so far (tests). A pass that finds every binding
+ * pinned is not repeated until one of them can become evictable (time
+ * reaches its safe_until, or its last reference goes) or the
+ * configuration changes, so a full table makes a failing bind O(1).
+ */
+uint32_t fakeip_evict_scans(const struct fakeip_db *db);
 
 uint32_t fakeip_count(const struct fakeip_db *db);
 

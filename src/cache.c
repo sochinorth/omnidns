@@ -82,6 +82,7 @@ struct cache {
 	uint32_t max_entries;
 	size_t max_bytes;
 	size_t bytes;
+	uint32_t swept;		/* omni_now() of the last cache_sweep_expired() */
 };
 
 #define ENTRY_OVERHEAD CACHE_ENTRY_OVERHEAD
@@ -185,6 +186,15 @@ uint32_t cache_sweep_expired(struct cache *c)
 	uint32_t now = omni_now(), it = 0, n = 0;
 	struct centry *e;
 
+	/*
+	 * Expiry has a resolution of one second: a second sweep within the
+	 * same second finds nothing (every entry it could drop, the first one
+	 * dropped). Skipping it keeps a failing bind, which sweeps before its
+	 * retry, from walking the whole cache each time.
+	 */
+	if (now == c->swept)
+		return 0;
+	c->swept = now;
 	while ((e = hmap_next(&c->map, &it))) {
 		if (now > e->inserted && now - e->inserted >= e->lifetime) {
 			entry_drop(c, e);

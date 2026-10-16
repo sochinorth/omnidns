@@ -99,7 +99,9 @@ int cache_insert(struct cache *c, const struct config *cfg,
 void cache_flush(struct cache *c);
 /*
  * Drop every expired entry (releasing its binding refs, so expired bindings
- * become reclaimable). Called periodically; returns entries dropped.
+ * become reclaimable). Called periodically; returns entries dropped. At
+ * most one walk per second: a second call within the same omni_now()
+ * second returns 0 at once (it would find nothing).
  */
 uint32_t cache_sweep_expired(struct cache *c);
 uint32_t cache_count(const struct cache *c);

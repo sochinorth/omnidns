@@ -42,6 +42,16 @@ struct fakeip_db {
 	uint32_t pol_nfree;
 	uint32_t pol_cap;	/* allocated length of pol and pol_free */
 	struct s3fifo s3;
+	/*
+	 * Eviction stall (see evict_to()): the last pass found nothing
+	 * evictable. Until one of the pinned bindings can become evictable,
+	 * passes are skipped: stall_until is the earliest safe_until of an
+	 * unreferenced binding (UINT32_MAX: none, only an unref can help).
+	 */
+	bool stalled;
+	uint32_t stall_until;
+	uint32_t scan_min;	/* that minimum, gathered during a pass */
+	uint32_t scans;		/* eviction passes run (tests) */
 };
 
 /* lookup key, endpoint already lowercased */
@@ -352,7 +362,21 @@ static void binding_drop(struct fakeip_db *db, struct binding *b, bool nft_del)
 
 static bool s3_can_evict(struct s3fifo *s, struct s3_node *n)
 {
-	return binding_evictable(container_of(n, struct binding, s3), omni_now());
+	struct binding *b = container_of(n, struct binding, s3);
+	struct fakeip_db *db = s->priv;
+
+	if (binding_evictable(b, omni_now()))
+		return true;
+	if (!b->refcnt && b->safe_until < db->scan_min)
+		db->scan_min = b->safe_until;
+	return false;
+}
+
+/* b may become evictable at b->safe_until: a stalled pass may be retried then */
+static void stall_wake(struct fakeip_db *db, const struct binding *b)
+{
+	if (b->safe_until < db->stall_until)
+		db->stall_until = b->safe_until;
 }
 
 static void s3_on_evict(struct s3fifo *s, struct s3_node *n)
@@ -495,13 +519,35 @@ static uint32_t evict_target(const struct fakeip_db *db)
 	return (uint32_t)((uint64_t)db->max_bindings * 7 / 8);
 }
 
+/*
+ * Evict down to `target`. When a pass ends short of it, every binding left
+ * was visited and found pinned (s3_evict() gives up only after a full
+ * stalled round), so another pass is pointless until one can be evicted:
+ * time passes the earliest safe_until of an unreferenced binding, a
+ * binding's last reference goes (fakeip_unref()), a new binding arrives
+ * with an earlier safe_until, or the configuration changes. Without this,
+ * a full table of live bindings cost every failing bind a scan of all of
+ * them.
+ */
+static void evict_to(struct fakeip_db *db, uint32_t target)
+{
+	if (s3_count(&db->s3) <= target)
+		return;
+	if (db->stalled && omni_now() <= db->stall_until)
+		return;
+	db->scan_min = UINT32_MAX;
+	db->scans++;
+	s3_evict(&db->s3, target);
+	db->stalled = s3_count(&db->s3) > target;
+	db->stall_until = db->scan_min;
+}
+
 static int find_slot(struct fakeip_db *db, int family, uint64_t khash, uint32_t now,
                      uint8_t *fake, struct binding **victim)
 {
 	if (!probe(db, family, khash, now, fake, victim))
 		return 0;
-	if (s3_count(&db->s3) > evict_target(db))
-		s3_evict(&db->s3, evict_target(db));
+	evict_to(db, evict_target(db));
 	return probe(db, family, khash, now, fake, victim);
 }
 
@@ -528,7 +574,7 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	if (r)
 		goto fail_policy;
 	if (!victim && hmap_len(&db->by_key) >= db->max_bindings) {
-		s3_evict(&db->s3, evict_target(db));
+		evict_to(db, evict_target(db));
 		if (hmap_len(&db->by_key) >= db->max_bindings) {
 			r = -ENOSPC;
 			goto fail_policy;
@@ -555,6 +601,7 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	if (victim)
 		binding_drop(db, victim, false);
 	s3_insert(&db->s3, &b->s3, khash);
+	stall_wake(db, b);
 	b->ticket = nft_elem_add(db->nft, b->family, b->fake, b->real, k->mark, victim != NULL);
 	return b;
 
@@ -645,6 +692,8 @@ void fakeip_unref(struct fakeip_db *db, struct binding *b)
 		return;
 	if (binding_detached(b))
 		binding_free(db, b);
+	else
+		stall_wake(db, b);
 }
 
 struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *fake)
@@ -687,7 +736,8 @@ int fakeip_set_config(struct fakeip_db *db, const struct ip_prefix *p4,
 	db->max_bindings = max_bindings ? max_bindings : 1;
 	s3_set_cap(&db->s3, db->max_bindings);
 	db->grace = grace;
-	s3_maybe_evict(&db->s3);
+	db->stalled = false;
+	fakeip_maybe_evict(db);
 	return 0;
 }
 
@@ -717,7 +767,14 @@ uint32_t fakeip_evict_expired(struct fakeip_db *db)
 
 void fakeip_maybe_evict(struct fakeip_db *db)
 {
-	s3_maybe_evict(&db->s3);
+	/* s3_maybe_evict()'s watermark, through the stall check */
+	if (s3_count(&db->s3) > db->max_bindings)
+		evict_to(db, evict_target(db));
+}
+
+uint32_t fakeip_evict_scans(const struct fakeip_db *db)
+{
+	return db->scans;
 }
 
 uint32_t fakeip_count(const struct fakeip_db *db)

@@ -261,6 +261,20 @@ TEST(basic)
 	time_override_advance(15);
 	CHECK_EQ(look(c, cfg, "y.foo.example", DNS_T_A, &out), 0);
 
+	/* sweeps: at most one walk per second, which loses nothing */
+	CHECK_EQ(ins(c, cfg, "z.foo.example", 1, NULL, 0), 0);
+	CHECK_EQ(cache_sweep_expired(c), 0);
+	CHECK_EQ(cache_count(c), 2);
+	time_override_advance(5);	/* both expired */
+	CHECK_EQ(cache_sweep_expired(c), 2);
+	CHECK_EQ(cache_count(c), 0);
+	CHECK_EQ(ins(c, cfg, "z.foo.example", 1, NULL, 0), 0);
+	CHECK_EQ(cache_sweep_expired(c), 0);	/* skipped: same second */
+	time_override_advance(1);
+	CHECK_EQ(cache_sweep_expired(c), 1);
+	CHECK_EQ(cache_sweep_expired(c), 0);
+	CHECK_EQ(cache_count(c), 0);
+
 	dns_msg_free(&out);
 	cache_free(c);
 	config_free(cfg);

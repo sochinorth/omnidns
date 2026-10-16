@@ -323,7 +323,13 @@ safe_until = now + min(TTL, fakeip_ttl_max) + fakeip_grace
   mark are recorded in conntrack on the first packet, so removing a map
   element only affects *new* connections.
 - **Eviction**: an S3-FIFO bounded by `fakeip_max_bindings`. It runs lazily,
-  only under pressure, and only evicts evictable bindings.
+  only under pressure, and only evicts evictable bindings. A pass that ends
+  short of its target has found every binding pinned, so the next one waits
+  until one can be evictable: time passes the earliest `safe_until` of an
+  unreferenced binding, a binding's last reference goes, or a reload. With
+  a table full of live bindings, a failing bind therefore costs a probe and
+  no scan, and the cache sweep before its retry runs at most once a
+  second (a second sweep within the same second would find nothing).
 - **Persistence**: bindings live in RAM only. On startup omnidns recreates its
   nftables table from scratch.
 

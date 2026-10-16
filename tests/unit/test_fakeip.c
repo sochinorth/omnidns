@@ -672,6 +672,95 @@ TEST(capacity)
 	fakeip_free(db);
 }
 
+/*
+ * A full table of live bindings: the first failing bind runs one eviction
+ * pass, the next ones none, until a binding can become evictable (an
+ * unref, a new binding with an earlier safe_until, time, a reload).
+ */
+TEST(evict_stall)
+{
+	enum { CAP = 2000 };
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db = fakeip_new(&p4, NULL, CAP, 0, SECRET, NFT);
+	struct binding *held = NULL, *b;
+	uint32_t scans;
+	char name[16];
+	int err;
+
+	reset();
+	kern_off = true;
+	for (int i = 0; i < CAP; i++) {
+		snprintf(name, sizeof(name), "h%d", i);
+		/* h0 expires first, h1 is referenced and expires right after */
+		b = bind4(db, "r", 0, name, 1, i < 2 ? 10 + i : 100, &err);
+		REQUIRE(b);
+		if (i == 1)
+			fakeip_ref(held = b);
+	}
+	CHECK_EQ(fakeip_evict_scans(db), 0);
+	CHECK(!bind4(db, "r", 0, "x0", 1, 100, &err));
+	CHECK_EQ(err, -ENOSPC);
+	scans = fakeip_evict_scans(db);
+	CHECK_EQ(scans, 1);
+	/* the second failing bind does not rescan */
+	for (int i = 1; i < 50; i++) {
+		snprintf(name, sizeof(name), "x%d", i);
+		CHECK(!bind4(db, "r", 0, name, 1, 100, &err));
+		CHECK_EQ(err, -ENOSPC);
+	}
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	/* nor does a reference going away while its binding is live */
+	fakeip_ref(held);
+	fakeip_unref(db, held);
+	CHECK(!bind4(db, "r", 0, "y", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	/* time reaching h0's safe_until (1010) is not enough: it must pass it */
+	time_override_set(1010);
+	CHECK(!bind4(db, "r", 0, "y", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	time_override_set(1011);
+	b = bind4(db, "r", 0, "y", 1, 100, &err);
+	REQUIRE(b);
+	CHECK_EQ(fakeip_evict_scans(db), ++scans);
+	CHECK_EQ(n_del, 1);	/* h0 */
+	/* that pass stalled again: h1 has expired too, but is referenced */
+	time_override_set(1012);
+	CHECK(!bind4(db, "r", 0, "z", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	/* its last reference goes: evictable now, a pass runs */
+	fakeip_unref(db, held);
+	REQUIRE(bind4(db, "r", 0, "z", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), ++scans);
+	CHECK_EQ(n_del, 2);
+	CHECK(!bind4(db, "r", 0, "w", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	/* a new binding expiring before the others wakes the stall at its time */
+	CHECK_EQ(fakeip_set_config(db, &p4, NULL, CAP + 1, 0), 0);
+	REQUIRE(bind4(db, "r", 0, "short", 1, 3, &err));	/* safe_until 1015 */
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	CHECK(!bind4(db, "r", 0, "w", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), ++scans);
+	CHECK(!bind4(db, "r", 0, "w", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	time_override_set(1016);
+	REQUIRE(bind4(db, "r", 0, "w", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), ++scans);
+	CHECK_EQ(n_del, 3);
+	CHECK_EQ(fakeip_count(db), CAP + 1);
+	CHECK(!bind4(db, "r", 0, "v", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), scans);
+	/* a reload clears the stall */
+	CHECK_EQ(fakeip_set_config(db, &p4, NULL, CAP + 1, 0), 0);
+	CHECK(!bind4(db, "r", 0, "v", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), ++scans);
+	/* and the h* bindings expire at 1101 */
+	time_override_set(1101);
+	REQUIRE(bind4(db, "r", 0, "v", 1, 100, &err));
+	CHECK_EQ(fakeip_evict_scans(db), ++scans);
+	CHECK_EQ(fakeip_count(db), (CAP + 1) * 7 / 8 + 1);
+	fakeip_free(db);
+}
+
 /* ---- randomized stress ---- */
 
 static uint64_t rng = 88172645463325252ull;
@@ -1172,6 +1261,7 @@ int main(void)
 	RUN(set_config);
 	RUN(stale_mark);
 	RUN(capacity);
+	RUN(evict_stall);
 	RUN(stress);
 	RUN(policy_stress);
 	RUN(policy_refcount);
