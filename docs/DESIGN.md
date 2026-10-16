@@ -39,13 +39,14 @@ nftables control-plane transactions at startup and reload, which are short
 synchronous netlink exchanges.
 
 ```
- client ──► server ──► resolve ──► cache (hit) ──────────────────────► reply
-                          │
-                          ├──► match (rule per name)
-                          ├──► upstream (UDP/TCP, coalesced)
-                          └──► fakeip (bindings) ──► nft (async batches)
-                                                       │ ack
-                          reply ◄── cache insert ◄─────┘
+ client ──► server ──► cache (hit) ──────────────────────────────────► reply
+              │ miss
+              └──► resolve
+                      ├──► match (rule per name)
+                      ├──► upstream (UDP/TCP, coalesced)
+                      └──► fakeip (bindings) ──► nft (async batches)
+                                                   │ ack
+                      reply ◄── cache insert ◄─────┘
 ```
 
 | module | role |
@@ -191,19 +192,34 @@ still `block`, but they cannot change the routing decision.
 
 ### Answer assembly
 
-The answer section is the prefix followed by the terminal records.
+The answer section is the prefix followed by the terminal records: the
+kept, rewritten or bound records of the queried type owned by the final
+name. Nothing else in the final response's answer section (its RRSIGs, for
+instance) is carried over. The authority and additional sections are the
+final response's, filtered:
 
-When anything was rewritten:
-- RRSIG, NSEC and NSEC3 records are removed;
-- AD is cleared;
-- additional-section addresses are dropped.
+- when a terminal record was rewritten or dropped, RRSIG, NSEC, NSEC3 and
+  (unless DS was asked for) DS records are removed;
+- additional A/AAAA/SVCB/HTTPS records are dropped entirely when a latch is
+  in force or the answer made bindings. Otherwise each is kept only if its
+  owner's rule is a plain `forward`, and that owner is recorded as a
+  dependency. This stops glue (e.g. SRV/MX targets) from leaking real
+  addresses of fakeip or blocked names.
 
-Separately, an additional A/AAAA/SVCB record is kept only if its owner's
-rule is a plain `forward`. This stops glue (e.g. SRV/MX targets) from
-leaking real addresses of fakeip or blocked names.
+A negative answer is the prefix plus the final response's authority and
+additional sections, with the same glue filtering and DNSSEC records kept.
 
-When a single upstream response needed no change at all, it is passed
-through as received (minus OPT).
+The header is always omnidns's own: QR, RA, the client's RD and CD, and the
+upstream's 4-bit rcode. AA and AD are never set.
+
+When a single upstream response needed no change at all (no alias
+synthesized from a DNAME, no latch, no bindings, no glue to filter, nothing
+rewritten), its records are passed through as received; only the header is
+replaced and OPT dropped.
+
+The finished answer is serialized once, with name compression, into the
+bytes the cache stores and every reply is rendered from (see
+[Cache](#answer-cache)).
 
 ### Deferred binding
 
@@ -346,13 +362,16 @@ output_reject      (filter, output,     filter-1):  same
 
 ## Answer cache
 
-- **Key**: lowercased qname, qtype, qclass. Upstream queries always use DO=0,
-  so the DO bit is not part of the key.
-- **Value**:
-  - a compact copy of the final message: 16-byte records whose owner and
-    rdata names are stored once per entry, in a single allocation with the
-    rest of the entry (about 280 bytes for a CNAME plus three A records).
-    Answers too large for its 16-bit offsets are not cached;
+- **Key**: qname (compared case-insensitively), qtype, qclass. Upstream
+  queries always use DO=0, so the DO bit is not part of the key.
+- **Value**, in a single allocation (about 260 bytes, overhead included,
+  for a CNAME plus three A records):
+  - the final response in wire format, as it was serialized once when the
+    answer was complete: header, question (the key, in the case it was first
+    asked with), the records with their names compressed; no OPT. An answer
+    larger than a DNS message is stored as serialization cuts it (trailing
+    additional records dropped, or just header and question with TC set),
+    which is what every client got for it anyway;
   - insert time and lifetime;
   - the walk's dependencies;
   - references to the bindings in the answer;
@@ -362,7 +381,21 @@ output_reject      (filter, output,     filter-1):  same
   - negative answers: min(SOA TTL, SOA MINIMUM, `neg_ttl_max`);
   - block answers: `block_ttl`;
   - SERVFAIL and other errors: not cached.
-- **Hits**: served with every TTL reduced by the entry's age.
+- **Hits**: the server looks the cache up right after validating a query,
+  before it allocates any request state, and replies synchronously. ANY and
+  PTR queries for fake-pool addresses are not looked up: they keep their own
+  handling, which comes first. A hit is rendered from the stored bytes
+  without rebuilding the message: they are copied, the id, flags and
+  question bytes are patched in (the client's question is the same name, so
+  it has the same length and pointers into it stay valid), every TTL is
+  reduced by the entry's age (floored at 0) by a walk over the records, an
+  OPT record is appended if the query had one, and the message is cut to
+  the client's size limit at exactly the record where serializing would
+  have cut it (see [Client-facing server](#client-facing-server)). Fresh
+  answers take the same path with age 0, so there is one reply path.
+  Because names compress case-insensitively (a name pointing at an equal
+  one takes its case), patching in another case of the question gives
+  exactly the bytes serializing for that question would have.
 - **Revalidation**: if the entry's generation differs from the current
   config's, every dependency name is matched again, and each rule
   fingerprint must equal the recorded one; otherwise the entry is dropped.
@@ -401,22 +434,35 @@ output_reject      (filter, output,     filter-1):  same
   - ANY gets NOTIMP;
   - AXFR/IXFR get REFUSED.
 - **Responses** echo the client's id, RD/CD bits and question bytes, so
-  0x20-randomized case survives. They carry an OPT record only if the query
-  did.
+  0x20-randomized case survives (and so does it in owner names compressed
+  against the question). They carry an OPT record only if the query did.
+  Every answer reply, fresh or cached, is rendered from the answer's wire
+  form (see [Cache](#answer-cache)); only error replies (FORMERR, NOTIMP,
+  REFUSED, BADVERS and SERVFAIL when a query cannot be started) are built
+  from the query alone.
 - **Size limits**: UDP answers are limited to 512 bytes without EDNS, or
-  min(client size, 1232) with it. A larger answer is truncated with TC=1.
+  max(512, min(client size, 1232)) with it, the OPT record included. A
+  larger answer loses additional-section records from the first one that
+  does not fit; if an answer or authority record does not fit, the reply is
+  the header and question (and OPT) with TC=1.
 - **PTR**: lookups for fake-pool addresses are answered locally from the
   binding table and never sent upstream.
 - **TCP**: pipelining with out-of-order replies (RFC 7766), up to 16 queries
-  in flight per connection and a 10 s idle timeout. Reading stops above
-  256 KiB of queued output, and the connection is dropped above 1 MiB.
+  in flight per connection and a 10 s idle timeout. A cache hit is answered
+  as soon as it is read, possibly before earlier queries of the same
+  connection. Reading stops above 256 KiB of queued output (checked before
+  each query, so a run of hits backs off too), and the connection is
+  dropped above 1 MiB.
 - **Limits**:
   - `max_pending` queries in flight in total;
   - `max_pending_per_client` per client, where IPv6 clients are accounted
     per /64;
   - `max_clients_tcp` TCP connections.
 
-  Over the limits, UDP queries are dropped and TCP queries get REFUSED.
+  Over the limits, UDP queries are dropped and TCP queries get REFUSED. The
+  pending limits bound requests waiting for upstreams or nftables; a cache
+  hit never waits, so it is answered whatever they are and does not count
+  against them (nor against the 16 in flight per TCP connection).
 - **Pending replies across a reload**: a UDP listener closed by a reload
   keeps its socket open until its last pending reply is sent. A reused file
   descriptor can never receive another client's answer.
@@ -471,7 +517,10 @@ cached answers skip revalidation. The log still says
 ## Testing
 
 - **Unit tests**: each module has unit tests under ASan/UBSan, including
-  randomized model tests for the hash map, S3-FIFO and the binding table. The
+  randomized model tests for the hash map, S3-FIFO and the binding table.
+  Replies rendered from cached bytes are compared byte for byte with
+  serializing the message for the client (a recorded corpus covering
+  truncation, TTL aging, flags and 0x20 case, plus randomized messages). The
   nftables tests run in an unprivileged user+net namespace against the real
   kernel, including a real DNATed connection with the expected marks.
 - **Resolver tests**: the walk has a table-driven suite with a scripted
