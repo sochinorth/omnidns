@@ -29,10 +29,13 @@
 
 struct s3_node {
 	struct list_head list;
-	uint64_t hash;		/* key hash, for the ghost queue */
+	uint32_t hash;		/* folded key hash, for the ghost queue */
 	uint8_t freq;
 	uint8_t queue;		/* internal: S3_Q_* */
 };
+
+/* two pointers + 8 bytes: 24 B on LP64, 16 B on ILP32 (no padding holes) */
+_Static_assert(sizeof(struct s3_node) == 2 * sizeof(void *) + 8, "s3_node layout");
 
 struct s3fifo;
 
@@ -47,15 +50,28 @@ struct s3fifo {
 	uint32_t cap;			/* target capacity in nodes */
 	const struct s3_ops *ops;
 	void *priv;
-	/* ghost: ring of hashes + small open-addressed set over the ring */
-	uint64_t *ghost_ring;
+	/*
+	 * ghost: ring of 32-bit hashes + small open-addressed set over the
+	 * ring. ghost_cap and ghost_set_mask are fixed by the capacity; the
+	 * tables themselves are allocated on the first ghost insertion (NULL
+	 * until then, or if that allocation failed).
+	 */
+	uint32_t *ghost_ring;
 	uint32_t ghost_cap, ghost_head, ghost_len;
-	uint64_t *ghost_set;		/* 2*ghost_cap slots, 0 = empty */
+	uint32_t *ghost_set;		/* >= 2*ghost_cap slots, 0 = empty */
 	uint32_t ghost_set_mask;
 };
 
+/* Allocates nothing (ghost tables are lazy); always returns 0. */
 int s3_init(struct s3fifo *s, uint32_t cap, const struct s3_ops *ops, void *priv);
 void s3_destroy(struct s3fifo *s);	/* does NOT call evict on remaining nodes */
+
+/*
+ * Change the target capacity (e.g. on config reload). Does not evict;
+ * call s3_maybe_evict() afterwards. If the ghost size changes, the ghost
+ * history is dropped.
+ */
+void s3_set_cap(struct s3fifo *s, uint32_t cap);
 
 static inline uint32_t s3_count(const struct s3fifo *s) { return s->n_small + s->n_main; }
 

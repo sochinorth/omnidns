@@ -632,7 +632,7 @@ int fakeip_set_config(struct fakeip_db *db, const struct ip_prefix *p4,
 			binding_drop(db, b, true);
 	set_pools(db, p4, p6);
 	db->max_bindings = max_bindings ? max_bindings : 1;
-	db->s3.cap = db->max_bindings;
+	s3_set_cap(&db->s3, db->max_bindings);
 	db->grace = grace;
 	s3_maybe_evict(&db->s3);
 	return 0;

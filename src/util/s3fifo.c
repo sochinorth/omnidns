@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-#include <errno.h>
 #include <stdlib.h>
 
 #include "s3fifo.h"
@@ -10,24 +9,36 @@ enum {
 	S3_Q_MAIN,
 };
 
-/* ghost set: linear probing with backward-shift deletion; may hold duplicates */
+/*
+ * Ghost hashes are 32 bits: the 64-bit key hash folded in half. A false
+ * ghost hit only places a new node in main instead of small. 0 marks an
+ * empty set slot, so hash 0 is stored as 1 (0 and 1 alias in the ghost).
+ */
+static inline uint32_t fold_hash(uint64_t hash)
+{
+	return (uint32_t)(hash ^ (hash >> 32));
+}
 
-static inline uint64_t ghost_key(uint64_t hash)
+static inline uint32_t ghost_key(uint32_t hash)
 {
 	return hash ? hash : 1;
 }
 
-static bool ghost_has(const struct s3fifo *s, uint64_t h)
+/* ghost set: linear probing with backward-shift deletion; may hold duplicates */
+
+static bool ghost_has(const struct s3fifo *s, uint32_t h)
 {
 	uint32_t i;
 
+	if (!s->ghost_set)
+		return false;
 	for (i = h & s->ghost_set_mask; s->ghost_set[i]; i = (i + 1) & s->ghost_set_mask)
 		if (s->ghost_set[i] == h)
 			return true;
 	return false;
 }
 
-static void ghost_set_add(struct s3fifo *s, uint64_t h)
+static void ghost_set_add(struct s3fifo *s, uint32_t h)
 {
 	uint32_t i;
 
@@ -36,7 +47,7 @@ static void ghost_set_add(struct s3fifo *s, uint64_t h)
 	s->ghost_set[i] = h;
 }
 
-static void ghost_set_del(struct s3fifo *s, uint64_t h)
+static void ghost_set_del(struct s3fifo *s, uint32_t h)
 {
 	uint32_t mask = s->ghost_set_mask, i, j, k;
 
@@ -57,10 +68,41 @@ static void ghost_set_del(struct s3fifo *s, uint64_t h)
 	s->ghost_set[i] = 0;
 }
 
-static void ghost_add(struct s3fifo *s, uint64_t hash)
+static void ghost_free(struct s3fifo *s)
 {
-	uint64_t h = ghost_key(hash);
+	free(s->ghost_ring);
+	free(s->ghost_set);
+	s->ghost_ring = NULL;
+	s->ghost_set = NULL;
+	s->ghost_head = s->ghost_len = 0;
+}
 
+/* Size the (not yet allocated) ghost for `cap`: ghost_cap ~ 90% of cap. */
+static void ghost_size(struct s3fifo *s, uint32_t cap)
+{
+	uint32_t gcap = cap - cap / 10, slots = 4;
+
+	if (!gcap)
+		gcap = 1;
+	while (slots < 2 * (uint64_t)gcap)
+		slots <<= 1;
+	s->ghost_cap = gcap;
+	s->ghost_set_mask = slots - 1;
+}
+
+/* Record an evicted hash. Never fails: without memory, the ghost is skipped. */
+static void ghost_add(struct s3fifo *s, uint32_t hash)
+{
+	uint32_t h = ghost_key(hash);
+
+	if (!s->ghost_ring) {
+		s->ghost_ring = calloc(s->ghost_cap, sizeof(*s->ghost_ring));
+		s->ghost_set = calloc((size_t)s->ghost_set_mask + 1, sizeof(*s->ghost_set));
+		if (!s->ghost_ring || !s->ghost_set) {
+			ghost_free(s);
+			return;
+		}
+	}
 	if (s->ghost_len == s->ghost_cap) {
 		ghost_set_del(s, s->ghost_ring[s->ghost_head]);
 		s->ghost_ring[s->ghost_head] = h;
@@ -74,45 +116,46 @@ static void ghost_add(struct s3fifo *s, uint64_t hash)
 
 int s3_init(struct s3fifo *s, uint32_t cap, const struct s3_ops *ops, void *priv)
 {
-	uint32_t gcap = cap - cap / 10, slots = 4;
-
-	if (!gcap)
-		gcap = 1;
-	while (slots < 2 * (uint64_t)gcap)
-		slots <<= 1;
-
 	INIT_LIST_HEAD(&s->small);
 	INIT_LIST_HEAD(&s->main);
 	s->n_small = s->n_main = 0;
 	s->cap = cap;
 	s->ops = ops;
 	s->priv = priv;
-	s->ghost_cap = gcap;
+	s->ghost_ring = NULL;
+	s->ghost_set = NULL;
 	s->ghost_head = s->ghost_len = 0;
-	s->ghost_set_mask = slots - 1;
-	s->ghost_ring = calloc(gcap, sizeof(*s->ghost_ring));
-	s->ghost_set = calloc(slots, sizeof(*s->ghost_set));
-	if (!s->ghost_ring || !s->ghost_set) {
-		s3_destroy(s);
-		return -ENOMEM;
-	}
+	ghost_size(s, cap);
 	return 0;
 }
 
 void s3_destroy(struct s3fifo *s)
 {
-	free(s->ghost_ring);
-	free(s->ghost_set);
-	s->ghost_ring = NULL;
-	s->ghost_set = NULL;
-	s->ghost_cap = s->ghost_len = s->ghost_head = 0;
+	ghost_free(s);
+	s->ghost_cap = 0;
+}
+
+void s3_set_cap(struct s3fifo *s, uint32_t cap)
+{
+	uint32_t old = s->ghost_cap;
+
+	s->cap = cap;
+	ghost_size(s, cap);
+	/*
+	 * The ring and set are sized for the old ghost_cap: drop them (and the
+	 * ghost history with them); they are reallocated lazily at the new
+	 * size. Losing ghost history on a resize only costs some admissions
+	 * into small instead of main.
+	 */
+	if (s->ghost_cap != old)
+		ghost_free(s);
 }
 
 void s3_insert(struct s3fifo *s, struct s3_node *n, uint64_t hash)
 {
-	n->hash = hash;
+	n->hash = fold_hash(hash);
 	n->freq = 0;
-	if (ghost_has(s, ghost_key(hash))) {
+	if (ghost_has(s, ghost_key(n->hash))) {
 		n->queue = S3_Q_MAIN;
 		list_add_tail(&n->list, &s->main);
 		s->n_main++;

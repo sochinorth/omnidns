@@ -170,7 +170,7 @@ void cache_set_limits(struct cache *c, uint32_t max_entries, size_t max_bytes)
 {
 	c->max_entries = max_entries ? max_entries : 1;
 	c->max_bytes = max_bytes;
-	c->s3.cap = c->max_entries;
+	s3_set_cap(&c->s3, c->max_entries);
 	maybe_evict(c);
 }
 

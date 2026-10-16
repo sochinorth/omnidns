@@ -92,6 +92,7 @@ TEST(init_destroy)
 
 	REQUIRE(s3_init(&s, 1000, &ops, (void *)&s) == 0);
 	CHECK_EQ(s.ghost_cap, 900);
+	CHECK(!s.ghost_ring && !s.ghost_set);
 	CHECK(s.ghost_set_mask + 1 >= 1800);
 	CHECK(s.priv == &s);
 	s3_destroy(&s);
@@ -240,6 +241,150 @@ TEST(ghost_expiry)
 		s3_evict(&s, 0);
 	}
 	CHECK(!in_ghost(&s, 42));
+	s3_destroy(&s);
+}
+
+TEST(lazy_ghost)
+{
+	struct s3fifo s;
+	struct obj o[4];
+
+	reset(o, 4);
+	REQUIRE(s3_init(&s, 10, &ops, NULL) == 0);
+	CHECK(!s.ghost_ring && !s.ghost_set);
+	CHECK_EQ(s.ghost_cap, 9);
+	CHECK(!in_ghost(&s, 1));
+	put(&s, &o[0], 1);
+	put(&s, &o[1], 2);
+	s3_touch(&o[0].node);
+	s3_touch(&o[1].node);
+	/* promotions small -> main and evictions from main record no ghost */
+	CHECK_EQ(s3_evict(&s, 0), 2);
+	CHECK(!o[0].in && !o[1].in);
+	CHECK(!s.ghost_ring && !s.ghost_set);
+	put(&s, &o[2], 3);
+	s3_remove(&s, &o[2].node);
+	o[2].in = false;
+	CHECK(!s.ghost_ring);
+	/* first eviction from small allocates */
+	put(&s, &o[3], 4);
+	CHECK_EQ(s3_evict(&s, 0), 1);
+	CHECK(s.ghost_ring && s.ghost_set);
+	CHECK_EQ(s.ghost_len, 1);
+	CHECK(in_ghost(&s, 4));
+	CHECK(!in_ghost(&s, 1));
+	s3_destroy(&s);
+	CHECK(!s.ghost_ring && !s.ghost_set);
+}
+
+/* Insert every absent o[i] (hash hbase + i), evicting at the watermark. */
+static void churn(struct s3fifo *s, struct obj *o, uint32_t n, uint64_t hbase)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		if (o[i].in)
+			continue;
+		put(s, &o[i], hbase + i);
+		s3_maybe_evict(s);
+	}
+}
+
+TEST(set_cap)
+{
+	enum { N = 400 };
+	static struct obj o[N];
+	struct s3fifo s;
+	uint32_t i, n;
+	uint64_t g = 0;
+
+	reset(o, N);
+	REQUIRE(s3_init(&s, 100, &ops, NULL) == 0);
+	churn(&s, o, 200, 10000);
+	CHECK(s3_count(&s) <= 100);
+	CHECK(s.ghost_ring);
+	for (i = 0; i < 200 && !g; i++)
+		if (in_ghost(&s, 10000 + i))
+			g = 10000 + i;
+	CHECK(g);
+
+	/* same ghost size (99 - 9 == 100 - 10): history kept */
+	s3_set_cap(&s, 99);
+	CHECK_EQ(s.cap, 99);
+	CHECK_EQ(s.ghost_cap, 90);
+	s3_set_cap(&s, 100);
+	CHECK_EQ(s.ghost_cap, 90);
+	CHECK(s.ghost_ring);
+	CHECK(in_ghost(&s, g));
+
+	/* shrink: ghost dropped and resized, eviction honours the new cap */
+	s3_set_cap(&s, 20);
+	CHECK_EQ(s.cap, 20);
+	CHECK_EQ(s.ghost_cap, 18);
+	CHECK_EQ(s.ghost_set_mask + 1, 64);
+	CHECK(!s.ghost_ring && !s.ghost_set);
+	CHECK_EQ(s.ghost_len, 0);
+	CHECK(!in_ghost(&s, g));
+	s3_maybe_evict(&s);
+	CHECK(s3_count(&s) <= 20);
+	for (i = 0; i < N; i++)
+		o[i].evictions = 0;
+	churn(&s, o, N, 20000);
+	CHECK(s3_count(&s) <= 20);
+	CHECK(s.ghost_ring);
+	CHECK_EQ(s.ghost_len, 18);
+	/* ring wrap at the new size: only the last 18 small evictions remain */
+	for (n = 0, i = 0; i < N; i++)
+		n += in_ghost(&s, 20000 + i);
+	CHECK(n <= 18 && n > 0);
+
+	/* grow: ghost dropped, entries kept, fills up to the new cap */
+	n = s3_count(&s);
+	s3_set_cap(&s, 300);
+	CHECK_EQ(s.ghost_cap, 270);
+	CHECK_EQ(s.ghost_set_mask + 1, 1024);
+	CHECK(!s.ghost_ring);
+	CHECK_EQ(s3_count(&s), n);
+	CHECK_EQ(s3_maybe_evict(&s), 0);
+	churn(&s, o, N, 30000);
+	CHECK(s3_count(&s) <= 300);
+	CHECK(s3_count(&s) > 200);
+	CHECK(s.ghost_ring);
+	CHECK(s.ghost_len > 0 && s.ghost_len <= 270);
+
+	CHECK(!bad_evict);
+	CHECK(s3_evict(&s, 0) > 0);
+	CHECK_EQ(s3_count(&s), 0);
+	s3_destroy(&s);
+}
+
+TEST(ghost_hash_edges)
+{
+	struct s3fifo s;
+	struct obj o[8];
+	uint64_t hi = 1ULL << 40;
+
+	reset(o, 8);
+	REQUIRE(s3_init(&s, 100, &ops, NULL) == 0);
+	/* 0 is stored as 1 in the ghost (0 marks an empty set slot) */
+	put(&s, &o[0], 0);
+	CHECK_EQ(s3_evict(&s, 0), 1);
+	CHECK(in_ghost(&s, 0));
+	CHECK(in_ghost(&s, 1));
+	CHECK(!in_ghost(&s, 2));
+	/* differ only in the high 32 bits: still distinct after folding */
+	put(&s, &o[1], 5 | hi);
+	CHECK_EQ(s3_evict(&s, 0), 1);
+	CHECK(in_ghost(&s, 5 | hi));
+	CHECK(!in_ghost(&s, 5));
+	/* all share the home slot in the set (low bits equal) */
+	for (uint32_t i = 2; i < 8; i++)
+		put(&s, &o[i], 7 + ((uint64_t)i << 24));
+	CHECK_EQ(s3_evict(&s, 0), 6);
+	for (uint32_t i = 2; i < 8; i++)
+		CHECK(in_ghost(&s, 7 + ((uint64_t)i << 24)));
+	CHECK(!in_ghost(&s, 7));
+	CHECK(!in_ghost(&s, 7 + (9ULL << 24)));
+	CHECK_EQ(s.ghost_len, 8);
+	CHECK(!bad_evict);
 	s3_destroy(&s);
 }
 
@@ -532,6 +677,9 @@ int main(void)
 	RUN(freq_saturates);
 	RUN(ghost_hit);
 	RUN(ghost_expiry);
+	RUN(lazy_ghost);
+	RUN(set_cap);
+	RUN(ghost_hash_edges);
 	RUN(pinned);
 	RUN(pinned_main_small_leftover);
 	RUN(pinned_hot_unpinned);
