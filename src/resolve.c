@@ -52,8 +52,8 @@ struct resolve_req {
 	struct upstream_set *cur_up;
 	struct latch latch;
 	struct dns_msg resp;
-	bool have_resp, requeried, synth;
-	uint16_t nresp, steps;
+	bool synth;			/* a CNAME was synthesized from a DNAME */
+	uint16_t nresp, steps;		/* responses (in r->resp: the last one) */
 	struct dns_msg prefix;
 
 	/*
@@ -600,7 +600,6 @@ static int copy_tail(struct resolve_req *r, bool strip_sec)
 	return 0;
 }
 
-
 static int copy_prefix(struct resolve_req *r)
 {
 	uint16_t i;
@@ -616,8 +615,7 @@ static int copy_prefix(struct resolve_req *r)
 
 static bool can_pass_through(struct resolve_req *r)
 {
-	return r->nresp == 1 && !r->requeried && !r->synth && !r->latch.on && !r->nbinds &&
-	       all_glue_ok(r);
+	return r->nresp == 1 && !r->synth && !r->latch.on && !r->nbinds && all_glue_ok(r);
 }
 
 /*
@@ -966,7 +964,6 @@ static void upstream_done(void *ctx, int err, struct dns_msg *resp)
 	dns_msg_free(&r->resp);
 	r->resp = *resp;
 	dns_msg_init(resp);
-	r->have_resp = true;
 	r->nresp++;
 	walk(r, true);
 }
@@ -1007,12 +1004,10 @@ static bool policy_step(struct resolve_req *r)
 	want = r->latch.on ? r->latch.up : rule->up;
 	if (!want)
 		return servfail(r), true;
-	if (r->have_resp && want->id == r->cur_up->id)
+	if (r->nresp && want->id == r->cur_up->id)
 		return false;
-	if (r->have_resp) {
+	if (r->nresp)
 		stats.requeries++;
-		r->requeried = true;
-	}
 	set_up(&r->cur_up, want);
 	query(r);
 	return true;
