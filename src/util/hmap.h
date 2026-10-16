@@ -69,7 +69,10 @@ size_t hmap_footprint(const struct hmap *m);
 static inline uint32_t hmap_len(const struct hmap *m) { return m->len; }
 
 /* Iteration: for (uint32_t it = 0; (v = hmap_next(m, &it)); ) ...
- * Deleting the current element during iteration is allowed. */
+ * Deleting during iteration is allowed (the current element or any other):
+ * deletes never move entries. hmap_put() during iteration is NOT allowed:
+ * it may grow the table, purge tombstones in place or shrink it, any of
+ * which moves entries so the walk skips or repeats them. */
 void *hmap_next(const struct hmap *m, uint32_t *it);
 
 #endif
