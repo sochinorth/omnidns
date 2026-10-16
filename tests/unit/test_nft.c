@@ -536,10 +536,10 @@ TEST(async_add_del)
 	inet_pton(AF_INET6, "fc00::1", f6);
 	inet_pton(AF_INET6, "2001:db8::1", r6);
 
-	t1 = nft_elem_add(n, AF_INET, f1, r1, 0x01000000, false);
-	t2 = nft_elem_add(n, AF_INET, f2, r2, 0x02000000, false);
+	t1 = nft_elem_add(n, AF_INET, f1, r1, 0x01000000);
+	t2 = nft_elem_add(n, AF_INET, f2, r2, 0x02000000);
 	CHECK_EQ(t1, t2);
-	CHECK(nft_elem_add(n, AF_INET6, f6, r6, 0x02000000, false) == t1);
+	CHECK(nft_elem_add(n, AF_INET6, f6, r6, 0x02000000) == t1);
 	CHECK(!nft_ticket_done(n, t1));
 	wait_on(&a, t1);
 	wait_on(&b, t1);
@@ -565,8 +565,8 @@ TEST(async_add_del)
 	CHECK_EQ(c.err, 0);
 
 	/* re-adding identical element is fine; replace changes mapping */
-	CHECK(nft_elem_add(n, AF_INET, f2, r2, 0x02000000, false) != 0);
-	t2 = nft_elem_add(n, AF_INET, f1, r2, 0x02000000, true);
+	CHECK(nft_elem_add(n, AF_INET, f2, r2, 0x02000000) != 0);
+	t2 = nft_elem_add(n, AF_INET, f1, r2, 0x02000000);
 	t3 = nft_elem_del(n, AF_INET6, f6);
 	CHECK(t2 > t1);
 	CHECK_EQ(t3, t2);
@@ -581,7 +581,7 @@ TEST(async_add_del)
 
 	/* adds are idempotent: remapping an existing key always succeeds,
 	 * also with the 4/6 family shorthand used by the fakeip DB */
-	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000, false);
+	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000);
 	wait_on(&a, t3);
 	run_loop();
 	CHECK_EQ(a.err, 0);
@@ -590,8 +590,8 @@ TEST(async_add_del)
 	free(o);
 
 	/* same key twice in one loop iteration: the second op must win */
-	nft_elem_add(n, 4, f1, r2, 0x02000000, false);
-	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000, false);
+	nft_elem_add(n, 4, f1, r2, 0x02000000);
+	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000);
 	wait_on(&a, t3);
 	run_loop();
 	CHECK_EQ(a.err, 0);
@@ -600,7 +600,7 @@ TEST(async_add_del)
 	CHECK(has(o, "198.18.0.1 : jump mark_01000000"));
 	free(o);
 	/* add then delete in one iteration: element must be gone */
-	nft_elem_add(n, 4, f1, r2, 0x02000000, false);
+	nft_elem_add(n, 4, f1, r2, 0x02000000);
 	t3 = nft_elem_del(n, 4, f1);
 	wait_on(&a, t3);
 	run_loop();
@@ -608,7 +608,7 @@ TEST(async_add_del)
 	o = list_table();
 	CHECK(lacks(o, "198.18.0.1 :"));
 	free(o);
-	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000, false);
+	t3 = nft_elem_add(n, 4, f1, r1, 0x01000000);
 	wait_on(&a, t3);
 	run_loop();
 
@@ -636,7 +636,7 @@ TEST(async_failure)
 	nfails = 0;
 	v4(f1, "198.18.0.9"); v4(r1, "10.9.9.9"); v4(f2, "198.18.0.10");
 	/* no chain mark_05000000 */
-	t1 = nft_elem_add(n, AF_INET, f1, r1, 0x05000000, false);
+	t1 = nft_elem_add(n, AF_INET, f1, r1, 0x05000000);
 	wait_on(&a, t1);
 	run_loop();
 	CHECK_EQ(a.fired, 1);
@@ -655,7 +655,7 @@ TEST(async_failure)
 	CHECK_EQ(a.err, failed_err);
 
 	/* replace or delete of a non-existent element is a no-op (DESTROY) */
-	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000, true);
+	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000);
 	nft_elem_del(n, 6, (const uint8_t *)"\xfc\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x77");
 	wait_on(&b, t2);
 	run_loop();
@@ -663,7 +663,7 @@ TEST(async_failure)
 	CHECK_EQ(nfails, 1);
 
 	/* the next batch is unaffected */
-	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000, false);
+	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000);
 	wait_on(&b, t2);
 	run_loop();
 	CHECK_EQ(b.err, 0);
@@ -686,10 +686,10 @@ TEST(async_failure_not_last)
 	v4(f1, "198.18.0.11"); v4(r1, "10.11.11.11"); v4(f2, "198.18.0.12");
 	inet_pton(AF_INET6, "fc00::11", f6);
 	inet_pton(AF_INET6, "2001:db8::11", r6);
-	t1 = nft_elem_add(n, AF_INET, f1, r1, 0x05000000, false);	/* no chain */
-	CHECK(nft_elem_add(n, AF_INET6, f6, r6, 0x01000000, false) == t1);
+	t1 = nft_elem_add(n, AF_INET, f1, r1, 0x05000000);	/* no chain */
+	CHECK(nft_elem_add(n, AF_INET6, f6, r6, 0x01000000) == t1);
 	nft_flush(n);
-	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000, false);
+	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000);
 	CHECK(t2 == t1 + 1);
 	nft_flush(n);
 	wait_on(&a, t1);
@@ -723,7 +723,7 @@ TEST(async_big_batch)
 		uint64_t t;
 
 		f[0] = 198; f[1] = 18; f[2] = (uint8_t)(i >> 8); f[3] = (uint8_t)i;
-		t = nft_elem_add(n, AF_INET, f, r, 0x01000000, false);
+		t = nft_elem_add(n, AF_INET, f, r, 0x01000000);
 		if (!first)
 			first = t;
 		last = t;
@@ -769,9 +769,9 @@ TEST(async_burst_inflight)
 			uint8_t bf[4] = { 198, 18, 250, 250 };
 
 			/* no chain mark_07000000: fails its whole batch */
-			bad_ticket = nft_elem_add(n, AF_INET, bf, r, 0x07000000, false);
+			bad_ticket = nft_elem_add(n, AF_INET, bf, r, 0x07000000);
 		}
-		tick[i] = nft_elem_add(n, AF_INET, f, r, 0x02000000, false);
+		tick[i] = nft_elem_add(n, AF_INET, f, r, 0x02000000);
 		if (!nb || tickets[nb - 1] != tick[i]) {
 			REQUIRE(nb < MAXB);
 			tickets[nb++] = tick[i];
@@ -805,8 +805,8 @@ TEST(async_burst_inflight)
 	/* a key re-added right after: its pending add forces a new batch,
 	 * also across the many batches already sent */
 	f[0] = 198; f[1] = 19; f[2] = 0; f[3] = 1;
-	uint64_t t1 = nft_elem_add(n, AF_INET, f, r, 0x01000000, false);
-	uint64_t t2 = nft_elem_add(n, AF_INET, f, r, 0x02000000, false);
+	uint64_t t1 = nft_elem_add(n, AF_INET, f, r, 0x01000000);
+	uint64_t t2 = nft_elem_add(n, AF_INET, f, r, 0x02000000);
 	CHECK(t2 == t1 + 1);
 	for (int i = 0; i < N; i++) {
 		f[0] = 198; f[1] = 19; f[2] = (uint8_t)(i >> 8); f[3] = (uint8_t)i;
@@ -903,14 +903,14 @@ TEST(reconcile_fwmask_stale_elems)
 	v4(f1, "198.18.0.21"); v4(r1, "10.2.1.1"); v4(f2, "198.18.0.22");
 	inet_pton(AF_INET6, "fc00::21", f6);
 	inet_pton(AF_INET6, "2001:db8::21", r6);
-	nft_elem_add(n, AF_INET, f1, r1, 0x01000000, false);
-	wait_on(&a, nft_elem_add(n, AF_INET6, f6, r6, 0x01000000, false));
+	nft_elem_add(n, AF_INET, f1, r1, 0x01000000);
+	wait_on(&a, nft_elem_add(n, AF_INET6, f6, r6, 0x01000000));
 	run_loop();
 	CHECK_EQ(a.err, 0);
 	/* the delete shares a batch with an add the kernel rejects (no chain) */
 	nft_elem_del(n, AF_INET, f1);
 	nft_elem_del(n, AF_INET6, f6);
-	wait_on(&b, nft_elem_add(n, AF_INET, f2, r1, 0x05000000, false));
+	wait_on(&b, nft_elem_add(n, AF_INET, f2, r1, 0x05000000));
 	run_loop();
 	CHECK(b.err < 0);
 	CHECK_EQ(count_elems("fake2mark_v4"), 1);
@@ -940,7 +940,7 @@ TEST(reconcile_fwmask_stale_elems)
 	free(o);
 
 	/* the maps still work */
-	wait_on(&a, nft_elem_add(n, AF_INET, f1, r1, 0x00010000, false));
+	wait_on(&a, nft_elem_add(n, AF_INET, f1, r1, 0x00010000));
 	run_loop();
 	CHECK_EQ(a.err, 0);
 	CHECK_EQ(count_elems("fake2mark_v4"), 1);
@@ -997,7 +997,7 @@ TEST(packets)
 	REQUIRE(nft_bootstrap(n, &d) == 0);
 	v4(fake, "198.18.0.5");
 	v4(real, "127.0.0.1");
-	nft_elem_add(n, AF_INET, fake, real, 0x01000000, false);
+	nft_elem_add(n, AF_INET, fake, real, 0x01000000);
 	REQUIRE(nft_drain(n) == 0);
 
 	lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1183,7 +1183,7 @@ static int wire_check(const struct rop *ops, uint32_t nops, uint32_t send)
 static void rop_queue(const struct rop *o)
 {
 	if (o->add)
-		nft_elem_add(n, o->fam, o->fake, o->real, o->mark, false);
+		nft_elem_add(n, o->fam, o->fake, o->real, o->mark);
 	else
 		nft_elem_del(n, o->fam, o->fake);
 }

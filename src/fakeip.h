@@ -32,8 +32,8 @@
  * Probing at most FAKEIP_MAX_PROBE candidates:
  *   - free candidate                          -> take it
  *   - occupied by an evictable binding        -> reclaim: evict that binding
- *     (expired: safe_until < now and refcnt==0)  and reuse its fake; the nft
- *                                                 op uses replace=true
+ *     (expired: safe_until < now and refcnt==0)  and reuse its fake (the nft
+ *                                                 add replaces its elements)
  *   - occupied by a live binding              -> continue
  * If no candidate is found, run an S3-FIFO eviction pass and retry once;
  * then fail with -ENOSPC. (A pass is skipped while the last one stalled,
@@ -43,7 +43,7 @@
  * unreferenced (pinned otherwise). Eviction deletes the nft elements.
  *
  * A binding is usable for answering only after its nft ticket is done;
- * callers wait with nft_wait(b->ticket) (fakeip_ticket()).
+ * callers wait with nft_wait(b->ticket).
  */
 
 #define FAKEIP_MAX_PROBE 64

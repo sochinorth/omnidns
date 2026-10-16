@@ -60,8 +60,9 @@ static void kern_remove(uint32_t i)
 	kern[i] = kern[--n_kern];
 }
 
+/* an add destroys any element of the key first: n_add_replace counts those */
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-                      const uint8_t *real, uint32_t mark, bool replace)
+                      const uint8_t *real, uint32_t mark)
 {
 	int i;
 
@@ -71,14 +72,8 @@ uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
 	i = kern_find(family, fake);
 	if (n != NFT || (family != 4 && family != 6))
 		kern_bad++;
-	if (replace) {
+	if (i >= 0) {
 		n_add_replace++;
-		if (i < 0)
-			kern_bad++;
-		else
-			kern_remove(i);
-	} else if (i >= 0) {
-		kern_bad++;
 		kern_remove(i);
 	}
 	if (n_kern == KMAX) {

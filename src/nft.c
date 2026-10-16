@@ -1249,13 +1249,10 @@ static bool op_begin(struct nft_ctx *n, int family)
 	return true;
 }
 
-/*
- * An add always destroys the key first (so a key mapped to different data
- * never fails with EEXIST); `replace` is therefore implied and kept only
- * for API compatibility.
- */
+/* An add always destroys the key first, so a key mapped to different data
+ * never fails with EEXIST. */
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-                      const uint8_t *real, uint32_t mark, bool replace)
+                      const uint8_t *real, uint32_t mark)
 {
 	bool v6;
 	int rs, ms;

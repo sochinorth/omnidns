@@ -94,13 +94,13 @@ int nft_destroy_table(struct nft_ctx *n);
 
 /*
  * Queue: add fake -> real into fake2real and fake -> jump mark_<mark> into
- * fake2mark. The mark chain must exist (desired at last reconcile).
- * `replace` first deletes any existing element for `fake` in the same
- * transaction (used when reclaiming a slot).
+ * fake2mark. The mark chain must exist (desired at last reconcile). Any
+ * existing element for `fake` is destroyed first in the same transaction,
+ * so this also replaces (a reclaimed slot).
  * Returns the ticket of the batch carrying the op.
  */
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-                      const uint8_t *real, uint32_t mark, bool replace);
+                      const uint8_t *real, uint32_t mark);
 uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake);
 
 /* true when the batch `ticket` has been acknowledged (successfully or not). */

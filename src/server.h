@@ -29,10 +29,4 @@ int server_start(struct omni *o);
 int server_reconfigure(struct omni *o);
 void server_stop(void);
 
-struct server_stats {
-	uint64_t udp_queries, tcp_queries, dropped, formerr, refused_limit, tcp_conns;
-	uint32_t pending;
-};
-const struct server_stats *server_get_stats(void);
-
 #endif

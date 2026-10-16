@@ -43,9 +43,7 @@ TEST(reuse)
 	CHECK(!a->payload && !a->own);		/* new ones are zeroed */
 	a->payload = 42;
 	a->own = malloc(16);
-	CHECK_EQ(p.used, 1);
 	pool_put(&p, a);
-	CHECK_EQ(p.used, 0);
 	CHECK_EQ(p.nfree, 1);
 #if defined(__SANITIZE_ADDRESS__)
 	/* kept objects are poisoned past the link word, like freed memory */
@@ -83,12 +81,10 @@ TEST(cap)
 		REQUIRE(o[i]);
 		o[i]->own = malloc(8);
 	}
-	CHECK_EQ(p.used, 10);
 	for (i = 0; i < 10; i++)
 		pool_put(&p, o[i]);
 	CHECK_EQ(p.nfree, 3);
 	CHECK_EQ(released, 7);
-	CHECK_EQ(p.used, 0);
 	/* the kept ones are reused before anything new is allocated */
 	for (i = 0; i < 3; i++) {
 		o[i] = pool_get(&p, &fresh);

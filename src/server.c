@@ -105,7 +105,7 @@ static LIST_HEAD(listeners);
 static LIST_HEAD(conns);
 static LIST_HEAD(udp_reqs);
 static struct hmap clients = HMAP_INIT;
-static struct server_stats stats;
+static uint32_t n_pending;		/* bounded by max_pending */
 static uint16_t cur_port;
 static uint32_t n_conns;
 static uint8_t udp_buf[65536];
@@ -119,11 +119,6 @@ static uint8_t out_buf[65536];
  */
 static struct pool creq_pool = POOL_INIT(struct creq, UDP_BUDGET, 4, NULL);
 static struct pool client_pool = POOL_INIT(struct client_cnt, 32, 4, NULL);
-
-const struct server_stats *server_get_stats(void)
-{
-	return &stats;
-}
 
 /* ---- per-client accounting ---- */
 
@@ -160,7 +155,7 @@ static struct client_cnt *client_acquire(const struct sockaddr_storage *peer)
 	struct client_cnt key, *c;
 	uint64_t h;
 
-	if (stats.pending >= cfg->max_pending)
+	if (n_pending >= cfg->max_pending)
 		return NULL;
 	sa_ip(peer, &key.family, key.ip);
 	h = omni_hash(&key.family, CLIENT_KEY_LEN);
@@ -182,13 +177,13 @@ static struct client_cnt *client_acquire(const struct sockaddr_storage *peer)
 	if (c->n >= cfg->max_pending_per_client)
 		return NULL;
 	c->n++;
-	stats.pending++;
+	n_pending++;
 	return c;
 }
 
 static void client_release(struct client_cnt *c)
 {
-	stats.pending--;
+	n_pending--;
 	if (--c->n)
 		return;
 	hmap_del_ptr(&clients, c->hash, c);	/* hmap only uses the low 32 bits */
@@ -384,7 +379,6 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 		goto out;
 	}
 	if (ret) {
-		stats.formerr++;
 		ret = build_error(buf, len, DNS_R_FORMERR, NULL, false, reply, reply_cap);
 		goto out;
 	}
@@ -417,7 +411,6 @@ static int handle_query(const uint8_t *buf, size_t len, struct creq *tmpl,
 
 	cc = client_acquire(&tmpl->peer);
 	if (!cc) {
-		stats.refused_limit++;
 		if (tmpl->conn)
 			ret = build_error(buf, len, DNS_R_REFUSED, &m, m.edns.present,
 			                  reply, reply_cap);
@@ -483,7 +476,6 @@ static void udp_read_cb(struct uloop_fd *ufd, unsigned events)
 				log_rl(LOG_WARNING, "udp recvmsg: %s", strerror(errno));
 			return;
 		}
-		stats.udp_queries++;
 		tmpl.o = srv_o;
 		tmpl.udp_fd = ufd->fd;
 		tmpl.lst = container_of(ufd, struct listener, ufd);
@@ -666,7 +658,6 @@ static bool tcp_read(struct tcp_conn *c)
 			tmpl.conn = c;
 			tmpl.udp_fd = -1;
 			tmpl.peer = c->peer;
-			stats.tcp_queries++;
 			rlen = handle_query(c->msg, c->msg_len, &tmpl, &c->reqs,
 			                    out_buf, sizeof(out_buf));
 			free(c->msg);
@@ -717,11 +708,9 @@ static void tcp_accept_cb(struct uloop_fd *ufd, unsigned events)
 			return;
 		}
 		if (n_conns >= srv_o->cfg->max_clients_tcp || !(c = calloc(1, sizeof(*c)))) {
-			stats.dropped++;
 			close(fd);
 			continue;
 		}
-		stats.tcp_conns++;
 		n_conns++;
 		c->ufd.fd = fd;
 		c->ufd.cb = tcp_conn_cb;

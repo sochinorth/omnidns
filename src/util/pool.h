@@ -33,13 +33,16 @@
 
 struct pool {
 	void *head;			/* kept objects, linked through their first word */
-	uint32_t nfree, used;
+	uint32_t nfree;
 	uint32_t low;			/* fewest kept since the last trim */
 	uint32_t cap, floor;
 	size_t size;
 	void (*release)(void *obj);
 	struct uloop_timeout timer;
 };
+
+/* head + 4 counters, no hole before size: 24 B on LP64, 20 B on ILP32 */
+_Static_assert(offsetof(struct pool, size) == sizeof(void *) + 16, "pool layout");
 
 #define POOL_INIT(type, cap_, floor_, release_) \
 	{ .size = sizeof(type), .cap = (cap_), .floor = (floor_), .release = (release_) }

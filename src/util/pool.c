@@ -68,7 +68,6 @@ void *pool_get(struct pool *p, bool *fresh)
 			return NULL;
 		*fresh = true;
 	}
-	p->used++;
 	return obj;
 }
 
@@ -76,7 +75,6 @@ void pool_put(struct pool *p, void *obj)
 {
 	if (!obj)
 		return;
-	p->used--;
 	if (p->nfree >= p->cap) {
 		destroy(p, obj);
 		return;

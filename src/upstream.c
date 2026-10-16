@@ -320,10 +320,6 @@ static bool rcode_fail(int rc)
 
 static void ex_start_tcp(struct exchange *ex);
 
-/*
- * Returns true if the response was consumed (the exchange may be gone),
- * false if it was ignored as spoofed.
- */
 /* Done with a parsed message (pmsg or one of its own). */
 static void msg_done(struct dns_msg *m)
 {
@@ -335,6 +331,10 @@ static void msg_done(struct dns_msg *m)
 	}
 }
 
+/*
+ * Returns true if the response was consumed (the exchange may be gone),
+ * false if it was ignored as spoofed.
+ */
 static bool ex_on_resp(struct exchange *ex, const uint8_t *b, size_t len)
 {
 	struct dns_msg own, *m = &pmsg;

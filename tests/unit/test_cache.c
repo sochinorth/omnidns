@@ -27,7 +27,7 @@ static inline struct dns_name qname_of(const struct dns_msg *m)
 /* ---- nft stubs (fakeip needs them; tickets complete immediately) ---- */
 
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
-                      const uint8_t *real, uint32_t mark, bool replace)
+                      const uint8_t *real, uint32_t mark)
 {
 	return 1;
 }

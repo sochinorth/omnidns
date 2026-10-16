@@ -597,12 +597,12 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 		hmap_del_ptr(&db->by_key, khash, b);
 		goto fail_free;
 	}
-	/* the victim is gone from the kernel by the replace below, no nft del */
+	/* the add below replaces the victim's elements, no nft del */
 	if (victim)
 		binding_drop(db, victim, false);
 	s3_insert(&db->s3, &b->s3, khash);
 	stall_wake(db, b);
-	b->ticket = nft_elem_add(db->nft, b->family, b->fake, b->real, k->mark, victim != NULL);
+	b->ticket = nft_elem_add(db->nft, b->family, b->fake, b->real, k->mark);
 	return b;
 
 fail_free:
