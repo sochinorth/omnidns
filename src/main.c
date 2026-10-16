@@ -99,7 +99,7 @@ static int reload(void)
 	static uint32_t marks[MAX_MARKS];
 	struct config *ncfg, *old = omni.cfg;
 	struct nft_desired d;
-	bool mask_changed;
+	bool mask_changed, same;
 	char err[512];
 	int ret;
 
@@ -146,7 +146,10 @@ static int reload(void)
 	}
 	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
 	nkept_marks = d.nmarks;
-	ncfg->gen = ++omni.next_gen;
+	/* same index, fwmask and fingerprints: cached answers need no
+	 * revalidation (deps_valid would accept every one of them) */
+	same = config_same_policy(old, ncfg);
+	ncfg->gen = same ? old->gen : ++omni.next_gen;
 	omni.cfg = ncfg;
 	ret = server_reconfigure(&omni);
 	if (ret)
@@ -154,8 +157,9 @@ static int reload(void)
 	apply_runtime_limits(ncfg);
 	config_free(old);
 	nsc_sweep(&omni.nsc);
-	log_info("configuration reloaded (generation %llu, %u rules)",
-	         (unsigned long long)ncfg->gen, ncfg->nrules);
+	log_info("configuration reloaded (generation %llu%s, %u rules)",
+	         (unsigned long long)ncfg->gen, same ? " kept, rules unchanged" : "",
+	         ncfg->nrules);
 	return 0;
 
 fail:

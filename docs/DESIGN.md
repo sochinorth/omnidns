@@ -360,7 +360,9 @@ output_reject      (filter, output,     filter-1):  same
   fingerprint must equal the recorded one; otherwise the entry is dropped.
   This catches inserted or reordered rules, nameset edits and upstream
   changes. A reload doesn't flush the cache, and an entry is never served
-  under the wrong policy.
+  under the wrong policy. A reload that keeps the match table, the fwmask
+  and every fingerprint by ordinal keeps the generation, since every
+  revalidation would succeed.
 - **Binding references** pin bindings while an answer can still be served. A
   30 s sweep drops expired entries so their bindings become reclaimable.
   Dropping a cache entry never deletes a binding.

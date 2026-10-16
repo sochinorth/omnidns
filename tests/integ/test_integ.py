@@ -18,6 +18,7 @@ Client-side commands run via `nsenter -t <pid> -n`.
 import json
 import os
 import random
+import re
 import signal
 import socket
 import subprocess
@@ -446,6 +447,67 @@ config rule 'adblock'""")
     # restore
     env.write_config(CONFIG)
     env.hup()
+    check(answers(env.q("warp.test", "A"), "A") == [fake], "same fake after restore")
+
+
+def last_reload(env, after):
+    lines = [x for x in env.daemon_log()[after:].splitlines() if "configuration reloaded" in x]
+    check(lines, "no reload logged:\n" + env.daemon_log()[-800:])
+    m = re.search(r"configuration reloaded \(generation (\d+)", lines[-1])
+    return int(m.group(1)), "kept" in lines[-1]
+
+
+@test
+def reload_noop_keeps_generation(env):
+    env.write_config(CONFIG)
+    off = len(env.daemon_log())
+    env.hup()
+    gen, _ = last_reload(env, off)
+    fake = answers(env.q("warp.test", "A"), "A")[0]
+    check(answers(env.q("plain.test", "A"), "A") == [REAL_B], "plain.test")
+    chains = sh("nft -a list table inet %s | grep -v elements" % TABLE)
+    env.clear_upstream_logs()
+    # nothing changed: same generation, cache still valid, no nft transaction
+    off = len(env.daemon_log())
+    env.hup()
+    g, kept = last_reload(env, off)
+    check(kept and g == gen, "no-op reload changed generation %d -> %d" % (gen, g))
+    check(answers(env.q("warp.test", "A"), "A") == [fake], "fake changed")
+    check(answers(env.q("plain.test", "A"), "A") == [REAL_B], "plain.test changed")
+    check(not any(env.upstream_log(n) for n in UP), "cache not used after no-op reload")
+    check(sh("nft -a list table inet %s | grep -v elements" % TABLE) == chains,
+          "no-op reload rewrote nftables chains")
+    check(env.nft_map("fake2real_v4").get(fake) == REAL_A, "binding lost on reload")
+    # a nameset touched / replaced with identical content is still a no-op
+    t = time.time() + 10
+    os.utime(env.dir + "/warp.txt", (t, t))
+    with open(env.dir + "/ads.tmp", "w") as f:
+        f.write(NAMESETS["ads.txt"])
+    os.rename(env.dir + "/ads.tmp", env.dir + "/ads.txt")
+    off = len(env.daemon_log())
+    env.hup()
+    g, kept = last_reload(env, off)
+    check(kept and g == gen, "touched namesets changed generation %d -> %d" % (gen, g))
+    # an edited nameset: new generation, takes effect on cached names too
+    with open(env.dir + "/ads.txt", "a") as f:
+        f.write("plain.test\n")
+    off = len(env.daemon_log())
+    env.hup()
+    g, kept = last_reload(env, off)
+    check(not kept and g > gen, "edit kept generation %d" % g)
+    r = env.q("plain.test", "A")
+    check(r["rcode"] == 0 and not r["an"], "edited nameset not applied: %r" % r)
+    # a changed upstream for the catchall: new generation
+    env.write_config(CONFIG.replace("{d}/isp.conf", "{d}/alt.conf"))
+    off = len(env.daemon_log())
+    env.hup()
+    g2, kept = last_reload(env, off)
+    check(not kept and g2 > g, "upstream change kept generation %d" % g2)
+    with open(env.dir + "/ads.txt", "w") as f:
+        f.write(NAMESETS["ads.txt"])
+    env.write_config(CONFIG)
+    env.hup()
+    check(answers(env.q("plain.test", "A"), "A") == [REAL_B], "plain.test after restore")
     check(answers(env.q("warp.test", "A"), "A") == [fake], "same fake after restore")
 
 
