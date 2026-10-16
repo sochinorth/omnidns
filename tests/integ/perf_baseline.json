@@ -1,27 +1,27 @@
 {
  "hit": {
-  "allocs": 5.38,
-  "bytes": 9019.96,
-  "qps": 74056.78
+  "allocs": 7.4,
+  "bytes": 9071.35,
+  "qps": 73600.79
  },
  "forward miss": {
-  "allocs": 32.05,
-  "bytes": 160210.64,
-  "qps": 2598.91
+  "allocs": 21.01,
+  "bytes": 19560.03,
+  "qps": 2653.49
  },
  "cname miss": {
-  "allocs": 34.06,
-  "bytes": 161091.17,
-  "qps": 2496.42
+  "allocs": 23.01,
+  "bytes": 20478.47,
+  "qps": 2614.34
  },
  "fakeip miss": {
-  "allocs": 58.09,
-  "bytes": 179614.42,
-  "qps": 2524.52
+  "allocs": 47.01,
+  "bytes": 39064.01,
+  "qps": 2680.02
  },
  "block": {
-  "allocs": 8.25,
-  "bytes": 10922.95,
-  "qps": 78715.93
+  "allocs": 11.23,
+  "bytes": 11270.7,
+  "qps": 80703.61
  }
 }
