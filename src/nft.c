@@ -683,6 +683,20 @@ static int shadow_from(struct shadow *s, const struct nft_desired *d)
 	return 0;
 }
 
+static bool prefix_eq(bool has, const struct ip_prefix *a, const struct ip_prefix *b)
+{
+	return !has || (a->family == b->family && a->plen == b->plen &&
+	                !memcmp(a->addr, b->addr, sizeof(a->addr)));
+}
+
+static bool shadow_eq(const struct shadow *a, const struct shadow *b)
+{
+	return a->fwmask == b->fwmask && a->has_pool4 == b->has_pool4 &&
+	       a->has_pool6 == b->has_pool6 && prefix_eq(a->has_pool4, &a->pool4, &b->pool4) &&
+	       prefix_eq(a->has_pool6, &a->pool6, &b->pool6) && a->nmarks == b->nmarks &&
+	       (!a->nmarks || !memcmp(a->marks, b->marks, a->nmarks * sizeof(*a->marks)));
+}
+
 static bool has_mark(const struct shadow *s, uint32_t v)
 {
 	return bsearch(&v, s->marks, s->nmarks, sizeof(v), cmp_u32) != NULL;
@@ -756,6 +770,11 @@ int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d)
 	err = shadow_from(&s, d);
 	if (err)
 		return err;
+	if (shadow_eq(&s, &n->sh)) {
+		/* nothing to do; rules changed behind our back stay changed */
+		shadow_free(&s);
+		return 0;
+	}
 	remask = s.fwmask != n->sh.fwmask;
 
 	txn_begin(n, t);

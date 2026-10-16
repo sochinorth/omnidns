@@ -317,7 +317,12 @@ output_reject      (filter, output,     filter-1):  same
 - **Reload**: one transaction reconciles chains and rules against the
   desired state. It never flushes maps. Mark chains are kept across reloads
   until the fwmask changes, because walks in flight may still bind with a
-  mark the new config no longer uses.
+  mark the new config no longer uses. If the desired state (pools, fwmask,
+  mark set) equals what the last successful transaction installed, no
+  transaction is sent. The cost is that a no-op reload no longer repairs
+  rules someone edited inside our chains; the next real change, or a
+  restart, does. That repair was only ever partial: a deleted chain or table
+  made every reconcile fail instead.
 - **Element updates** go through a separate netlink socket.
   - **Batching**: they are coalesced into batches, submitted at the end of
     the loop iteration or at 1024 operations. Each batch has a monotonically

@@ -213,6 +213,46 @@ TEST(reconcile_fwmask)
 	free(o);
 }
 
+TEST(reconcile_noop)
+{
+	static const uint32_t m1[] = { 0x02000000, 0x01000000 };
+	static const uint32_t m1b[] = { 0x01000000, 0x02000000, 0x01000000 };
+	struct nft_desired d = desired(true, true, m1, 2);
+	char *a, *b;
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	/* "-a" prints rule handles: a rewritten chain gets new ones */
+	a = sh("nft -a list table inet " TABLE);
+	d.marks = m1b;		/* same set, other order, repeated */
+	d.nmarks = 3;
+	CHECK(nft_reconcile(n, &d) == 0);
+	b = sh("nft -a list table inet " TABLE);
+	CHECK_STR(a, b);
+	free(b);
+	/* a real change rewrites the policy chains */
+	d.pool6 = pfx(AF_INET6, "fd00::", 64);
+	CHECK(nft_reconcile(n, &d) == 0);
+	b = sh("nft -a list table inet " TABLE);
+	CHECK(strcmp(a, b) != 0);
+	CHECK(has(b, "fd00::/64"));
+	free(a);
+	free(b);
+	/* external edits survive a no-op reconcile (documented trade-off)... */
+	free(sh("nft flush chain inet " TABLE " forward_reject"));
+	CHECK(nft_reconcile(n, &d) == 0);
+	a = list_table();
+	CHECK(has(a, "chain forward_reject {\n\t\ttype filter hook forward priority "
+	          "filter - 1; policy accept;\n\t}"));
+	free(a);
+	/* ...and are repaired by the next real change */
+	d.pool6 = pfx(AF_INET6, "fc00::", 64);
+	CHECK(nft_reconcile(n, &d) == 0);
+	a = list_table();
+	CHECK(has(a, "chain forward_reject {\n\t\ttype filter hook forward priority "
+	          "filter - 1; policy accept;\n\t\tip daddr 198.18.0.0/15 reject"));
+	free(a);
+}
+
 TEST(reconcile_kernel_failure)
 {
 	static const uint32_t m1[] = { 0x01000000 };
@@ -715,6 +755,7 @@ int main(int argc, char **argv)
 	RUN(bootstrap_v4v6_marks);
 	RUN(reconcile);
 	RUN(reconcile_fwmask);
+	RUN(reconcile_noop);
 	RUN(reconcile_kernel_failure);
 	RUN(async_add_del);
 	RUN(async_failure);

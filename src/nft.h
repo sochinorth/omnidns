@@ -74,7 +74,9 @@ int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d);
  * contents: add missing mark chains, rewrite restore/dstnat/reject rules,
  * delete mark chains no longer desired. Caller guarantees that no map
  * element references a chain being deleted. On failure nothing changes and
- * the shadow state is kept. Sync.
+ * the shadow state is kept. If `d` equals the shadow state (the state of the
+ * last successful bootstrap/reconcile), no transaction is sent: external
+ * edits to our chains are not repaired then. Sync.
  */
 int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d);
 
