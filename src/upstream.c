@@ -153,21 +153,36 @@ static bool ex_eq(const void *val, const void *key, void *ctx)
 
 /* ---- callbacks ---- */
 
-static void fire(struct upstream_query *q, int err, const struct dns_msg *m)
+static void fire(struct upstream_query *q, int err, struct dns_msg *m)
 {
 	q->in_cb = true;
 	q->cb(q->ctx, err, m);
 	free(q);
 }
 
-static void deliver_list(int err, const struct dns_msg *m)
+/*
+ * Each waiter may take its message over, so all but the last get a copy and
+ * the last one gets m itself. "Last" is decided as we go: a callback may
+ * cancel waiters still on the list.
+ */
+static void deliver_list(int err, struct dns_msg *m)
 {
 	struct upstream_query *q;
+	struct dns_msg copy;
 
 	while (!list_empty(&U.delivering)) {
 		q = list_first_entry(&U.delivering, struct upstream_query, list);
 		list_del_init(&q->list);
-		fire(q, err, m);
+		if (!m || list_empty(&U.delivering)) {
+			fire(q, err, m);
+			continue;
+		}
+		dns_msg_init(&copy);
+		if (dns_msg_copy(&copy, m))
+			fire(q, -ENOMEM, NULL);
+		else
+			fire(q, err, &copy);
+		dns_msg_free(&copy);
 	}
 }
 
@@ -219,7 +234,7 @@ static void ex_free(struct exchange *ex)
 }
 
 /* Detach all waiters, free the exchange, then run the callbacks. */
-static void ex_finish(struct exchange *ex, int err, const struct dns_msg *m)
+static void ex_finish(struct exchange *ex, int err, struct dns_msg *m)
 {
 	struct upstream_query *q;
 

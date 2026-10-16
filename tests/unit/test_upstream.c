@@ -157,6 +157,8 @@ struct res {
 	struct upstream_query *started;		/* query started from the cb */
 	struct res *child;
 	struct upstream_set *set;
+	bool steal;				/* take the message over */
+	struct dns_msg msg;			/* ... into here */
 };
 
 static int n_done, n_want;
@@ -180,11 +182,16 @@ static void run_loop(int want, int timeout_ms)
 	uloop_timeout_cancel(&wd);
 }
 
-static void res_cb(void *ctx, int err, const struct dns_msg *m)
+static void res_cb(void *ctx, int err, struct dns_msg *m)
 {
 	struct res *r = ctx;
 
 	r->called++;
+	if (m && r->steal) {
+		r->msg = *m;
+		dns_msg_init(m);
+		m = &r->msg;
+	}
 	r->err = err;
 	r->t_ms = omni_now_ms();
 	if (m) {
@@ -393,6 +400,77 @@ TEST(coalesce)
 	}
 	CHECK_EQ(upstream_get_stats()->coalesced, co + 4);
 	CHECK_EQ(log_count(&srv_a, "co.example.com", NULL), 1);
+	upstream_set_put(u);
+}
+
+/* The message is checked after every callback ran, from where each took it. */
+static void stolen_is(struct res *r, const char *ip)
+{
+	struct in_addr a;
+
+	inet_pton(AF_INET, ip, &a);
+	CHECK_EQ(r->called, 1);
+	CHECK_EQ(r->err, 0);
+	REQUIRE(r->msg.nrr == 1);
+	CHECK_EQ(r->msg.rr[0].type, DNS_T_A);
+	CHECK(r->msg.rr[0].rdlen == 4 && !memcmp(r->msg.rr[0].rdata, &a, 4));
+	CHECK(r->msg.has_q && r->msg.qtype == DNS_T_A);
+	dns_msg_free(&r->msg);
+}
+
+/*
+ * Coalesced waiters that take their message over: all but the last get a
+ * copy, the last the parsed message itself, whatever was cancelled before
+ * the response or from an earlier waiter's callback.
+ */
+TEST(coalesce_steal)
+{
+	struct upstream_set *u = mkset(1, 1, &srv_a.port);
+	struct upstream_query *h[4];
+	struct res r[4] = { 0 };
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		r[i].steal = true;
+		REQUIRE((h[i] = q(u, "co.example.com", DNS_T_A, &r[i])));
+	}
+	run_loop(4, 3000);
+	for (i = 0; i < 4; i++)
+		stolen_is(&r[i], "192.0.2.3");
+
+	/* the first waiter is cancelled before the response */
+	memset(r, 0, sizeof(r));
+	for (i = 0; i < 3; i++) {
+		r[i].steal = true;
+		REQUIRE((h[i] = q(u, "co.example.com", DNS_T_A, &r[i])));
+	}
+	upstream_cancel(h[0]);
+	run_loop(2, 3000);
+	CHECK_EQ(r[0].called, 0);
+	stolen_is(&r[1], "192.0.2.3");
+	stolen_is(&r[2], "192.0.2.3");
+
+	/* the first callback cancels the last waiter: the middle one is last */
+	memset(r, 0, sizeof(r));
+	for (i = 0; i < 3; i++) {
+		r[i].steal = true;
+		REQUIRE((h[i] = q(u, "co.example.com", DNS_T_A, &r[i])));
+	}
+	r[0].cancel_other = h[2];
+	run_loop(2, 3000);
+	stolen_is(&r[0], "192.0.2.3");
+	stolen_is(&r[1], "192.0.2.3");
+	CHECK_EQ(r[2].called, 0);
+
+	/* a lone waiter, and one that does not take its message */
+	memset(r, 0, sizeof(r));
+	r[0].steal = true;
+	REQUIRE(q(u, "a.example.com", DNS_T_A, &r[0]));
+	REQUIRE(q(u, "co.example.com", DNS_T_A, &r[1]));
+	run_loop(2, 3000);
+	stolen_is(&r[0], "192.0.2.1");
+	CHECK_EQ(r[1].called, 1);
+	ip_is(&r[1], "192.0.2.3");
 	upstream_set_put(u);
 }
 
@@ -788,6 +866,7 @@ int main(void)
 	RUN(all_fail);
 	RUN(tc_tcp);
 	RUN(coalesce);
+	RUN(coalesce_steal);
 	RUN(no_coalesce_qtype);
 	RUN(cancel_one);
 	RUN(cancel_all);

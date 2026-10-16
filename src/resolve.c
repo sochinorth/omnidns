@@ -561,19 +561,23 @@ static bool can_pass_through(struct resolve_req *r)
 	       all_glue_ok(r);
 }
 
+/*
+ * The response becomes the answer: moved, not copied (nothing reads r->resp
+ * after this). Only the header is ours: id 0, no OPT (which also drops an
+ * extended rcode), our flags (AA and AD cleared) and the client's question.
+ */
 static int pass_through(struct resolve_req *r)
 {
-	int rcode = r->resp.flags & DNS_F_RCODE, ret;
+	int rcode = r->resp.flags & DNS_F_RCODE;
 
-	ret = dns_msg_copy(&r->out, &r->resp);
-	if (ret)
-		return ret;
+	dns_msg_free(&r->out);
+	r->out = r->resp;
+	dns_msg_init(&r->resp);
 	memset(&r->out.edns, 0, sizeof(r->out.edns));
 	r->out.id = 0;
-	ret = dns_msg_set_question(&r->out, r->qname.data, r->qname.len, r->qtype, r->qclass);
 	r->out.flags = DNS_F_QR | DNS_F_RA | r->rd;
 	dns_msg_set_rcode(&r->out, rcode);
-	return ret;
+	return dns_msg_set_question(&r->out, r->qname.data, r->qname.len, r->qtype, r->qclass);
 }
 
 /* Answer = prefix + negative response (its SOA kept). */
@@ -805,8 +809,9 @@ static int build_nodata(struct resolve_req *r)
 	return add_synth_soa(r, r->o->cfg->block_ttl);
 }
 
+/* *changed: some record is not kept as is (dropped, bound or hint-rewritten). */
 static int plan_terminal(struct resolve_req *r, struct plan *plan, uint16_t *nkept,
-                         bool *dropped)
+                         bool *dropped, bool *changed)
 {
 	const struct dns_msg *m = &r->resp;
 	int fam = afamily(r->qtype), ret;
@@ -837,11 +842,15 @@ static int plan_terminal(struct resolve_req *r, struct plan *plan, uint16_t *nke
 			*dropped = true;
 		else
 			(*nkept)++;
+		if (p->act != ACT_KEEP)
+			*changed = true;
 	}
 	return 0;
 }
 
-static int build_terminal(struct resolve_req *r, const struct plan *plan, bool *rewritten)
+/* Assemble prefix + planned records + tail; changed as from plan_terminal. */
+static int build_terminal(struct resolve_req *r, const struct plan *plan, bool changed,
+                          bool *rewritten)
 {
 	const struct dns_msg *m = &r->resp;
 	uint16_t i;
@@ -865,14 +874,15 @@ static int build_terminal(struct resolve_req *r, const struct plan *plan, bool *
 	}
 	if (ret)
 		return ret;
-	if (!*rewritten && can_pass_through(r))
+	/* hints were planned, but there was nothing to rewrite */
+	if (changed && !*rewritten && can_pass_through(r))
 		return pass_through(r);
 	return copy_tail(r, *rewritten, r->latch.on || r->nbinds, false);
 }
 
 static void terminal(struct resolve_req *r)
 {
-	bool dropped = false, rewritten;
+	bool dropped = false, changed = false, rewritten;
 	struct plan *plan;
 	uint16_t nkept = 0;
 	int ret, kind = LIFE_POS;
@@ -882,13 +892,15 @@ static void terminal(struct resolve_req *r)
 		servfail(r);
 		return;
 	}
-	ret = plan_terminal(r, plan, &nkept, &dropped);
+	ret = plan_terminal(r, plan, &nkept, &dropped, &changed);
 	rewritten = dropped;
 	if (!ret && !nkept) {
 		ret = build_nodata(r);
 		kind = LIFE_NEG;
+	} else if (!ret && !changed && can_pass_through(r)) {
+		ret = pass_through(r);
 	} else if (!ret) {
-		ret = build_terminal(r, plan, &rewritten);
+		ret = build_terminal(r, plan, changed, &rewritten);
 	}
 	free(plan);
 	if (ret) {
@@ -904,15 +916,19 @@ static void terminal(struct resolve_req *r)
 
 static void walk(struct resolve_req *r, bool scan);
 
-static void upstream_done(void *ctx, int err, const struct dns_msg *resp)
+static void upstream_done(void *ctx, int err, struct dns_msg *resp)
 {
 	struct resolve_req *r = ctx;
 
 	r->uq = NULL;
-	if (err || !resp || dns_msg_copy(&r->resp, resp)) {
+	if (err || !resp) {
 		servfail(r);
 		return;
 	}
+	/* take the message over; nothing references the previous one */
+	dns_msg_free(&r->resp);
+	r->resp = *resp;
+	dns_msg_init(resp);
 	r->have_resp = true;
 	r->nresp++;
 	walk(r, true);

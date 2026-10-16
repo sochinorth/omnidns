@@ -1204,6 +1204,106 @@ TEST(t_other_qtypes_steered)
 	CHECK_EQ(count(DNS_S_AR), 0);
 }
 
+/* the answer as the server would build it (id 0, no EDNS), as hex */
+static const char *wire_hex(void)
+{
+	static uint8_t buf[DNS_MAX_MSG];
+	static char hex[2 * sizeof(buf) + 1];
+	int n = dns_build(&res, buf, sizeof(buf)), i;
+
+	if (n < 0)
+		return "(build failed)";
+	for (i = 0; i < n; i++)
+		sprintf(hex + 2 * i, "%02x", buf[i]);
+	if (getenv("TEST_PRINT_WIRE"))
+		fprintf(stderr, "    wire: %s\n", hex);
+	return hex;
+}
+
+/*
+ * Answers on the wire, byte for byte, as the pre-ownership-rework code
+ * produced them (recorded from it): pass-through (as is, with RRSIG, NS and
+ * glue; NXDOMAIN; a CNAME chain answered in one response; HTTPS whose
+ * fakeip target has no hints to rewrite) and assembled answers (glue
+ * filtered; re-query).
+ */
+TEST(v_wire_compat)
+{
+	static const struct {
+		const char *qname;
+		uint16_t qtype;
+		int rcode;
+		const char *srv, *rrs, *more_srv, *more_q, *more_rrs, *hex;
+	} c[] = {
+		{ "Www.PT.example", DNS_T_A, 0, "10.0.0.1",
+		  "an www.pt.example 300 A 1.2.3.4;an www.pt.example 300 RRSIG;"
+		  "ns pt.example 300 SOA 60;ar ns.pt.example 300 A 5.5.5.5",
+		  NULL, NULL, NULL,
+		  "00008180000100020001000103577777025054076578616d706c65000001000103777777"
+		  "027074c013000100010000012c000401020304c020002e00010000012c00180000000000"
+		  "00000000000000000000000000000000000000c024000600010000012c001e026e73c013"
+		  "02686dc013000000010000000000000000000000000000003c026e73c024000100010000"
+		  "012c000405050505" },
+		{ "nx.pt.example", DNS_T_A, DNS_R_NXDOMAIN, "10.0.0.1",
+		  "ns pt.example 900 SOA 100;ns pt.example 900 RRSIG",
+		  NULL, NULL, NULL,
+		  "000081830001000000020000026e78027074076578616d706c650000010001c00f000600"
+		  "0100000384001e026e73c01202686dc01200000001000000000000000000000000000000"
+		  "64c00f002e00010000038400180000000000000000000000000000000000000000000000"
+		  "00" },
+		{ "c.pt.example", DNS_T_A, 0, "10.0.0.1",
+		  "an c.pt.example 300 CNAME d.pt.example;an d.pt.example 200 A 1.1.1.1;"
+		  "an d.pt.example 200 A 1.1.1.2;ar x.pt.example 60 AAAA 2001:db8::1",
+		  NULL, NULL, NULL,
+		  "0000818000010003000000010163027074076578616d706c650000010001c00c00050001"
+		  "0000012c00040164c00ec02a00010001000000c8000401010101c02a00010001000000c8"
+		  "0004010101020178c00e001c00010000003c001020010db8000000000000000000000001" },
+		{ "h.pt.example", DNS_T_HTTPS, 0, "10.0.0.1",
+		  "an h.pt.example 300 HTTPS 1 a.vpn.example alpn=h2;"
+		  "an h.pt.example 300 HTTPS 2 b.pt.example alpn=h3 ipv4hint=1.2.3.4",
+		  NULL, NULL, NULL,
+		  "0000818000010002000000000168027074076578616d706c650000410001c00c00410001"
+		  "0000012c0018000101610376706e076578616d706c650000010003026832c00c00410001"
+		  "0000012c001f00020162027074076578616d706c65000001000302683300040004010203"
+		  "04" },
+		{ "m.pt.example", DNS_T_MX, 0, "10.0.0.1",
+		  "an m.pt.example 300 MX 10 mx.pt.example;an m.pt.example 300 MX 20 mx.vpn.example;"
+		  "ar mx.pt.example 300 A 1.2.3.4;ar mx.vpn.example 300 A 1.2.3.5;"
+		  "ar mx.pt.example 300 AAAA 2001:db8::2",
+		  NULL, NULL, NULL,
+		  "000081800001000200000002016d027074076578616d706c6500000f0001c00c000f0001"
+		  "0000012c0007000a026d78c00ec00c000f00010000012c000b0014026d780376706ec011"
+		  "c02c000100010000012c000401020304c02c001c00010000012c001020010db800000000"
+		  "0000000000000002" },
+		{ "a.pt.example", DNS_T_A, 0, "10.0.0.1",
+		  "an a.pt.example 300 CNAME b.fwd2.example;an b.fwd2.example 300 A 1.1.1.1;"
+		  "an b.fwd2.example 300 RRSIG",
+		  "10.0.0.2", "b.fwd2.example",
+		  "an b.fwd2.example 30 A 2.2.2.2;ns fwd2.example 30 SOA 10;"
+		  "ar ns.fwd2.example 30 A 3.3.3.3",
+		  "0000818000010002000100010161027074076578616d706c650000010001c00c00050001"
+		  "0000012c000901620466776432c011c02a000100010000001e000402020202c02c000600"
+		  "010000001e001e026e73c01102686dc01100000001000000000000000000000000000000"
+		  "0a026e73c02c000100010000001e000403030303" },
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+		struct dns_name lq = N(c[i].qname);
+
+		setup(CFG_DEFAULT);
+		S(c[i].srv, ntext(lq.data, lq.len), c[i].qtype, c[i].rcode, c[i].rrs);
+		if (c[i].more_srv)
+			S(c[i].more_srv, c[i].more_q, c[i].qtype, 0, c[i].more_rrs);
+		CHECK(run(c[i].qname, c[i].qtype));
+		CHECK_STR(wire_hex(), c[i].hex);
+		/* the cached copy builds the same bytes */
+		CHECK(run(c[i].qname, c[i].qtype));
+		CHECK(no_queries());
+		CHECK_STR(wire_hex(), c[i].hex);
+	}
+}
+
 struct pending {
 	int ncb;
 	struct dns_msg m;
@@ -1354,6 +1454,7 @@ int main(int argc, char **argv)
 	RUN(s_upstream_error);
 	RUN(t_other_qtypes_steered);
 	RUN(u_fwmask_change_in_flight);
+	RUN(v_wire_compat);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);

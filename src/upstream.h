@@ -24,16 +24,21 @@
  * When all servers fail, cb gets err=-ETIMEDOUT or -EIO and resp=NULL.
  *
  * Coalescing: concurrent queries with equal (set id, qname (ci), qtype)
- * share one exchange; each caller gets its own callback with the same
- * parsed response.
+ * share one exchange; each caller gets its own callback and its own copy of
+ * the parsed response (the last caller gets the parsed message itself, so
+ * the common uncoalesced case copies nothing).
  *
  * Callbacks are never invoked synchronously from upstream_query().
  */
 
 struct upstream_query;
 
-/* resp is valid only during the callback. */
-typedef void (*upstream_cb)(void *ctx, int err, const struct dns_msg *resp);
+/*
+ * resp is valid only during the callback, but it belongs to this caller
+ * alone: the callback may take it over by moving it out (`*mine = *resp;
+ * dns_msg_init(resp);`). Whatever is left in it is freed after the callback.
+ */
+typedef void (*upstream_cb)(void *ctx, int err, struct dns_msg *resp);
 
 void upstream_init(uint32_t try_timeout_ms, uint32_t total_timeout_ms);
 void upstream_set_timeouts(uint32_t try_timeout_ms, uint32_t total_timeout_ms);
