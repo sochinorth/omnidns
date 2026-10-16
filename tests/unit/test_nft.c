@@ -669,6 +669,47 @@ TEST(async_failure)
 	CHECK_EQ(b.err, 0);
 }
 
+/*
+ * Only a batch's last message asks for an ack. An error in an earlier
+ * message (here the v4 mark add, before the v6 adds) still fails exactly
+ * its batch, and the next batch, in flight at the same time, succeeds.
+ */
+TEST(async_failure_not_last)
+{
+	uint8_t f1[4], r1[4], f2[4], f6[16], r6[16];
+	struct twait a, b;
+	uint64_t t1, t2;
+	char *o;
+
+	bootstrap_marks();
+	nfails = 0;
+	v4(f1, "198.18.0.11"); v4(r1, "10.11.11.11"); v4(f2, "198.18.0.12");
+	inet_pton(AF_INET6, "fc00::11", f6);
+	inet_pton(AF_INET6, "2001:db8::11", r6);
+	t1 = nft_elem_add(n, AF_INET, f1, r1, 0x05000000, false);	/* no chain */
+	CHECK(nft_elem_add(n, AF_INET6, f6, r6, 0x01000000, false) == t1);
+	nft_flush(n);
+	t2 = nft_elem_add(n, AF_INET, f2, r1, 0x01000000, false);
+	CHECK(t2 == t1 + 1);
+	nft_flush(n);
+	wait_on(&a, t1);
+	wait_on(&b, t2);
+	run_loop();
+	CHECK_EQ(a.fired, 1);
+	CHECK(a.err < 0);
+	CHECK_EQ(b.fired, 1);
+	CHECK_EQ(b.err, 0);
+	CHECK_EQ(nfails, 1);
+	CHECK_EQ(failed_ticket, t1);
+	o = list_table();
+	CHECK(lacks(o, "198.18.0.11"));
+	CHECK(lacks(o, "fc00::11"));
+	CHECK(has(o, "198.18.0.12 : jump mark_01000000"));
+	free(o);
+	nft_elem_del(n, AF_INET, f2);
+	CHECK_EQ(nft_drain(n), 0);
+}
+
 TEST(async_big_batch)
 {
 	enum { N = NFT_BATCH_MAX + 500 };
@@ -1048,11 +1089,15 @@ static const char *const ref_sets[4] = {
 	"fake2real_v4", "fake2mark_v4", "fake2real_v6", "fake2mark_v6",
 };
 
-/* one batch: BEGIN, per phase (destroys, adds) per set chunks of 256, END */
+/*
+ * one batch: BEGIN, per phase (destroys, adds) per set chunks of 256, END;
+ * only the last message before END asks for an ack (nft.c set NLM_F_ACK on
+ * every message until it adopted the control plane's single final ack)
+ */
 static size_t ref_batch(char *buf, uint32_t seq, const struct rop *ops, uint32_t nops)
 {
 	size_t len = 0;
-	struct nlmsghdr *nlh;
+	struct nlmsghdr *nlh, *last = NULL;
 
 	nlh = nftnl_batch_begin(buf, seq++);
 	len += MNL_ALIGN(nlh->nlmsg_len);
@@ -1072,8 +1117,9 @@ static size_t ref_batch(char *buf, uint32_t seq, const struct rop *ops, uint32_t
 					int type = phase ? NFT_MSG_NEWSETELEM : NFT_MSG_DESTROYSETELEM;
 
 					nlh = nftnl_nlmsg_build_hdr(buf + len, type, NFPROTO_INET,
-					        (phase ? NLM_F_CREATE : 0) | NLM_F_ACK, seq++);
+					        phase ? NLM_F_CREATE : 0, seq++);
 					nftnl_set_elems_nlmsg_build_payload(nlh, set);
+					last = nlh;
 					len += MNL_ALIGN(nlh->nlmsg_len);
 					nftnl_set_free(set);
 					set = NULL;
@@ -1102,6 +1148,8 @@ static size_t ref_batch(char *buf, uint32_t seq, const struct rop *ops, uint32_t
 			}
 		}
 	}
+	if (last)
+		last->nlmsg_flags |= NLM_F_ACK;
 	nlh = nftnl_batch_end(buf + len, seq);
 	len += MNL_ALIGN(nlh->nlmsg_len);
 	return len;
@@ -1301,6 +1349,7 @@ int main(int argc, char **argv)
 	RUN(big_reconcile_failure);
 	RUN(async_add_del);
 	RUN(async_failure);
+	RUN(async_failure_not_last);
 	RUN(async_big_batch);
 	RUN(async_burst_inflight);
 	RUN(fakeip_failed_batch);

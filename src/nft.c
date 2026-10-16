@@ -59,9 +59,8 @@ struct nbuf {
 };
 
 /*
- * One transaction under construction: BEGIN, msgs, END. Element batches set
- * NLM_F_ACK on every message; control-plane transactions only on the last
- * one (see ctl_commit()).
+ * One transaction under construction: BEGIN, msgs, END. Only the last
+ * message before END asks for an ack (see ctl_commit() and nft_flush()).
  */
 struct txn {
 	struct nbuf b;
@@ -73,7 +72,8 @@ struct ebatch {
 	struct list_head list;
 	uint64_t ticket;
 	uint32_t nops;
-	uint32_t seq_first, seq_last, acks_left;
+	uint32_t seq_first, seq_last;
+	uint32_t ack_seq;	/* the one message asking for an ack */
 	int err;
 };
 
@@ -1066,6 +1066,7 @@ static void ebuf_move(struct nft_ctx *n, struct ebuf *e, struct txn *t)
 
 		memcpy(nlh, e->b.p + off, len);
 		nlh->nlmsg_seq = n->seq++;
+		t->last_off = t->b.len;
 		t->b.len += len;
 		t->nmsg++;
 		off += len;
@@ -1078,6 +1079,7 @@ void nft_flush(struct nft_ctx *n)
 {
 	struct ebatch *b = n->open;
 	struct txn *t = &n->etx;
+	struct nlmsghdr *nlh;
 
 	uloop_timeout_cancel(&n->submit_tmo);
 	if (!b)
@@ -1088,10 +1090,20 @@ void nft_flush(struct nft_ctx *n)
 	for (int phase = 0; phase < 2; phase++)
 		for (int i = 0; i < S_NUM; i++)
 			ebuf_move(n, &n->ebuf[i * 2 + phase], t);
+	/*
+	 * As for control-plane transactions (see ctl_commit()), only the last
+	 * message asks for an ack: the kernel reports a failing message, or a
+	 * failed commit (on BEGIN), whether it asked or not, and queues every
+	 * reply of the batch at once, in message order, so an error arrives
+	 * before the final ack and the final ack alone means success. One ack
+	 * and one read per batch instead of one per message.
+	 */
+	nlh = (struct nlmsghdr *)(t->b.p + t->last_off);
+	nlh->nlmsg_flags |= NLM_F_ACK;
+	b->ack_seq = nlh->nlmsg_seq;
 	txn_end(n, t);
 	b->seq_first = t->seq_first;
 	b->seq_last = t->seq_last;
-	b->acks_left = t->nmsg;
 	list_add_tail(&b->list, &n->inflight);
 	if (mnl_socket_sendto(n->async, t->b.p, t->b.len) < 0) {
 		b->err = -errno;
@@ -1125,7 +1137,7 @@ static void queue_elem(struct nft_ctx *n, int set, bool add, const uint8_t *key,
 	if (!e->nelem) {
 		nlh = nftnl_nlmsg_build_hdr((char *)nlh,
 		        add ? NFT_MSG_NEWSETELEM : NFT_MSG_DESTROYSETELEM, NFPROTO_INET,
-		        (add ? NLM_F_CREATE : 0) | NLM_F_ACK, 0);
+		        add ? NLM_F_CREATE : 0, 0);
 		mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set_names[set]);
 		mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, n->table);
 		e->nest_off = nlh->nlmsg_len;
@@ -1347,10 +1359,9 @@ static bool async_ack(void *priv, uint32_t seq, int err)
 	list_for_each_entry(b, &n->inflight, list) {
 		if (b->err || !seq_in(seq, b->seq_first, b->seq_last))
 			continue;
-		if (err)
+		/* an error (earlier in the batch, or the commit), or the final ack */
+		if (err || seq == b->ack_seq)
 			batch_complete(n, b, err);
-		else if (!--b->acks_left)
-			batch_complete(n, b, 0);
 		break;
 	}
 	return true;

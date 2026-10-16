@@ -422,6 +422,11 @@ output_reject      (filter, output,     filter-1):  same
     operation on a key that already has a pending add starts a new batch.
   - **Failure**: if a batch fails, the bindings it carried are dropped and
     their waiters get SERVFAIL.
+  - **Acks**: as in control-plane transactions, only the last message
+    before END asks for an ack. An error, in any message of the batch or
+    in its commit, arrives before that ack and fails the batch whose
+    sequence range it falls in; the ack alone completes it. A batch costs
+    one ack and one read, not one per message (four for a single binding).
   - **Encoding**: elements are encoded straight into netlink messages (256
     elements each, the same bytes libnftnl would produce), one persistent
     buffer per map and phase, and copied into a persistent transaction
