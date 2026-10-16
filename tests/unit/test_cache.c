@@ -114,25 +114,26 @@ static void mkresp(struct dns_msg *m, const char *qname, const char *addr, uint3
 	dns_msg_add_rr(m, DNS_S_AN, n.data, n.len, DNS_T_A, DNS_C_IN, ttl, a, 4);
 }
 
-static struct cache_dep dep(const struct config *cfg, const char *name)
+/* Append the packed dependency (name -> its rule under cfg) of an entry for qname. */
+static size_t dep(uint8_t *p, const struct config *cfg, const char *qname, const char *name)
 {
-	struct cache_dep d = { .name = N(name) };
-	uint16_t idx = match_lookup_wire(cfg->idx, d.name.data, d.name.len);
+	struct dns_name d = N(name), q = N(qname);
+	uint16_t idx = match_lookup_wire(cfg->idx, d.data, d.len);
 
-	d.fingerprint = cfg->rules[idx].fingerprint;
-	return d;
+	return cache_dep_put(p, cfg->rules[idx].fingerprint, d.data, d.len, q.data, q.len);
 }
 
 static int ins(struct cache *c, const struct config *cfg, const char *qname, uint32_t life,
                struct binding *const *b, uint16_t nb)
 {
-	struct cache_dep d = dep(cfg, qname);
+	uint8_t d[CACHE_DEP_HDR + DNS_MAX_NAME];
+	size_t dsz = dep(d, cfg, qname, qname);
 	struct dns_name n = N(qname);
 	struct dns_msg m;
 	int r;
 
 	mkresp(&m, qname, "1.2.3.4", life);
-	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, life, &d, 1, b, nb);
+	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, life, d, dsz, 1, b, nb);
 	dns_msg_free(&m);
 	return r;
 }
@@ -207,18 +208,24 @@ TEST(limits_e2big)
 {
 	struct config *cfg = load(HDR RULE_FA RULE_ALL);
 	struct cache *c = cache_new(100, 1 << 20, NULL);
-	struct cache_dep deps[CACHE_MAX_DEPS + 1];
+	uint8_t deps[(CACHE_MAX_DEPS + 1) * (CACHE_DEP_HDR + 16)];
 	struct dns_name n = N("a.example");
+	size_t dsz = 0, sz32 = 0;
 	struct dns_msg m;
 	int i;
 
-	for (i = 0; i <= CACHE_MAX_DEPS; i++)
-		deps[i] = dep(cfg, "a.example");
+	for (i = 0; i <= CACHE_MAX_DEPS; i++) {
+		char name[32];
+
+		snprintf(name, sizeof(name), "d%d.example", i);
+		sz32 = dsz;
+		dsz += dep(deps + dsz, cfg, "a.example", name);
+	}
 	mkresp(&m, "a.example", "1.1.1.1", 60);
 	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 60,
-	                      deps, CACHE_MAX_DEPS + 1, NULL, 0), -E2BIG);
+	                      deps, dsz, CACHE_MAX_DEPS + 1, NULL, 0), -E2BIG);
 	CHECK_EQ(cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 60,
-	                      deps, CACHE_MAX_DEPS, NULL, 0), 0);
+	                      deps, sz32, CACHE_MAX_DEPS, NULL, 0), 0);
 	CHECK_EQ(cache_count(c), 1);
 	dns_msg_free(&m);
 	cache_free(c);
@@ -472,10 +479,11 @@ static void msg_https(struct dns_msg *m)
 static int ins_msg(struct cache *c, const struct config *cfg, const struct dns_msg *m,
                    uint32_t life)
 {
-	struct cache_dep d = dep(cfg, "x.example");
+	uint8_t d[CACHE_DEP_HDR + DNS_MAX_NAME];
+	size_t dsz = dep(d, cfg, "invalid", "x.example");
 
 	return cache_insert(c, cfg, m->qname.data, m->qname.len, m->qtype, DNS_C_IN, m,
-	                    life, &d, 1, NULL, 0);
+	                    life, d, dsz, 1, NULL, 0);
 }
 
 /*
@@ -620,18 +628,19 @@ TEST(huge_answer)
 static int ins_deps(struct cache *c, const struct config *cfg, const char *qname,
                     const char *d0, const char *d1)
 {
-	struct cache_dep d[2];
+	uint8_t d[2 * (CACHE_DEP_HDR + DNS_MAX_NAME)];
 	struct dns_name n = N(qname);
 	struct dns_msg m;
 	uint16_t nd = 0;
+	size_t dsz = 0;
 	int r;
 
 	if (d0)
-		d[nd++] = dep(cfg, d0);
+		dsz += dep(d + dsz, cfg, qname, d0), nd++;
 	if (d1)
-		d[nd++] = dep(cfg, d1);
+		dsz += dep(d + dsz, cfg, qname, d1), nd++;
 	mkresp(&m, qname, "192.0.2.9", 300);
-	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 300, d, nd, NULL, 0);
+	r = cache_insert(c, cfg, n.data, n.len, DNS_T_A, DNS_C_IN, &m, 300, d, dsz, nd, NULL, 0);
 	dns_msg_free(&m);
 	return r;
 }

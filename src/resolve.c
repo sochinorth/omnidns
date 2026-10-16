@@ -26,6 +26,13 @@ struct latch {
 	struct upstream_set *up;
 };
 
+#define DEPS_INLINE	128
+
+struct dep_memo {
+	uint16_t off;			/* into deps */
+	uint16_t rule;			/* index in the config of gen0 */
+};
+
 struct resolve_req {
 	struct omni *o;
 	resolve_cb cb;
@@ -47,8 +54,17 @@ struct resolve_req {
 	bool have_resp, requeried, synth;
 	uint16_t nresp, steps;
 	struct dns_msg prefix;
-	struct cache_dep *deps;
-	uint16_t ndeps, deps_cap;
+
+	/*
+	 * deps: packed as cache_insert takes them, each name once; memo[i]
+	 * locates dependency i and remembers its rule. The first nwalk are the
+	 * walk's names (loop detection looks only at those).
+	 */
+	uint8_t *deps;
+	uint16_t dsz, dcap, ndeps, nwalk;
+	bool deps_full;			/* more than CACHE_MAX_DEPS: not cached */
+	struct dep_memo memo[CACHE_MAX_DEPS];
+	uint8_t deps_inline[DEPS_INLINE];
 
 	/* commit */
 	struct binding **binds;
@@ -153,35 +169,69 @@ static int prefix_add(struct resolve_req *r, const struct dns_rr *rr)
 	return add_rr(&r->prefix, DNS_S_AN, rr);
 }
 
-static int dep_add(struct resolve_req *r, const uint8_t *name, uint8_t len, uint64_t fp)
+/* Index of the dependency on name among the first n, or -1. */
+static int dep_find(const struct resolve_req *r, const uint8_t *name, uint8_t len, uint16_t n)
 {
-	struct cache_dep *d;
+	uint16_t i;
 
-	if (r->ndeps == r->deps_cap) {
-		uint16_t cap = r->deps_cap ? r->deps_cap * 2 : 4;
+	for (i = 0; i < n; i++) {
+		const uint8_t *d = r->deps + r->memo[i].off;
 
-		d = realloc(r->deps, cap * sizeof(*d));
+		if (d[8] ? dns_name_eq(d + CACHE_DEP_HDR, d[8], name, len) :
+		           dns_name_eq(r->qname.data, r->qname.len, name, len))
+			return i;
+	}
+	return -1;
+}
+
+static int dep_add(struct resolve_req *r, const uint8_t *name, uint8_t len, uint16_t idx)
+{
+	size_t need = (size_t)r->dsz + CACHE_DEP_HDR + len;
+
+	if (r->ndeps == CACHE_MAX_DEPS) {
+		r->deps_full = true;
+		return 0;
+	}
+	if (need > r->dcap) {
+		uint16_t cap = (uint16_t)(need > 2u * r->dcap ? need : 2u * r->dcap);
+		uint8_t *d = r->deps == r->deps_inline ? malloc(cap) : realloc(r->deps, cap);
+
 		if (!d)
 			return -ENOMEM;
+		if (r->deps == r->deps_inline)
+			memcpy(d, r->deps_inline, r->dsz);
 		r->deps = d;
-		r->deps_cap = cap;
+		r->dcap = cap;
 	}
-	d = &r->deps[r->ndeps++];
-	memcpy(d->name.data, name, len);
-	d->name.len = len;
-	dns_name_lower(d->name.data, len);
-	d->fingerprint = fp;
+	r->memo[r->ndeps].off = r->dsz;
+	r->memo[r->ndeps++].rule = idx;
+	r->dsz += cache_dep_put(r->deps + r->dsz, r->o->cfg->rules[idx].fingerprint, name, len,
+	                        r->qname.data, r->qname.len);
 	return 0;
+}
+
+/*
+ * The rule for name, recorded as a dependency. A name already recorded is
+ * not matched again (while the config is the one the walk started with).
+ * NULL when nothing matches, or out of memory.
+ */
+static const struct rule *dep_match(struct resolve_req *r, const uint8_t *name, uint8_t len)
+{
+	const struct config *cfg = r->o->cfg;
+	int i = cfg->gen == r->gen0 ? dep_find(r, name, len, r->ndeps) : -1;
+	uint16_t idx;
+
+	if (i >= 0)
+		return &cfg->rules[r->memo[i].rule];
+	idx = match_lookup_wire(cfg->idx, name, len);
+	if (idx == MATCH_NONE || idx >= cfg->nrules || dep_add(r, name, len, idx))
+		return NULL;
+	return &cfg->rules[idx];
 }
 
 static bool visited(const struct resolve_req *r, const struct dns_name *n)
 {
-	uint16_t i;
-
-	for (i = 0; i < r->ndeps; i++)
-		if (dns_name_eq(r->deps[i].name.data, r->deps[i].name.len, n->data, n->len))
-			return true;
-	return false;
+	return dep_find(r, n->data, n->len, r->nwalk) >= 0;
 }
 
 static int bind_add(struct resolve_req *r, struct binding *b)
@@ -270,7 +320,8 @@ static void req_free(struct resolve_req *r)
 	dns_msg_free(&r->resp);
 	dns_msg_free(&r->prefix);
 	dns_msg_free(&r->out);
-	free(r->deps);
+	if (r->deps != r->deps_inline)
+		free(r->deps);
 	free(r);
 }
 
@@ -323,9 +374,9 @@ static void finish_cached(struct resolve_req *r)
 
 	if (r->nbinds)
 		stats.fakeip_answers++;
-	if (o->cache && r->lifetime && o->cfg->gen == r->gen0)
+	if (o->cache && r->lifetime && o->cfg->gen == r->gen0 && !r->deps_full)
 		cache_insert(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype,
-		             r->qclass, &r->out, r->lifetime, r->deps, r->ndeps,
+		             r->qclass, &r->out, r->lifetime, r->deps, r->dsz, r->ndeps,
 		             r->binds, r->nbinds);
 	deliver(r);
 }
@@ -493,8 +544,7 @@ static bool strip_type(const struct resolve_req *r, uint16_t t)
  */
 static bool glue_ok(struct resolve_req *r, const struct dns_rr *rr)
 {
-	const struct config *cfg = r->o->cfg;
-	uint16_t idx;
+	const struct rule *rule;
 
 	if (rr->section != DNS_S_AR ||
 	    (rr->type != DNS_T_A && rr->type != DNS_T_AAAA &&
@@ -502,10 +552,8 @@ static bool glue_ok(struct resolve_req *r, const struct dns_rr *rr)
 		return true;
 	if (r->latch.on || r->nbinds)
 		return false;
-	idx = match_lookup_wire(cfg->idx, rr->owner, rr->owner_len);
-	if (idx == MATCH_NONE || idx >= cfg->nrules || cfg->rules[idx].action != RULE_FORWARD)
-		return false;
-	return dep_add(r, rr->owner, rr->owner_len, cfg->rules[idx].fingerprint) == 0;
+	rule = dep_match(r, rr->owner, rr->owner_len);
+	return rule && rule->action == RULE_FORWARD;
 }
 
 static bool all_glue_ok(struct resolve_req *r)
@@ -756,13 +804,10 @@ static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struc
 /* Decide one ServiceMode RR (match its effective target). */
 static int plan_svcb(struct resolve_req *r, const struct dns_rr *rr, struct plan *p)
 {
-	const struct config *cfg = r->o->cfg;
 	const struct rule *rule;
 	const uint8_t *t;
 	struct svcb_view v;
-	uint16_t idx;
 	uint8_t tlen;
-	int ret;
 
 	if (svcb_parse(rr->rdata, rr->rdlen, &v)) {
 		p->act = ACT_DROP;
@@ -773,13 +818,9 @@ static int plan_svcb(struct resolve_req *r, const struct dns_rr *rr, struct plan
 		return 0;
 	t = svcb_target_is_root(&v) ? r->name.data : v.target;
 	tlen = svcb_target_is_root(&v) ? r->name.len : v.target_len;
-	idx = match_lookup_wire(cfg->idx, t, tlen);
-	if (idx == MATCH_NONE || idx >= cfg->nrules)
+	rule = dep_match(r, t, tlen);
+	if (!rule)
 		return -ENOENT;
-	rule = &cfg->rules[idx];
-	ret = dep_add(r, t, tlen, rule->fingerprint);
-	if (ret)
-		return ret;
 	if (rule->action == RULE_BLOCK) {
 		p->act = ACT_DROP;
 	} else if (r->latch.on) {
@@ -956,17 +997,13 @@ static int latch_set(struct resolve_req *r, const struct rule *rule)
 /* Steps 1-4. Returns true when the walk continues asynchronously or ended. */
 static bool policy_step(struct resolve_req *r)
 {
-	const struct config *cfg = r->o->cfg;
 	const struct rule *rule;
 	struct upstream_set *want;
-	uint16_t idx;
 
-	idx = match_lookup_wire(cfg->idx, r->name.data, r->name.len);
-	if (idx == MATCH_NONE || idx >= cfg->nrules)
+	rule = dep_match(r, r->name.data, r->name.len);
+	if (!rule)
 		return servfail(r), true;
-	rule = &cfg->rules[idx];
-	if (dep_add(r, r->name.data, r->name.len, rule->fingerprint))
-		return servfail(r), true;
+	r->nwalk = r->ndeps;
 	if (rule->action == RULE_BLOCK)
 		return finish_block(r), true;
 	if (!r->latch.on && rule->action == RULE_FAKEIP && latch_set(r, rule))
@@ -1172,6 +1209,8 @@ struct resolve_req *resolve_start(struct omni *o, const struct dns_msg *query,
 	r->qclass = query->qclass;
 	r->rd = query->flags & DNS_F_RD;
 	r->name = query->qname;
+	r->deps = r->deps_inline;
+	r->dcap = sizeof(r->deps_inline);
 	dns_msg_init(&r->resp);
 	dns_msg_init(&r->prefix);
 	dns_msg_init(&r->out);

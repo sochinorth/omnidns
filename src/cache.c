@@ -375,42 +375,6 @@ int cache_lookup(struct cache *c, const struct config *cfg,
 	return 0;
 }
 
-/*
- * Packed deps: (fingerprint u64, len u8, lowercased name[len])*. A dep
- * naming the qname itself (usually the first one: the walk starts there)
- * is stored with len 0.
- */
-static bool dep_is_qname(const struct cache_dep *d, const uint8_t *qname, uint8_t qlen)
-{
-	return dns_name_eq(d->name.data, d->name.len, qname, qlen);
-}
-
-static size_t deps_packed_len(const struct cache_dep *deps, uint16_t ndeps,
-                              const uint8_t *qname, uint8_t qlen)
-{
-	size_t n = 0;
-	uint16_t i;
-
-	for (i = 0; i < ndeps; i++)
-		n += 9 + (dep_is_qname(&deps[i], qname, qlen) ? 0 : deps[i].name.len);
-	return n;
-}
-
-static void pack_deps(uint8_t *p, const struct cache_dep *deps, uint16_t ndeps,
-                      const uint8_t *qname, uint8_t qlen)
-{
-	uint16_t i;
-
-	for (i = 0; i < ndeps; i++) {
-		uint8_t len = dep_is_qname(&deps[i], qname, qlen) ? 0 : deps[i].name.len;
-
-		memcpy(p, &deps[i].fingerprint, 8);
-		p[8] = len;
-		memcpy(p + 9, deps[i].name.data, len);
-		dns_name_lower(p + 9, len);
-		p += 9 + len;
-	}
-}
 
 /* Interning searches at most this much of data: bounds the work for huge
  * answers; typical answers fit entirely. */
@@ -444,10 +408,10 @@ static int32_t intern(uint8_t *data, size_t *dlen, const uint8_t *s, size_t len)
  * what was used. Returns NULL with *err set.
  */
 static struct centry *entry_new(const uint8_t *qname, uint8_t qlen, const struct dns_msg *resp,
-				const struct cache_dep *deps, uint16_t ndeps,
+				const uint8_t *deps, size_t dsz, uint16_t ndeps,
 				struct binding *const *binds, uint16_t nbinds, int *err)
 {
-	size_t bsz = (size_t)nbinds * sizeof(*binds), dsz = deps_packed_len(deps, ndeps, qname, qlen);
+	size_t bsz = (size_t)nbinds * sizeof(*binds);
 	size_t rsz = (size_t)resp->nrr * sizeof(struct crr), hsz, dmax = qlen, dlen;
 	struct centry *e, *n;
 	struct crr *crr;
@@ -468,7 +432,8 @@ static struct centry *entry_new(const uint8_t *qname, uint8_t qlen, const struct
 	e->nrr = resp->nrr;
 	e->ndeps = ndeps;
 	e->dsz = (uint16_t)dsz;
-	pack_deps((uint8_t *)e_deps(e), deps, ndeps, qname, qlen);
+	if (dsz)
+		memcpy((uint8_t *)e_deps(e), deps, dsz);
 	crr = (struct crr *)e_rr(e);
 	data = (uint8_t *)e_data(e);
 	memcpy(data, qname, qlen);
@@ -507,7 +472,7 @@ static struct centry *entry_new(const uint8_t *qname, uint8_t qlen, const struct
 int cache_insert(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
                  const struct dns_msg *resp, uint32_t lifetime,
-                 const struct cache_dep *deps, uint16_t ndeps,
+                 const uint8_t *deps, size_t dsz, uint16_t ndeps,
                  struct binding *const *binds, uint16_t nbinds)
 {
 	struct centry *e, *old;
@@ -515,11 +480,11 @@ int cache_insert(struct cache *c, const struct config *cfg,
 	uint16_t i;
 	int err;
 
-	if (ndeps > CACHE_MAX_DEPS || nbinds > CACHE_MAX_BINDS)
+	if (ndeps > CACHE_MAX_DEPS || dsz > UINT16_MAX || nbinds > CACHE_MAX_BINDS)
 		return -E2BIG;
 	if (!lifetime)
 		return 0;
-	e = entry_new(qname, qlen, resp, deps, ndeps, binds, nbinds, &err);
+	e = entry_new(qname, qlen, resp, deps, dsz, ndeps, binds, nbinds, &err);
 	if (!e)
 		return err;
 	if (e->bytes > c->max_bytes) {

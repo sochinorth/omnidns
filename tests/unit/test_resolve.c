@@ -1304,6 +1304,55 @@ TEST(v_wire_compat)
 	}
 }
 
+/*
+ * Every answer here has more dependency *records* than CACHE_MAX_DEPS but
+ * only a few distinct names, so it must be cached: glue owners were
+ * recorded once by the pass-through check and again when the tail was
+ * copied, and every ServiceMode record added its (shared) target.
+ */
+TEST(w_deps_dedup)
+{
+	static char mx[4096], https[4096], glue[4096];
+	int i;
+
+	setup(CFG_DEFAULT);
+	/* 16 forward glue owners, then one fakeip owner: assembled, not passed through */
+	snprintf(mx, sizeof(mx), "an m.plain.example 300 MX 10 mx0.plain.example;");
+	for (i = 0; i < 16; i++)
+		snprintf(mx + strlen(mx), sizeof(mx) - strlen(mx),
+		         "ar mx%d.plain.example 300 A 1.2.3.%d;", i, i);
+	snprintf(mx + strlen(mx), sizeof(mx) - strlen(mx), "ar mx.vpn.example 300 A 9.9.9.9");
+	S("10.0.0.1", "m.plain.example", DNS_T_MX, 0, mx);
+	CHECK(run("m.plain.example", DNS_T_MX));
+	CHECK_EQ(count(DNS_S_AR), 16);
+	CHECK(run("m.plain.example", DNS_T_MX));
+	CHECK(no_queries());
+	CHECK_EQ(count(DNS_S_AR), 16);
+
+	/* 40 addresses for one glue owner: passed through */
+	snprintf(glue, sizeof(glue), "an g.plain.example 300 MX 10 mx.plain.example;");
+	for (i = 0; i < 40; i++)
+		snprintf(glue + strlen(glue), sizeof(glue) - strlen(glue),
+		         "ar mx.plain.example 300 A 1.2.4.%d;", i);
+	S("10.0.0.1", "g.plain.example", DNS_T_MX, 0, glue);
+	CHECK(run("g.plain.example", DNS_T_MX));
+	CHECK_EQ(count(DNS_S_AR), 40);
+	CHECK(run("g.plain.example", DNS_T_MX));
+	CHECK(no_queries());
+
+	/* 40 ServiceMode records sharing one fakeip target */
+	https[0] = 0;
+	for (i = 1; i <= 40; i++)
+		snprintf(https + strlen(https), sizeof(https) - strlen(https),
+		         "an s.plain.example 300 HTTPS %d t.vpn.example alpn=h2;", i);
+	S("10.0.0.1", "s.plain.example", DNS_T_HTTPS, 0, https);
+	CHECK(run("s.plain.example", DNS_T_HTTPS));
+	CHECK_EQ(count(DNS_S_AN), 40);
+	CHECK(run("s.plain.example", DNS_T_HTTPS));
+	CHECK(no_queries());
+	CHECK_EQ(count(DNS_S_AN), 40);
+}
+
 struct pending {
 	int ncb;
 	struct dns_msg m;
@@ -1455,6 +1504,7 @@ int main(int argc, char **argv)
 	RUN(t_other_qtypes_steered);
 	RUN(u_fwmask_change_in_flight);
 	RUN(v_wire_compat);
+	RUN(w_deps_dedup);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);

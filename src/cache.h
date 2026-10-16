@@ -3,6 +3,7 @@
 #define OMNI_CACHE_H
 
 #include <stdint.h>
+#include <string.h>
 
 #include "config.h"
 #include "dns/wire.h"
@@ -39,10 +40,27 @@ struct cache;
 struct fakeip_db;
 struct binding;
 
-struct cache_dep {
-	struct dns_name name;		/* lowercased */
-	uint64_t fingerprint;		/* of the rule the name matched */
-};
+/*
+ * Dependencies are passed packed, in the form the entry stores them: per
+ * dependency the matched rule's fingerprint (u64, host order), the name's
+ * length (u8) and the lowercased name, where length 0 stands for the qname.
+ */
+#define CACHE_DEP_HDR 9
+
+/* Append one dependency at p (at most CACHE_DEP_HDR + len bytes); returns
+ * the bytes written. */
+static inline size_t cache_dep_put(uint8_t *p, uint64_t fingerprint,
+                                   const uint8_t *name, uint8_t len,
+                                   const uint8_t *qname, uint8_t qlen)
+{
+	if (dns_name_eq(name, len, qname, qlen))
+		len = 0;
+	memcpy(p, &fingerprint, 8);
+	p[8] = len;
+	memcpy(p + CACHE_DEP_HDR, name, len);
+	dns_name_lower(p + CACHE_DEP_HDR, len);
+	return CACHE_DEP_HDR + len;
+}
 
 struct cache *cache_new(uint32_t max_entries, size_t max_bytes, struct fakeip_db *fdb);
 void cache_free(struct cache *c);
@@ -57,13 +75,14 @@ int cache_lookup(struct cache *c, const struct config *cfg,
 
 /*
  * Insert/replace. `lifetime` seconds (0 => not cached). Takes a reference on
- * each binding. ndeps > CACHE_MAX_DEPS or nbinds > CACHE_MAX_BINDS => not
- * cached (returns -E2BIG).
+ * each binding. deps: ndeps packed dependencies, dsz bytes (see above).
+ * ndeps > CACHE_MAX_DEPS or nbinds > CACHE_MAX_BINDS => not cached (returns
+ * -E2BIG).
  */
 int cache_insert(struct cache *c, const struct config *cfg,
                  const uint8_t *qname, uint8_t qlen, uint16_t qtype, uint16_t qclass,
                  const struct dns_msg *resp, uint32_t lifetime,
-                 const struct cache_dep *deps, uint16_t ndeps,
+                 const uint8_t *deps, size_t dsz, uint16_t ndeps,
                  struct binding *const *binds, uint16_t nbinds);
 
 void cache_flush(struct cache *c);
