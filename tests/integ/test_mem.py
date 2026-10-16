@@ -105,10 +105,12 @@ def suffixes(name):
 
 # ------------------------------------------------------------------ helpers
 
-def blast(names, ok, window=48, timeout=1.0, tries=6):
+def blast(names, ok, window=48, timeout=1.0, tries=6, lat=None):
     """Send A queries for `names` to the daemon with `window` in flight
     (below max_pending_per_client), retrying on timeout. Returns a list of
-    (name, problem) for queries that failed `ok(resp)` or never got answered."""
+    (name, problem) for queries that failed `ok(resp)` or never got answered.
+    If `lat` is a list, each answer's latency (s, from the last send) is
+    appended to it."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
     s.setblocking(False)
@@ -126,7 +128,8 @@ def blast(names, ok, window=48, timeout=1.0, tries=6):
                 break
             while nid in pending:
                 nid = (nid + 1) & 0xFFFF
-            pending[nid] = [name, time.monotonic() + timeout, 1]
+            now = time.monotonic()
+            pending[nid] = [name, now + timeout, 1, now]
             send(nid, name)
             nid = (nid + 1) & 0xFFFF
         if select.select([s], [], [], 0.05)[0]:
@@ -140,6 +143,8 @@ def blast(names, ok, window=48, timeout=1.0, tries=6):
                 if not p or not r["question"] or r["question"][0].lower() != p[0]:
                     continue
                 del pending[r["id"]]
+                if lat is not None:
+                    lat.append(time.monotonic() - p[3])
                 if not ok(r):
                     bad.append((p[0], "rcode %d an %r" % (r["rcode"], ti.answers(r))))
         now = time.monotonic()
@@ -150,7 +155,7 @@ def blast(names, ok, window=48, timeout=1.0, tries=6):
                 bad.append((p[0], "timeout"))
                 del pending[qid]
             else:
-                p[1], p[2] = now + timeout, p[2] + 1
+                p[1], p[2], p[3] = now + timeout, p[2] + 1, now
                 send(qid, p[0])
     s.close()
     return bad

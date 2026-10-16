@@ -1,0 +1,27 @@
+{
+ "hit": {
+  "allocs": 5.38,
+  "bytes": 9019.96,
+  "qps": 74056.78
+ },
+ "forward miss": {
+  "allocs": 32.05,
+  "bytes": 160210.64,
+  "qps": 2598.91
+ },
+ "cname miss": {
+  "allocs": 34.06,
+  "bytes": 161091.17,
+  "qps": 2496.42
+ },
+ "fakeip miss": {
+  "allocs": 58.09,
+  "bytes": 179614.42,
+  "qps": 2524.52
+ },
+ "block": {
+  "allocs": 8.25,
+  "bytes": 10922.95,
+  "qps": 78715.93
+ }
+}
