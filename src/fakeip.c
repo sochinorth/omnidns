@@ -172,26 +172,13 @@ static void pool_addr(const struct ip_prefix *p, int family, uint64_t off, uint8
 	}
 }
 
-static bool prefix_match(const struct ip_prefix *p, int family, const uint8_t *addr)
-{
-	unsigned full = p->plen / 8, rem = p->plen % 8;
-
-	if (p->plen > (family == 4 ? 32 : 128))
-		return false;
-	if (memcmp(p->addr, addr, full))
-		return false;
-	if (rem && ((p->addr[full] ^ addr[full]) & (0xff00 >> rem)))
-		return false;
-	return true;
-}
-
 /* addr inside the pool and not excluded */
 static bool pool_allocatable(const struct ip_prefix *p, int family, const uint8_t *addr)
 {
 	uint64_t usable = pool_usable(p, family), host;
 	unsigned h;
 
-	if (!prefix_match(p, family, addr))
+	if (!ip_prefix_contains(p, p->family, addr))
 		return false;
 	if (family == 4) {
 		h = 32 - p->plen;
@@ -1100,11 +1087,9 @@ uint32_t fakeip_adopt_elems(struct fakeip_db *db, const struct nft_elem *el, uin
 
 bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr)
 {
-	const struct ip_prefix *p;
+	const struct ip_prefix *p = db_pool(db, norm_family(family));
 
-	family = norm_family(family);
-	p = db_pool(db, family);
-	return p && prefix_match(p, family, addr);
+	return p && ip_prefix_contains(p, p->family, addr);
 }
 
 static bool fits_pool(const struct ip_prefix *p, const struct binding *b)
