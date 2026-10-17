@@ -52,11 +52,11 @@ struct fakeip_db {
 	 * Eviction stall (see evict_to()): the last pass found nothing
 	 * evictable. Until one of the pinned bindings can become evictable,
 	 * passes are skipped: stall_until is the earliest safe_until of an
-	 * unreferenced binding (UINT32_MAX: none, only an unref can help).
+	 * unreferenced binding (UINT32_MAX: none, only an unref can help),
+	 * gathered during the pass and lowered by stall_wake() after it.
 	 */
 	bool stalled;
 	uint32_t stall_until;
-	uint32_t scan_min;	/* that minimum, gathered during a pass */
 	uint32_t scans;		/* eviction passes run (tests) */
 	uint32_t nplaceholders;	/* adopted bindings not yet claimed or evicted */
 };
@@ -426,8 +426,8 @@ static bool s3_can_evict(struct s3fifo *s, struct s3_node *n)
 
 	if (binding_evictable(b, omni_now()))
 		return true;
-	if (!b->refcnt && b->safe_until < db->scan_min)
-		db->scan_min = b->safe_until;
+	if (!b->refcnt)
+		stall_wake(db, b);
 	return false;
 }
 
@@ -605,11 +605,10 @@ static void evict_to(struct fakeip_db *db, uint32_t target)
 		return;
 	if (db->stalled && omni_now() <= db->stall_until)
 		return;
-	db->scan_min = UINT32_MAX;
+	db->stall_until = UINT32_MAX;
 	db->scans++;
 	s3_evict(&db->s3, target);
 	db->stalled = s3_count(&db->s3) > target;
-	db->stall_until = db->scan_min;
 }
 
 static int find_slot(struct fakeip_db *db, const struct bkey *k, uint64_t khash, uint32_t now,
