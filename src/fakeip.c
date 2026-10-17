@@ -25,6 +25,8 @@ struct policy {
 };
 
 #define POLICY_NONE UINT32_MAX	/* bkey.policy: pair not interned */
+/* rule id of placeholders (fakeip_adopt()): no UCI section is named so */
+#define ADOPTED ""
 
 struct fakeip_db {
 	bool has4, has6;
@@ -52,6 +54,7 @@ struct fakeip_db {
 	uint32_t stall_until;
 	uint32_t scan_min;	/* that minimum, gathered during a pass */
 	uint32_t scans;		/* eviction passes run (tests) */
+	uint32_t nplaceholders;	/* adopted bindings not yet claimed or evicted */
 };
 
 /* lookup key, endpoint already lowercased */
@@ -94,6 +97,9 @@ static bool binding_detached(const struct binding *b)
 {
 	return !b->s3.list.next;
 }
+
+/* Policies by id: see the policy table below. */
+static bool is_placeholder(const struct fakeip_db *db, const struct binding *b);
 
 /* ---- pools ---- */
 
@@ -333,10 +339,17 @@ static void policy_put(struct fakeip_db *db, uint16_t id)
 	free(p);
 }
 
+static bool is_placeholder(const struct fakeip_db *db, const struct binding *b)
+{
+	return !db->pol[b->policy]->rule_id[0];
+}
+
 /* ---- binding lifecycle ---- */
 
 static void binding_free(struct fakeip_db *db, struct binding *b)
 {
+	if (is_placeholder(db, b))
+		db->nplaceholders--;
 	policy_put(db, b->policy);
 	free(b);
 }
@@ -485,33 +498,54 @@ static uint32_t safe_until_for(const struct fakeip_db *db, uint32_t now, uint32_
 	return t > UINT32_MAX ? UINT32_MAX : (uint32_t)t;
 }
 
+/* a placeholder the kernel already maps exactly as k wants: k may take it over */
+static bool claimable(const struct fakeip_db *db, const struct binding *o, const struct bkey *k)
+{
+	return is_placeholder(db, o) && o->family == k->family &&
+	       db->pol[o->policy]->mark == k->mark && !memcmp(o->real, k->real, alen(k->family));
+}
+
 /*
  * Probe for a fake for khash. Returns 0 with the address in `fake` and
- * *victim set to an evictable occupant (or NULL for a free slot), or -ENOSPC.
+ * *victim set to an evictable occupant or a claimable placeholder (or NULL
+ * for a free slot), or -ENOSPC. While placeholders exist, the whole probe
+ * window is searched for one to claim before a free slot is taken: with
+ * the secret of the earlier process, a key's old fake lies in its window.
  */
-static int probe(struct fakeip_db *db, int family, uint64_t khash, uint32_t now,
+static int probe(struct fakeip_db *db, const struct bkey *k, uint64_t khash, uint32_t now,
                  uint8_t *fake, struct binding **victim)
 {
+	int family = k->family;
 	const struct ip_prefix *p = db_pool(db, family);
 	uint64_t usable = pool_usable(p, family), off;
-	struct fkey fk = { .family = family, .fake = fake };
+	uint8_t cand[16];
+	struct fkey fk = { .family = family, .fake = cand };
 	struct binding *o;
+	bool found = false;
 	int i;
 
 	if (!usable)
 		return -ENOSPC;
 	off = khash % usable;
 	for (i = 0; i < FAKEIP_MAX_PROBE && (uint64_t)i < usable; i++) {
-		pool_addr(p, family, off, fake);
-		o = hmap_get(&db->by_fake, fake_hash(family, fake), &fk, fake_eq, NULL);
-		if (!o || binding_evictable(o, now)) {
+		pool_addr(p, family, off, cand);
+		o = hmap_get(&db->by_fake, fake_hash(family, cand), &fk, fake_eq, NULL);
+		if (o && db->nplaceholders && claimable(db, o, k)) {
+			memcpy(fake, cand, 16);
 			*victim = o;
 			return 0;
+		}
+		if (!found && (!o || binding_evictable(o, now))) {
+			memcpy(fake, cand, 16);
+			*victim = o;
+			found = true;
+			if (!db->nplaceholders)
+				return 0;
 		}
 		if (++off == usable)
 			off = 0;
 	}
-	return -ENOSPC;
+	return found ? 0 : -ENOSPC;
 }
 
 static uint32_t evict_target(const struct fakeip_db *db)
@@ -542,13 +576,13 @@ static void evict_to(struct fakeip_db *db, uint32_t target)
 	db->stall_until = db->scan_min;
 }
 
-static int find_slot(struct fakeip_db *db, int family, uint64_t khash, uint32_t now,
+static int find_slot(struct fakeip_db *db, const struct bkey *k, uint64_t khash, uint32_t now,
                      uint8_t *fake, struct binding **victim)
 {
-	if (!probe(db, family, khash, now, fake, victim))
+	if (!probe(db, k, khash, now, fake, victim))
 		return 0;
 	evict_to(db, evict_target(db));
-	return probe(db, family, khash, now, fake, victim);
+	return probe(db, k, khash, now, fake, victim);
 }
 
 static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k,
@@ -556,6 +590,8 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 {
 	struct binding *b, *victim;
 	uint8_t fake[16];
+	uint32_t hold = 0;
+	bool claim;
 	int r, pid;
 
 	/*
@@ -570,9 +606,12 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 		r = pid;
 		goto fail;
 	}
-	r = find_slot(db, k->family, khash, now, fake, &victim);
+	r = find_slot(db, k, khash, now, fake, &victim);
 	if (r)
 		goto fail_policy;
+	claim = victim && claimable(db, victim, k);
+	if (claim)
+		hold = victim->safe_until;
 	if (!victim && hmap_len(&db->by_key) >= db->max_bindings) {
 		evict_to(db, evict_target(db));
 		if (hmap_len(&db->by_key) >= db->max_bindings) {
@@ -591,6 +630,8 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	b->endpoint_len = k->endpoint_len;
 	memcpy(b->endpoint, k->endpoint, k->endpoint_len);
 	b->safe_until = safe_until_for(db, now, ttl);
+	if (b->safe_until < hold)	/* clients of the earlier process may hold it */
+		b->safe_until = hold;
 	if (hmap_put(&db->by_key, khash, b))
 		goto fail_free;
 	if (hmap_put(&db->by_fake, fake_hash(b->family, b->fake), b)) {
@@ -602,7 +643,9 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 		binding_drop(db, victim, false);
 	s3_insert(&db->s3, &b->s3, khash);
 	stall_wake(db, b);
-	b->ticket = nft_elem_add(db->nft, b->family, b->fake, b->real, k->mark);
+	/* a claimed placeholder: the kernel has this very mapping (ticket 0
+	 * counts as done) */
+	b->ticket = claim ? 0 : nft_elem_add(db->nft, b->family, b->fake, b->real, k->mark);
 	return b;
 
 fail_free:
@@ -630,6 +673,10 @@ struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t 
 	k.family = norm_family(family);
 	if (!db_pool(db, k.family)) {
 		*err = -EAFNOSUPPORT;
+		return NULL;
+	}
+	if (!rule_id[0]) {	/* reserved for placeholders */
+		*err = -EINVAL;
 		return NULL;
 	}
 	/*
@@ -696,13 +743,89 @@ void fakeip_unref(struct fakeip_db *db, struct binding *b)
 		stall_wake(db, b);
 }
 
-struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *fake)
+static struct binding *lookup_any(struct fakeip_db *db, int family, const uint8_t *fake)
 {
 	struct fkey fk = { .family = norm_family(family), .fake = fake };
 
 	if (!fk.family)
 		return NULL;
 	return hmap_get(&db->by_fake, fake_hash(fk.family, fake), &fk, fake_eq, NULL);
+}
+
+struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *fake)
+{
+	struct binding *b = lookup_any(db, family, fake);
+
+	return b && !is_placeholder(db, b) ? b : NULL;
+}
+
+bool fakeip_placeholder(struct fakeip_db *db, int family, const uint8_t *fake, uint32_t *mark)
+{
+	struct binding *b = lookup_any(db, family, fake);
+
+	if (!b || !is_placeholder(db, b))
+		return false;
+	if (mark)
+		*mark = fakeip_mark(db, b);
+	return true;
+}
+
+uint32_t fakeip_placeholders(const struct fakeip_db *db)
+{
+	return db->nplaceholders;
+}
+
+int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const uint8_t *real,
+                 uint32_t mark, uint32_t hold)
+{
+	static const uint8_t none[1];
+	struct bkey k = {
+		.rule_id = ADOPTED, .mark = mark, .family = norm_family(family),
+		.endpoint = none, .real = real,
+	};
+	const struct ip_prefix *p = db_pool(db, k.family);
+	struct binding *b;
+	uint64_t khash;
+	int pid;
+
+	if (!p || !pool_allocatable(p, k.family, fake))
+		return -EINVAL;
+	if (!nft_mark_known(db->nft, mark))
+		return -ESTALE;
+	if (lookup_any(db, k.family, fake))
+		return -EEXIST;
+	if (hmap_len(&db->by_key) >= db->max_bindings)
+		return -ENOSPC;
+	k.phash = policy_hash(ADOPTED, mark);
+	khash = key_hash(db, &k);
+	pid = policy_get(db, &k);
+	if (pid < 0)
+		return pid;
+	b = calloc(1, sizeof(*b));	/* no endpoint */
+	if (!b) {
+		policy_put(db, pid);
+		return -ENOMEM;
+	}
+	b->policy = pid;
+	b->family = k.family;
+	memcpy(b->fake, fake, alen(k.family));
+	memcpy(b->real, real, alen(k.family));
+	b->safe_until = safe_until_for(db, omni_now(), hold);
+	if (hmap_put(&db->by_key, khash, b)) {
+		free(b);
+		policy_put(db, pid);
+		return -ENOMEM;
+	}
+	if (hmap_put(&db->by_fake, fake_hash(b->family, b->fake), b)) {
+		hmap_del_ptr(&db->by_key, khash, b);
+		free(b);
+		policy_put(db, pid);
+		return -ENOMEM;
+	}
+	db->nplaceholders++;
+	s3_insert(&db->s3, &b->s3, khash);
+	stall_wake(db, b);
+	return 0;
 }
 
 bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr)

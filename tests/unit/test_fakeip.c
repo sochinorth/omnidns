@@ -1272,6 +1272,221 @@ TEST(pinned)
 	fakeip_free(db);
 }
 
+/* ---- adoption after a restart ---- */
+
+/* an element the kernel kept from an earlier process */
+static void kern_put(int family, const uint8_t *fake, uint32_t mark)
+{
+	kern[n_kern].family = family;
+	memset(kern[n_kern].fake, 0, 16);
+	memcpy(kern[n_kern].fake, fake, alen(family));
+	kern[n_kern].mark = mark;
+	kern[n_kern].ticket = 0;
+	n_kern++;
+}
+
+static int adopt4(struct fakeip_db *db, const uint8_t *fake, uint32_t real, uint32_t mark,
+                  uint32_t hold)
+{
+	uint8_t r[4];
+	int ret;
+
+	real = htonl(real);
+	memcpy(r, &real, 4);
+	ret = fakeip_adopt(db, 4, fake, r, mark, hold);
+	if (!ret)
+		kern_put(4, fake, mark);
+	return ret;
+}
+
+static const uint8_t *addr4(uint32_t a)
+{
+	static uint8_t buf[4];
+
+	a = htonl(a);
+	memcpy(buf, &a, 4);
+	return buf;
+}
+
+/* the fake an earlier process with SECRET gave the key */
+static uint32_t earlier_fake(const struct ip_prefix *p4, const char *rule, uint32_t mark,
+                             const char *name, uint32_t real)
+{
+	struct fakeip_db *old = fakeip_new(p4, NULL, 100, 600, SECRET, NFT);
+	struct binding *b;
+	uint32_t f;
+	int err;
+
+	kern_off = true;	/* the kernel model is the new process's */
+	b = bind4(old, rule, mark, name, real, 60, &err);
+	f = b ? fake4(b) : 0;
+	fakeip_free(old);
+	kern_off = false;
+	return f;
+}
+
+TEST(adopt_placeholders)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db;
+	uint32_t mark = 0;
+	int err;
+
+	reset();
+	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
+	REQUIRE(db);
+	CHECK_EQ(adopt4(db, addr4(0xc6120005), 0x0a000001, 0x100, 3600), 0);
+	CHECK_EQ(adopt4(db, addr4(0xc6120006), 0x0a000001, 0x200, 3600), 0);
+	/* outside the pool, an excluded address, a mark without chain, taken */
+	CHECK_EQ(adopt4(db, addr4(0xc6140005), 0x0a000001, 0x100, 3600), -EINVAL);
+	CHECK_EQ(adopt4(db, addr4(0xc6120000), 0x0a000001, 0x100, 3600), -EINVAL);
+	CHECK_EQ(adopt4(db, addr4(0xc6120007), 0x0a000001, dead_mark, 3600), -ESTALE);
+	CHECK_EQ(adopt4(db, addr4(0xc6120005), 0x0a000002, 0x100, 3600), -EEXIST);
+	CHECK_EQ(fakeip_count(db), 2);
+	CHECK_EQ(fakeip_placeholders(db), 2);
+	CHECK_EQ(fakeip_live_count(db), 2);
+	CHECK(fakeip_placeholder(db, 4, addr4(0xc6120006), &mark));
+	CHECK_EQ(mark, 0x200);
+	/* not a binding to answer from (PTR) */
+	CHECK(!fakeip_lookup(db, 4, addr4(0xc6120005)));
+	CHECK_EQ(n_add + n_del, 0);
+	/* safe_until = now + hold + grace */
+	time_override_advance(3600 + 600);
+	CHECK_EQ(fakeip_live_count(db), 2);
+	time_override_advance(1);
+	CHECK_EQ(fakeip_live_count(db), 0);
+	/* the reserved rule id cannot be bound */
+	CHECK(!bind4(db, "", 0x100, "a.example", 0x0a000001, 60, &err));
+	CHECK_EQ(err, -EINVAL);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
+TEST(adopt_claim)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	uint32_t f = earlier_fake(&p4, "warp", 0x100, "a.example", 0x0a000001);
+	struct fakeip_db *db;
+	struct binding *b;
+	int err;
+
+	reset();
+	REQUIRE(f);
+	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
+	REQUIRE(db);
+	REQUIRE(adopt4(db, addr4(f), 0x0a000001, 0x100, 3600) == 0);
+	b = bind4(db, "warp", 0x100, "a.example", 0x0a000001, 60, &err);
+	REQUIRE(b);
+	CHECK_EQ(fake4(b), f);		/* the same fake as before the restart */
+	CHECK_EQ(n_add + n_del, 0);	/* the kernel already maps it so */
+	CHECK(nft_ticket_done(NFT, b->ticket));
+	CHECK_EQ(fakeip_placeholders(db), 0);
+	CHECK_EQ(fakeip_count(db), 1);
+	CHECK(fakeip_lookup(db, 4, addr4(f)) == b);
+	CHECK_STR(fakeip_rule_id(db, b), "warp");
+	/* it keeps the placeholder's longer life */
+	CHECK_EQ(b->safe_until, 1000 + 3600 + 600);
+	CHECK(bind4(db, "warp", 0x100, "a.example", 0x0a000001, 60, &err) == b);
+	CHECK_EQ(n_add, 0);
+
+	/* claiming needs no determinism: any key with the same mapping whose
+	 * window holds the placeholder takes it; here another name for the
+	 * same address, probing from the same first candidate */
+	fakeip_free(db);
+	f = earlier_fake(&p4, "warp", 0x100, "b.example", 0x0a000001);
+	reset();
+	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
+	REQUIRE(adopt4(db, addr4(f), 0x0a000001, 0x100, 3600) == 0);
+	/* other mark or other real address: not claimable, a new fake */
+	b = bind4(db, "warp", 0x200, "b.example", 0x0a000001, 60, &err);
+	REQUIRE(b);
+	CHECK(fake4(b) != f);
+	b = bind4(db, "warp", 0x100, "b.example", 0x0a000002, 60, &err);
+	REQUIRE(b);
+	CHECK(fake4(b) != f);
+	CHECK_EQ(n_add, 2);
+	CHECK_EQ(fakeip_placeholders(db), 1);
+	b = bind4(db, "other", 0x100, "b.example", 0x0a000001, 60, &err);
+	REQUIRE(b);
+	CHECK_EQ(n_add, 2 + (fake4(b) != f));
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
+TEST(adopt_other_mapping_quarantined)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	uint32_t f = earlier_fake(&p4, "warp", 0x100, "a.example", 0x0a000001);
+	struct fakeip_db *db;
+	struct binding *b;
+	int err;
+
+	reset();
+	REQUIRE(f);
+	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
+	REQUIRE(db);
+	/* the key's first candidate holds another mapping */
+	REQUIRE(adopt4(db, addr4(f), 0x0a000009, 0x100, 3600) == 0);
+	b = bind4(db, "warp", 0x100, "a.example", 0x0a000001, 1, &err);
+	REQUIRE(b);
+	CHECK(fake4(b) != f);
+	CHECK(fakeip_placeholder(db, 4, addr4(f), NULL));
+	/* still live a second before safe_until */
+	time_override_advance(3600 + 600);
+	cur_ticket++;
+	fail_batch(b->ticket);		/* drops the binding, not the placeholder */
+	CHECK_EQ(fakeip_count(db), 1);
+	b = bind4(db, "warp", 0x100, "a.example", 0x0a000001, 1, &err);
+	REQUIRE(b);
+	CHECK(fake4(b) != f);
+	/* past it: reclaimed like any expired binding, re-pointed by an add */
+	time_override_advance(1);
+	cur_ticket++;
+	fail_batch(b->ticket);
+	n_add = n_add_replace = 0;
+	b = bind4(db, "warp", 0x100, "a.example", 0x0a000001, 1, &err);
+	REQUIRE(b);
+	CHECK_EQ(fake4(b), f);
+	CHECK_EQ(n_add, 1);
+	CHECK_EQ(n_add_replace, 1);
+	CHECK_EQ(fakeip_placeholders(db), 0);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
+TEST(adopt_capacity)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db;
+	struct binding *b;
+	uint32_t i;
+	int err;
+
+	reset();
+	db = fakeip_new(&p4, NULL, 4, 0, SECRET, NFT);
+	REQUIRE(db);
+	for (i = 0; i < 6; i++)
+		CHECK_EQ(adopt4(db, addr4(0xc6120010 + i), 0x0a000001 + i, 0x100, 100),
+		         i < 4 ? 0 : -ENOSPC);
+	CHECK_EQ(fakeip_count(db), 4);
+	/* live placeholders fill the table */
+	CHECK(!bind4(db, "r", 0x100, "x.example", 0x0b000001, 60, &err));
+	CHECK_EQ(err, -ENOSPC);
+	/* once expired they are evicted, their elements destroyed */
+	time_override_advance(101);
+	b = bind4(db, "r", 0x100, "x.example", 0x0b000001, 60, &err);
+	REQUIRE(b);
+	CHECK(n_del >= 1);
+	CHECK_EQ(fakeip_placeholders(db) + 1, fakeip_count(db));
+	CHECK(fakeip_count(db) <= 4);
+	i = fakeip_placeholders(db);
+	CHECK_EQ(fakeip_evict_expired(db), i);
+	CHECK_EQ(fakeip_placeholders(db), 0);
+	CHECK_EQ(n_kern, 1);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
 int main(void)
 {
 	RUN(determinism);
@@ -1292,5 +1507,9 @@ int main(void)
 	RUN(policy_refcount);
 	RUN(policy_exhaustion);
 	RUN(pinned);
+	RUN(adopt_placeholders);
+	RUN(adopt_claim);
+	RUN(adopt_other_mapping_quarantined);
+	RUN(adopt_capacity);
 	return test_summary();
 }

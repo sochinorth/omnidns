@@ -22,7 +22,8 @@
  * index reused when its last binding goes. At most FAKEIP_MAX_POLICIES
  * pairs exist at once; beyond that fakeip_bind() fails with -ENOSPC.
  *
- * Allocation is deterministic per process:
+ * Allocation is deterministic for a given secret, which a restarted
+ * process takes over from the nft table (nft_adopt()):
  *   candidate_0 = pool_first + siphash(secret, key) mod pool_usable
  *   candidate_i = next usable address (linear probing, wrapping)
  * Usable addresses exclude (v4) the network and broadcast address of the
@@ -35,6 +36,8 @@
  *     (expired: safe_until < now and refcnt==0)  and reuse its fake (the nft
  *                                                 add replaces its elements)
  *   - occupied by a live binding              -> continue
+ *   - a placeholder with the key's (family, real, mark) -> claim it
+ *     (searched over the whole window while placeholders exist)
  * If no candidate is found, run an S3-FIFO eviction pass and retry once;
  * then fail with -ENOSPC. (A pass is skipped while the last one stalled,
  * see fakeip_evict_scans().)
@@ -114,8 +117,31 @@ uint32_t fakeip_policy_refs(const struct fakeip_db *db, const char *rule_id, uin
 void fakeip_ref(struct binding *b);
 void fakeip_unref(struct fakeip_db *db, struct binding *b);
 
-/* Lookup by fake address (PTR answers, tests). NULL if unmapped. */
+/* Lookup by fake address (PTR answers, tests). NULL if unmapped or a
+ * placeholder. */
 struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *fake);
+
+/*
+ * Adoption at startup (main.c, after nft_adopt()): a map element the
+ * kernel still holds from an earlier process becomes a placeholder
+ * binding: fake -> (real, mark) under a reserved policy (rule id ""), no
+ * endpoint, refcnt 0, its ticket done (0), safe_until = now + hold + grace
+ * (hold: fakeip_ttl_max, the longest a client may have been told to keep
+ * it). Placeholders count against max_bindings and are evicted like any
+ * expired binding (their elements destroyed). A bind whose key maps to the
+ * same (family, real, mark) claims a placeholder it probes: the binding
+ * takes over that fake with no nft op (the kernel has the mapping) and
+ * keeps at least its safe_until; a placeholder with another mapping is a
+ * live binding to every other bind until it expires.
+ * Returns 0, -EINVAL (fake not allocatable in the current pools), -ESTALE
+ * (no chain for `mark`), -EEXIST (fake taken), -ENOSPC (max_bindings
+ * reached), -ENOMEM; the caller then destroys the element.
+ */
+int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const uint8_t *real,
+                 uint32_t mark, uint32_t hold);
+/* true if `fake` holds a placeholder (its mark in *mark if non-NULL); tests */
+bool fakeip_placeholder(struct fakeip_db *db, int family, const uint8_t *fake, uint32_t *mark);
+uint32_t fakeip_placeholders(const struct fakeip_db *db);	/* unclaimed */
 bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr);
 
 /*
