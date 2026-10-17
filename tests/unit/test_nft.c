@@ -1288,6 +1288,68 @@ TEST(adopt_crafted_userdata)
 	free(o);
 }
 
+/* recv() is interposed too, to count what a context reads */
+static bool count_recv;
+static size_t recv_bytes;
+
+ssize_t recv(int fd, void *buf, size_t len, int flags)
+{
+	static ssize_t (*real_recv)(int, void *, size_t, int);
+	ssize_t r;
+
+	if (!real_recv)
+		*(void **)&real_recv = dlsym(RTLD_NEXT, "recv");
+	r = real_recv(fd, buf, len, flags);
+	if (count_recv && r > 0)
+		recv_bytes += (size_t)r;
+	return r;
+}
+
+/* fakes 198.18.0.1 ... (and fc00::1 ...) mapped to 10.0.0.0 ..., all with `mark` */
+static void fill_maps(uint32_t cnt, bool v6, uint32_t mark)
+{
+	for (uint32_t i = 0; i < cnt; i++) {
+		uint8_t f[16] = { 0 }, r[16] = { 0 };
+		uint32_t a = htonl(0xc6120001 + i), b = htonl(0x0a000000 + i);
+
+		if (v6) {
+			inet_pton(AF_INET6, "fc00::", f);
+			memcpy(f + 12, &a, 4);
+			inet_pton(AF_INET6, "2001:db8::", r);
+			memcpy(r + 12, &b, 4);
+		} else {
+			memcpy(f, &a, 4);
+			memcpy(r, &b, 4);
+		}
+		nft_elem_add(n, v6 ? AF_INET6 : AF_INET, f, r, mark);
+	}
+	REQUIRE(nft_drain(n) == 0);
+}
+
+/*
+ * Declining at the element cap ends the dump: the kernel does not go on
+ * filling a socket that the next transaction then has to drain.
+ */
+TEST(adopt_cap_bounds_work)
+{
+	static const uint32_t m1[] = { 0x01000000 };
+	struct nft_desired d = desired(true, false, m1, 1);
+	uint8_t got[NFT_SECRET_LEN];
+	struct nft_elem *el;
+	struct nft_ctx *m;
+	uint32_t nel;
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	fill_maps(4000, false, 0x01000000);
+	REQUIRE(adopt(&d, 5, got, &el, &nel, &m) == 0);
+	recv_bytes = 0;
+	count_recv = true;
+	CHECK_EQ(nft_bootstrap(m, &d), 0);
+	count_recv = false;
+	CHECK_EQ(recv_bytes < 4096 ? 0 : recv_bytes, 0);
+	nft_close(m);
+}
+
 /* ---- real packets in the netns ---- */
 
 static int tcp_connect(const char *dst, int port)
@@ -1701,6 +1763,7 @@ int main(int argc, char **argv)
 	RUN(adopt_reconcile_keeps_elements);
 	RUN(adopt_mismatch_bootstraps);
 	RUN(adopt_crafted_userdata);
+	RUN(adopt_cap_bounds_work);
 	RUN(wire_v4v6_all_marks);
 	RUN(wire_batch_max);
 	RUN(batch_buffers);

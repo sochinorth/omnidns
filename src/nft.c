@@ -111,6 +111,7 @@ struct shadow {
 struct nft_ctx {
 	char table[NFT_TABLE_MAX];
 	struct mnl_socket *ctl, *async;
+	struct mnl_socket *rd;	/* readback, only during nft_adopt() */
 	uint32_t ctl_portid, async_portid;
 	uint32_t seq, set_id;
 	struct txn ctl_tx;
@@ -1042,18 +1043,24 @@ static int dump_recv(void *priv, const char *buf, size_t len)
 
 /*
  * Send a GET request (a dump, or one object asking for an ack) on the
- * control socket and pass each reply message to cb. 0, or -errno (-ENOENT:
+ * readback socket and pass each reply message to cb. 0, or -errno (-ENOENT:
  * no such object); a callback failing with errno set ends it early.
+ *
+ * The readback socket is opened for one nft_adopt() and closed when it ends
+ * or gives up, which ends a dump left unread: the kernel produces the next
+ * part of a dump only when its socket is read, so a dump stopped at a cap
+ * costs nothing more. Reading to the end instead is unbounded (the maps
+ * have no size), and a dump left on the control socket was read by the next
+ * transaction.
  */
-static int ctl_get(struct nft_ctx *n, struct nlmsghdr *nlh, mnl_cb_t cb, void *priv)
+static int rd_get(struct nft_ctx *n, struct nlmsghdr *nlh, mnl_cb_t cb, void *priv)
 {
-	struct dump d = { nlh->nlmsg_seq, mnl_socket_get_portid(n->ctl), cb, priv };
-	int fd = mnl_socket_get_fd(n->ctl), r;
+	struct dump d = { nlh->nlmsg_seq, mnl_socket_get_portid(n->rd), cb, priv };
 	char *buf = oom(malloc(DUMP_BUF));
+	int r;
 
-	ctl_discard(fd, buf, DUMP_BUF);
-	r = mnl_socket_sendto(n->ctl, nlh, nlh->nlmsg_len) < 0 ? -errno :
-	    recv_loop(fd, buf, DUMP_BUF, false, dump_recv, &d);
+	r = mnl_socket_sendto(n->rd, nlh, nlh->nlmsg_len) < 0 ? -errno :
+	    recv_loop(mnl_socket_get_fd(n->rd), buf, DUMP_BUF, false, dump_recv, &d);
 	free(buf);
 	return r;
 }
@@ -1189,7 +1196,7 @@ static bool rules_current(struct nft_ctx *n, const char *chain, uint64_t tag, ui
 
 	mnl_attr_put_strz(nlh, NFTA_RULE_TABLE, n->table);
 	mnl_attr_put_strz(nlh, NFTA_RULE_CHAIN, chain);
-	return !ctl_get(n, nlh, rule_cb, &st) && !st.bad && st.n == want;
+	return !rd_get(n, nlh, rule_cb, &st) && !st.bad && st.n == want;
 }
 
 struct elem_st {
@@ -1257,7 +1264,7 @@ static int dump_map(struct nft_ctx *n, int set, struct elem_st *st)
 	st->mark = set & 1;
 	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, n->table);
 	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set_names[set]);
-	return ctl_get(n, nlh, elem_cb, st);
+	return rd_get(n, nlh, elem_cb, st);
 }
 
 static int cmp_elem(const void *a, const void *b)
@@ -1314,14 +1321,17 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	*nelems = 0;
 	if (shadow_from(&s, d))
 		return 0;
+	n->rd = mnl_socket_open(NETLINK_NETFILTER);
+	why = "cannot read it";
+	if (!n->rd || sock_setup(n->rd))
+		goto fail;
 	nlh = get_msg(n, buf, NFT_MSG_GETTABLE, NLM_F_ACK);
 	mnl_attr_put_strz(nlh, NFTA_TABLE_NAME, n->table);
-	err = ctl_get(n, nlh, table_cb, &tst);
+	err = rd_get(n, nlh, table_cb, &tst);
 	if (err == -ENOENT) {
 		log_info("nft: no table %s yet", n->table);
 		goto fail_quiet;
 	}
-	why = "cannot read it";
 	if (err)
 		goto fail;
 	why = "made by another omnidns version";
@@ -1336,7 +1346,7 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	s.nmarks = 0;
 	nlh = get_msg(n, buf, NFT_MSG_GETCHAIN, NLM_F_DUMP);
 	why = "cannot list its chains, or too many";
-	if (ctl_get(n, nlh, chain_cb, &cst))
+	if (rd_get(n, nlh, chain_cb, &cst))
 		goto fail;
 	why = "a chain is missing";
 	if (cst.fixed != (1u << NFIXED) - 1)
@@ -1376,6 +1386,8 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	         *nelems, s.nmarks, n->stale ? ", policy rules to rewrite" : "");
 	free(est[0].v);
 	free(est[1].v);
+	mnl_socket_close(n->rd);
+	n->rd = NULL;
 	return 1;
 
 fail:
@@ -1385,6 +1397,9 @@ fail_quiet:
 	free(est[0].v);
 	free(est[1].v);
 	shadow_free(&s);
+	if (n->rd)
+		mnl_socket_close(n->rd);
+	n->rd = NULL;
 	return 0;
 }
 
