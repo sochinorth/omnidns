@@ -77,7 +77,7 @@ struct nbuf {
  */
 struct txn {
 	struct nbuf b;
-	uint32_t seq_first, seq_last, nmsg;
+	uint32_t seq_first, seq_last;
 	size_t last_off;	/* offset of the last message added by txn_msg() */
 };
 
@@ -176,7 +176,6 @@ static void nbuf_commit(struct nbuf *b, struct nlmsghdr *nlh)
 static void txn_begin(struct nft_ctx *n, struct txn *t)
 {
 	t->b.len = 0;
-	t->nmsg = 0;
 	nbuf_reserve(&t->b, MNL_NLMSG_HDRLEN + 64);
 	t->seq_first = n->seq;
 	nbuf_commit(&t->b, nftnl_batch_begin(t->b.p, n->seq++));
@@ -193,7 +192,6 @@ static struct nlmsghdr *txn_msg(struct nft_ctx *n, struct txn *t, int type,
 				uint16_t flags, size_t room)
 {
 	nbuf_reserve(&t->b, room);
-	t->nmsg++;
 	t->last_off = t->b.len;
 	return nftnl_nlmsg_build_hdr(t->b.p + t->b.len, type, NFPROTO_INET, flags,
 	                             n->seq++);
@@ -1703,7 +1701,6 @@ static void ebuf_move(struct nft_ctx *n, struct ebuf *e, struct txn *t)
 		nlh->nlmsg_seq = n->seq++;
 		t->last_off = t->b.len;
 		t->b.len += len;
-		t->nmsg++;
 		off += len;
 	}
 	e->b.len = 0;
@@ -1725,27 +1722,10 @@ void nft_flush(struct nft_ctx *n)
 	for (int phase = 0; phase < 2; phase++)
 		for (int i = 0; i < S_NUM; i++)
 			ebuf_move(n, &n->ebuf[i * 2 + phase], t);
-	if (!t->nmsg) {
-		/*
-		 * Unreachable today: a batch is opened only by an op that
-		 * queues elements before returning its ticket. Should it
-		 * happen, there is nothing to install and no message to carry
-		 * the ack (t->last_off would be stale): the batch succeeds
-		 * without a send, its waiters (if any) via the ready list.
-		 */
-		struct nft_waiter *w, *tmp;
-
-		list_for_each_entry_safe(w, tmp, &n->waiters, list)
-			if (w->ticket == b->ticket)
-				list_move_tail(&w->list, &n->ready);
-		if (!list_empty(&n->ready))
-			uloop_timeout_set(&n->ready_tmo, 0);
-		batch_free(n, b);
-		return;
-	}
 	/*
-	 * As for control-plane transactions (see ctl_commit()), only the last
-	 * message asks for an ack: the kernel reports a failing message, or a
+	 * Never empty: a batch is opened only by an op that queues elements
+	 * before anything can flush it. As for control-plane transactions (see
+	 * ctl_commit()), only the last message asks for an ack: the kernel reports a failing message, or a
 	 * failed commit (on BEGIN), whether it asked or not, and queues every
 	 * reply of the batch at once, in message order, so an error arrives
 	 * before the final ack and the final ack alone means success. One ack
@@ -1816,19 +1796,6 @@ static void queue_elem(struct nft_ctx *n, int set, bool add, const uint8_t *key,
 	mnl_attr_nest_end(nlh, elem);
 }
 
-/*
- * DESTROYSETELEM (kernel >= 6.3) is a delete that ignores missing keys.
- * Every element op goes through it, so element ops are idempotent and a
- * kernel state that drifted from the binding DB (e.g. after a failed,
- * rolled-back batch) can never make later batches fail.
- */
-static void queue_destroy(struct nft_ctx *n, int real, int mark, const uint8_t *fake,
-                          uint32_t alen)
-{
-	queue_elem(n, real, false, fake, alen, NULL, 0);
-	queue_elem(n, mark, false, fake, alen, NULL, 0);
-}
-
 static uint64_t op_done(struct nft_ctx *n)
 {
 	struct ebatch *b = n->open;
@@ -1850,7 +1817,7 @@ static uint64_t op_done(struct nft_ctx *n)
  * Keys with a pending add live in a fixed open-addressing table (at most
  * NFT_BATCH_MAX adds per batch, load <= 1/2): slots hold the batch's
  * generation and an index into pend_key, so a new batch empties the table
- * by bumping the generation.
+ * by bumping the generation. Opens a batch if none is open.
  */
 static void op_order_key(struct nft_ctx *n, int family, const uint8_t *fake, bool add)
 {
@@ -1871,74 +1838,53 @@ static void op_order_key(struct nft_ctx *n, int family, const uint8_t *fake, boo
 			}
 		}
 	}
-	if (!add)
-		return;
 	if (!n->open)
 		n->open = batch_new(n);
+	if (!add)
+		return;
 	for (s = h; n->pend_slot[s & (PENDING_SLOTS - 1)] >> 16 == n->pend_gen; s++)
 		;
 	n->pend_key[n->pend_n++] = k;
 	n->pend_slot[s & (PENDING_SLOTS - 1)] = (uint32_t)n->pend_gen << 16 | n->pend_n;
 }
 
-/* accepts 4/6 as well as AF_INET/AF_INET6 */
-static int norm_family(int family)
+/*
+ * Every element op destroys the key first, through DESTROYSETELEM (kernel
+ * >= 6.3, a delete that ignores missing keys): element ops are idempotent, a
+ * key mapped to different data never fails with EEXIST, and a kernel state
+ * that drifted from the binding DB (e.g. after a failed, rolled-back batch)
+ * can never make later batches fail. `family` is 4/6 or AF_INET/AF_INET6.
+ */
+static uint64_t elem_op(struct nft_ctx *n, int family, const uint8_t *fake, bool add,
+                        const uint8_t *real, uint32_t mark)
 {
-	if (family == 4)
-		return AF_INET;
-	if (family == 6)
-		return AF_INET6;
-	return family;
-}
+	bool v6 = family == 6 || family == AF_INET6;
+	int rs = v6 ? S_REAL6 : S_REAL4, ms = v6 ? S_MARK6 : S_MARK4;
+	uint32_t alen = v6 ? 16 : 4;
 
-static bool op_begin(struct nft_ctx *n, int family)
-{
-	if (family != AF_INET && family != AF_INET6) {
+	if (!v6 && family != 4 && family != AF_INET) {
 		log_err("nft: bad element family %d", family);
-		return false;
+		return 0;
 	}
-	if (!n->open)
-		n->open = batch_new(n);
-	return true;
+	op_order_key(n, v6 ? AF_INET6 : AF_INET, fake, add);
+	queue_elem(n, rs, false, fake, alen, NULL, 0);
+	queue_elem(n, ms, false, fake, alen, NULL, 0);
+	if (add) {
+		queue_elem(n, rs, true, fake, alen, real, 0);
+		queue_elem(n, ms, true, fake, alen, NULL, mark);
+	}
+	return op_done(n);
 }
 
-/* An add always destroys the key first, so a key mapped to different data
- * never fails with EEXIST. */
 uint64_t nft_elem_add(struct nft_ctx *n, int family, const uint8_t *fake,
                       const uint8_t *real, uint32_t mark)
 {
-	bool v6;
-	int rs, ms;
-	uint32_t alen;
-
-	family = norm_family(family);
-	if (!op_begin(n, family))
-		return 0;
-	op_order_key(n, family, fake, true);
-	v6 = family == AF_INET6;
-	rs = v6 ? S_REAL6 : S_REAL4;
-	ms = v6 ? S_MARK6 : S_MARK4;
-	alen = v6 ? 16 : 4;
-	queue_destroy(n, rs, ms, fake, alen);
-	queue_elem(n, rs, true, fake, alen, real, 0);
-	queue_elem(n, ms, true, fake, alen, NULL, mark);
-	return op_done(n);
+	return elem_op(n, family, fake, true, real, mark);
 }
 
 uint64_t nft_elem_del(struct nft_ctx *n, int family, const uint8_t *fake)
 {
-	bool v6;
-
-	family = norm_family(family);
-	if (!op_begin(n, family))
-		return 0;
-	op_order_key(n, family, fake, false);
-	if (!n->open)
-		n->open = batch_new(n);
-	v6 = family == AF_INET6;
-	queue_destroy(n, v6 ? S_REAL6 : S_REAL4, v6 ? S_MARK6 : S_MARK4, fake,
-	          v6 ? 16 : 4);
-	return op_done(n);
+	return elem_op(n, family, fake, false, NULL, 0);
 }
 
 size_t nft_batch_mem(const struct nft_ctx *n)
