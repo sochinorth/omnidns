@@ -203,7 +203,8 @@ EOF""")
         log = open(self.dir + "/daemon.log", "a")
         env = dict(os.environ)
         # no -x: a restart takes the table over (it goes with the netns)
-        self.daemon = subprocess.Popen([self.binary, "-f", "-t", TABLE,
+        # hold and lock files in the test directory (/var/run is not ours)
+        self.daemon = subprocess.Popen([self.binary, "-f", "-t", TABLE, "-r", self.dir,
                                         "-c", self.dir + "/omnidns"],
                                        stdout=log, stderr=log, env=env)
         for _ in range(50):
@@ -558,7 +559,8 @@ def accepted_fwmask_reload_flushes_cache(env):
 
     config(cfg)
     lf = open(d + "/daemon.log", "a")
-    p = subprocess.Popen([env.binary, "-f", "-t", table, "-x", "-c", d + "/omnidns"],
+    p = subprocess.Popen([env.binary, "-f", "-t", table, "-r", d, "-x",
+                          "-c", d + "/omnidns"],
                          stdout=lf, stderr=lf)
     try:
         for _ in range(100):
@@ -665,7 +667,8 @@ def mark_chain_overflow_rejects_reload(env):
 
     config(0)
     lf = open(d + "/daemon.log", "a")
-    p = subprocess.Popen([env.binary, "-f", "-t", table, "-x", "-c", d + "/omnidns"],
+    p = subprocess.Popen([env.binary, "-f", "-t", table, "-r", d, "-x",
+                          "-c", d + "/omnidns"],
                          stdout=lf, stderr=lf)
     try:
         for _ in range(100):
@@ -719,11 +722,13 @@ def restart_keeps_fakes(env):
     env.daemon.terminate()
     env.daemon.wait(10)
     check(env.nft_map("fake2real_v4").get(fake) == REAL_A, "table not kept on exit")
+    check(os.path.exists("%s/omnidns-%s.hold" % (env.dir, TABLE)), "no hold file on exit")
     off = len(env.daemon_log())
     env.start_daemon()
     log = env.daemon_log()[off:]
     m = re.search(r"kept (\d+) fake IPs", log)
-    check(m and int(m.group(1)) >= 2, "table not adopted:\n" + log)
+    check(m and int(m.group(1)) >= 2 and "fake IPs in use" in log,
+          "table not adopted with the hold file:\n" + log)
     # before any query: the adopted elements carry the connection and mark
     before = env.counters()
     out = env.connect(fake)
@@ -737,13 +742,17 @@ def restart_keeps_fakes(env):
 
 
 @test
-def restart_quarantine_and_flush(env):
-    """A fake nobody re-queries after a restart keeps working (and holds its
-    capacity) until fakeip_ttl_max + fakeip_grace have passed, then it can be
-    reclaimed. `omnidns -F` deletes the table. Runs a second daemon (own
-    port, table and pool, short lifetimes, one binding)."""
+def restart_hold_file(env):
+    """Expired bindings do not survive a restart: a clean exit writes a hold
+    file of the fakes still in use, the next start keeps just those (for
+    what is left of their life) and destroys the other elements, so new
+    names still get fakes. After a crash (SIGKILL, no hold file) every
+    element is kept until fakeip_ttl_max + fakeip_grace have passed, holding
+    its capacity. `omnidns -F` deletes the table and the hold file. Runs a
+    second daemon (own port, table and pool, short lifetimes, 3 bindings)."""
     table, port = TABLE + "r", 5397
     d = env.dir + "/restart"
+    hold = "%s/omnidns-%s.hold" % (d, table)
     os.makedirs(d, exist_ok=True)
     with open(d + "/w.txt", "w") as f:
         f.write("*.warp.test\nplain.test\n")
@@ -751,13 +760,17 @@ def restart_quarantine_and_flush(env):
            .replace("198.18.0.0/15", "100.65.0.0/16")
            .replace("{d}/warp.txt", d + "/w.txt")
            .replace("option block_mode", "option fakeip_ttl_max '2'\n\toption fakeip_grace '2'\n"
-                    "\toption fakeip_max_bindings '1'\n\toption block_mode"))
+                    "\toption fakeip_max_bindings '3'\n\toption block_mode"))
     with open(d + "/omnidns", "w") as f:
         f.write(cfg.format(lan=LAN, d=env.dir))
     lf = open(d + "/daemon.log", "a")
 
+    def log():
+        with open(d + "/daemon.log") as f:
+            return f.read()
+
     def start():
-        p = subprocess.Popen([env.binary, "-f", "-t", table, "-c", d + "/omnidns"],
+        p = subprocess.Popen([env.binary, "-f", "-t", table, "-r", d, "-c", d + "/omnidns"],
                              stdout=lf, stderr=lf)
         for _ in range(100):
             try:
@@ -771,32 +784,64 @@ def restart_quarantine_and_flush(env):
     def q(name):
         return dnsmini.query(LAN, port, name, "A")
 
+    def fake_of(name):
+        r = q(name)
+        a = answers(r, "A")
+        check(r["rcode"] == 0 and a and a[0].startswith("100.65."),
+              "no fake for %s: %r" % (name, r))
+        return a[0]
+
     p = start()
     try:
-        fake = answers(q("warp.test"), "A")[0]
-        check(fake.startswith("100.65."), "no fake: %r" % fake)
+        # two bindings expire; lazy eviction leaves their elements
+        gone = [fake_of("inner.warp.test"), fake_of("long.warp.test")]
+        time.sleep(5.2)
+        live = fake_of("warp.test")
+        check(len(env.nft_map("fake2real_v4", table)) == 3, "expired elements evicted")
         p.terminate()
         p.wait(10)
+        check(os.path.exists(hold), "no hold file after a clean exit")
+        off = len(log())
+        p = start()
+        out = log()[off:]
+        check(not os.path.exists(hold), "hold file not deleted when read")
+        check("lists 1 fake IPs in use" in out and
+              "kept 1 fake IPs of the existing table, dropped 2" in out,
+              "hold file not used:\n" + out)
+        check(env.connect(live) == "hello from " + REAL_A, "live fake broken after restart")
+        m = env.nft_map("fake2real_v4", table)
+        check(live in m and not set(gone) & set(m), "expired elements kept: %r" % m)
+        # the capacity they held is free (without the file: SERVFAIL)
+        fake_of("plain.test")
+        fake_of("inner.warp.test")
+
+        # a crash leaves no file: every element is kept, holding capacity
+        p.kill()
+        p.wait(10)
+        check(not os.path.exists(hold), "hold file written by SIGKILL")
+        off = len(log())
         p = start()
         t0 = time.monotonic()
-        check(env.connect(fake) == "hello from " + REAL_A, "kept fake broken after restart")
-        r = q("plain.test")
-        check(r["rcode"] == 2, "the kept fake does not hold its capacity: %r" % r)
+        out = log()[off:]
+        check("no hold file" in out and "kept 3 fake IPs of the existing table, dropped 0" in out,
+              "not a conservative adoption:\n" + out)
+        check(env.connect(live) == "hello from " + REAL_A, "kept fake broken after the crash")
+        r = q("long.warp.test")
+        check(r["rcode"] == 2, "the kept fakes do not hold their capacity: %r" % r)
         time.sleep(max(0, t0 + 5.2 - time.monotonic()))
-        plain = answers(q("plain.test"), "A")
-        check(plain and plain[0].startswith("100.65."), "no fake after the quarantine")
-        out = env.connect(fake)
-        check(out != "hello from " + REAL_A, "fake still mapped after the quarantine: %r" % out)
+        fake_of("long.warp.test")
     finally:
         p.terminate()
         p.wait(10)
     check(env.nft_map("fake2real_v4", table), "table not kept on exit")
+    check(os.path.exists(hold), "no hold file after a clean exit")
     for _ in range(2):  # an absent table is success too
-        r = subprocess.run([env.binary, "-F", "-t", table, "-c", d + "/omnidns"],
+        r = subprocess.run([env.binary, "-F", "-t", table, "-r", d, "-c", d + "/omnidns"],
                            capture_output=True, text=True)
         check(r.returncode == 0, "omnidns -F failed: %s" % r.stderr)
         r = subprocess.run("nft list table inet " + table, shell=True, capture_output=True)
         check(r.returncode != 0, "table left after omnidns -F")
+        check(not os.path.exists(hold), "hold file left after omnidns -F")
 
 
 def enter_netns():

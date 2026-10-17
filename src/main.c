@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/random.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <libubox/uloop.h>
@@ -32,8 +35,90 @@ _Static_assert(CONFIG_MAX_RULES <= MAX_MARKS, "a config's own marks must fit");
 
 static struct omni omni;
 static const char *nft_table;
+static const char *run_dir = "/var/run";
 static bool destroy_on_exit;
 static bool log_to_stderr;
+
+/*
+ * <run_dir>/omnidns-<table>.hold: the hold file (fakeip_hold_save()), how
+ * long each fake of the table must still be kept, written by a clean exit
+ * and consumed by the next adoption. <run_dir>/omnidns-<table>.lock: every
+ * instance holds a shared flock on it for its whole life, taken before it
+ * reads the table. An exiting instance writes the hold file only if it can
+ * turn that lock into an exclusive one, i.e. no other instance of the table
+ * runs (one started meanwhile, e.g. through SO_REUSEPORT, makes bindings
+ * the file would not list), and keeps it exclusive until the rename is
+ * done, so an instance starting meanwhile waits and then reads the whole
+ * file. Empty paths (the table name is no file name): no hold file.
+ */
+static char hold_path[512], lock_path[512];
+static int lock_fd = -1;
+
+static void run_paths(void)
+{
+	const char *t = nft_table ? nft_table : "omnidns";
+	int a, b;
+
+	if (strchr(t, '/'))
+		return;
+	a = snprintf(hold_path, sizeof(hold_path), "%s/omnidns-%s.hold", run_dir, t);
+	b = snprintf(lock_path, sizeof(lock_path), "%s/omnidns-%s.lock", run_dir, t);
+	if (a < 0 || (size_t)a >= sizeof(hold_path) || b < 0 || (size_t)b >= sizeof(lock_path))
+		hold_path[0] = lock_path[0] = 0;
+}
+
+/* The shared instance lock; without it no hold file is read or written. */
+static void lock_instance(void)
+{
+	int fd;
+
+	if (!lock_path[0])
+		return;
+	fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		log_warn("%s: %s; restarts keep every fake IP of the table for "
+		         "fakeip_ttl_max + fakeip_grace", lock_path, strerror(errno));
+		return;
+	}
+	while (flock(fd, LOCK_SH)) {
+		if (errno != EINTR) {
+			log_warn("%s: flock: %s", lock_path, strerror(errno));
+			close(fd);
+			return;
+		}
+	}
+	lock_fd = fd;
+}
+
+/* CLOCK_BOOTTIME seconds: steady across processes, unlike the wall clock,
+ * which NTP steps (on routers without RTC, at the first sync after boot) */
+static uint64_t boot_clock(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_BOOTTIME, &ts);
+	return (uint64_t)ts.tv_sec;
+}
+
+/* At exit, after the last element batch is acked. The table is left alone. */
+static void save_hold(void)
+{
+	int ret;
+
+	if (lock_fd < 0 || !omni.fdb || destroy_on_exit)
+		return;
+	if (flock(lock_fd, LOCK_EX | LOCK_NB)) {
+		log_info("another instance uses the table: no hold file (a restart keeps "
+		         "every fake IP for fakeip_ttl_max + fakeip_grace)");
+		return;
+	}
+	ret = fakeip_hold_save(omni.fdb, hold_path, boot_clock());
+	if (ret)
+		log_warn("%s: %s (a restart keeps every fake IP for fakeip_ttl_max + "
+		         "fakeip_grace)", hold_path, strerror(-ret));
+	else
+		log_info("saved the fake IPs in use to %s", hold_path);
+}
 
 /*
  * Mark chains installed so far (= the nft shadow's marks). They are kept
@@ -106,13 +191,16 @@ static int build_desired(const struct config *cfg, struct nft_desired *d, uint32
 /*
  * Startup with the table an earlier process left (a restart): take over its
  * secret, so keys probe the same fakes, and keep its map elements as
- * placeholder bindings, so fakes clients still hold keep working. Elements
- * that are not a consistent pair inside the current pools with a known mark
- * chain are destroyed; beyond fakeip_max_bindings, those after the first
- * max_bindings in address order (v4 first) are too, since the kernel keeps
- * no age. Their marks join kept_marks. On success omni.fdb exists and the
- * table is reconciled with the configuration; otherwise nothing is kept and
- * the caller bootstraps.
+ * placeholder bindings, so fakes clients still hold keep working. With a
+ * hold file of this table (a clean exit before), an element is kept for
+ * the hold it lists, and one it does not list (evictable at that exit) is
+ * destroyed; without one, every element is kept for fakeip_ttl_max +
+ * fakeip_grace. Elements that are not a consistent pair inside the current
+ * pools with a known mark chain are destroyed; beyond fakeip_max_bindings,
+ * those after the first max_bindings in address order (v4 first) are too,
+ * since the kernel keeps no age. Their marks join kept_marks. On success
+ * omni.fdb exists and the table is reconciled with the configuration;
+ * otherwise nothing is kept and the caller bootstraps.
  */
 static bool adopt_table(void)
 {
@@ -120,15 +208,18 @@ static bool adopt_table(void)
 	const struct config *cfg = omni.cfg;
 	struct nft_desired d;
 	struct nft_elem *el;
+	struct fakeip_hold *h = NULL;
+	struct binding *b;
 	uint8_t secret[NFT_SECRET_LEN];
-	uint32_t nel, i, kept = 0;
+	uint32_t nel, kept, max32, it = 0;
 	uint64_t max = 2 * (uint64_t)cfg->fakeip_max_bindings;
-	int ret;
+	uint64_t hold = (uint64_t)cfg->fakeip_ttl_max + cfg->fakeip_grace;
+	int ret, herr = -ENOENT;
 
+	max32 = max > UINT32_MAX ? UINT32_MAX : (uint32_t)max;
 	if (build_desired(cfg, &d, marks, false))
 		return false;
-	if (nft_adopt(omni.nft, &d, max > UINT32_MAX ? UINT32_MAX : (uint32_t)max, secret,
-	              &el, &nel) != 1)
+	if (nft_adopt(omni.nft, &d, max32, secret, &el, &nel) != 1)
 		return false;
 	omni.fdb = fakeip_new(cfg->has_pool4 ? &cfg->pool4 : NULL,
 	                      cfg->has_pool6 ? &cfg->pool6 : NULL,
@@ -137,20 +228,23 @@ static bool adopt_table(void)
 		free(el);
 		return false;
 	}
+	if (lock_fd >= 0)
+		h = fakeip_hold_load(hold_path, secret, max32, boot_clock(), &herr);
+	if (h)
+		log_info("startup: %s lists %u fake IPs in use", hold_path, fakeip_hold_count(h));
+	else if (herr != -ENOENT)
+		log_warn("startup: ignoring %s (%s)", hold_path, strerror(-herr));
+	else
+		log_info("startup: no hold file (no clean exit before): every fake IP of the "
+		         "existing table is kept for fakeip_ttl_max + fakeip_grace");
+	kept = fakeip_adopt_elems(omni.fdb, el, nel,
+	                          hold > UINT32_MAX ? UINT32_MAX : (uint32_t)hold, h);
+	fakeip_hold_free(h);
+	free(el);
 	nkept_marks = 0;
 	ret = 0;
-	for (i = 0; i < nel; i++) {
-		const struct nft_elem *e = &el[i];
-
-		if (!ret && e->ok && !fakeip_adopt(omni.fdb, e->family, e->fake, e->real, e->mark,
-		                                   cfg->fakeip_ttl_max)) {
-			kept++;
-			ret = add_mark(kept_marks, &nkept_marks, e->mark);
-			continue;
-		}
-		nft_elem_del(omni.nft, e->family, e->fake);
-	}
-	free(el);
+	while (!ret && (b = fakeip_next(omni.fdb, &it)))
+		ret = add_mark(kept_marks, &nkept_marks, fakeip_mark(omni.fdb, b));
 	if (ret) {
 		log_warn("startup: fake IPs of the existing table use more than %d marks",
 		         MAX_MARKS);
@@ -301,10 +395,11 @@ static struct uloop_timeout sweep_timer = { .cb = sweep_cb };
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"usage: %s [-c config] [-f] [-t nft_table] [-x | -F]\n"
+		"usage: %s [-c config] [-f] [-t nft_table] [-r run_dir] [-x | -F]\n"
 		"  -c  UCI config file (default /etc/config/omnidns)\n"
 		"  -f  log to stderr instead of syslog\n"
 		"  -t  nftables table name (default omnidns)\n"
+		"  -r  directory of the hold and lock files (default /var/run)\n"
 		"  -x  delete the nftables table on exit (by default a restarted\n"
 		"      daemon takes it over, with the fake IPs clients hold)\n"
 		"  -F  delete the nftables table and exit (service stop)\n", prog);
@@ -320,11 +415,12 @@ int main(int argc, char **argv)
 	int opt, ret = 1;
 
 	omni.config_path = "/etc/config/omnidns";
-	while ((opt = getopt(argc, argv, "c:ft:xFh")) != -1) {
+	while ((opt = getopt(argc, argv, "c:ft:r:xFh")) != -1) {
 		switch (opt) {
 		case 'c': omni.config_path = optarg; break;
 		case 'f': log_to_stderr = true; break;
 		case 't': nft_table = optarg; break;
+		case 'r': run_dir = optarg; break;
 		case 'x': destroy_on_exit = true; break;
 		case 'F': flush_only = true; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
@@ -332,11 +428,14 @@ int main(int argc, char **argv)
 	}
 
 	log_init("omnidns", log_to_stderr, LOG_INFO);
+	run_paths();
 	if (flush_only) {
 		/* the config is not read: a broken one must not keep the table */
 		omni.nft = nft_open(nft_table);
 		ret = !omni.nft || nft_destroy_table(omni.nft);
 		nft_close(omni.nft);
+		if (hold_path[0])
+			unlink(hold_path);
 		return ret;
 	}
 	hash_init();
@@ -365,6 +464,7 @@ int main(int argc, char **argv)
 		goto out_loop;
 	}
 	nft_set_secret(omni.nft, secret);
+	lock_instance();
 	if (!adopt_table()) {
 		nft_set_secret(omni.nft, secret);	/* adoption may have read another */
 		if (build_desired(omni.cfg, &d, marks, false) || nft_bootstrap(omni.nft, &d)) {
@@ -378,6 +478,10 @@ int main(int argc, char **argv)
 		                      omni.cfg->fakeip_max_bindings, omni.cfg->fakeip_grace,
 		                      secret, omni.nft);
 	}
+	/* read by the adoption, or stale (another table, or none): under the
+	 * lock no other instance writes one any more */
+	if (lock_fd >= 0)
+		unlink(hold_path);
 	omni.cache = cache_new(omni.cfg->cache_size, omni.cfg->cache_max_bytes, omni.fdb);
 	if (!omni.fdb || !omni.cache) {
 		log_err("out of memory");
@@ -403,11 +507,14 @@ out_state:
 		cache_free(omni.cache);
 	nft_flush(omni.nft);
 	nft_drain(omni.nft);
+	save_hold();
 	if (omni.fdb)
 		fakeip_free(omni.fdb);
 	if (destroy_on_exit)
 		nft_destroy_table(omni.nft);
 out_nft:
+	if (lock_fd >= 0)
+		close(lock_fd);
 	nft_close(omni.nft);
 out_loop:
 	uloop_done();
