@@ -49,7 +49,12 @@ void upstream_set_timeouts(uint32_t try_timeout_ms, uint32_t total_timeout_ms);
 struct upstream_query *upstream_query(struct upstream_set *u,
                                       const uint8_t *qname, uint8_t qlen, uint16_t qtype,
                                       upstream_cb cb, void *ctx);
-/* Callback will not be invoked after cancel. */
+/*
+ * Callback will not be invoked after cancel. The handle is valid until its
+ * callback returns or it is cancelled, whichever comes first: cancelling
+ * from inside its own callback is a no-op, after it a use after free. NULL
+ * from upstream_query() (out of memory) means no callback will come.
+ */
 void upstream_cancel(struct upstream_query *q);
 
 /* Cancel everything (shutdown). */

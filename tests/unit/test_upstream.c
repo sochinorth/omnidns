@@ -539,6 +539,11 @@ TEST(cancel_all)
 	run_loop(1, 100);	/* the drop query is now in flight */
 	CHECK(watchdog_fired);
 	CHECK_EQ(u->refcnt, 2);
+	/*
+	 * unless it already failed (send errors, e.g. with no loopback): then
+	 * its callback ran and the handle is gone, so it must not be cancelled
+	 */
+	REQUIRE(!r[3].called);
 	upstream_cancel(h[3]);
 	CHECK_EQ(u->refcnt, 1);
 	run_loop(1, 500);
