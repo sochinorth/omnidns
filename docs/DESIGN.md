@@ -308,12 +308,18 @@ candidateᵢ = next usable address (linear probing)
 - **Excluded addresses**: the IPv4 network and broadcast addresses, and the
   IPv6 all-zero host. Pools may not overlap 0/8, loopback, multicast, `::`,
   `::1`, v4-mapped space or `ff00::/8`.
-- **Determinism**: allocation is deterministic within a process lifetime. A
-  binding that was evicted and comes back usually gets the same fake again.
+- **Determinism**: allocation is deterministic for a given 16-byte secret.
+  The secret is random when the nftables table is created and is stored in
+  it, so a restarted daemon that takes the table over keeps it (see
+  [Restart](#restart)). A binding that was evicted and comes back usually
+  gets the same fake again, also across a restart.
 - **Probing**: up to 64 candidates are tried.
   - A free slot is taken.
   - A slot whose binding is expired and unreferenced is reclaimed.
   - A live slot is skipped.
+  - A placeholder left by a restart that maps to the key's (family, real
+    address, mark) is claimed. While placeholders exist, the whole window
+    is searched for one before a free slot is taken.
 - **Exhaustion**: if the probe fails, expired cache entries are swept and
   allocation is retried once. If that also fails, the result is SERVFAIL;
   omnidns never falls back to the real address.
@@ -339,8 +345,61 @@ safe_until = now + min(TTL, fakeip_ttl_max) + fakeip_grace
   a table full of live bindings, a failing bind therefore costs a probe and
   no scan, and the cache sweep before its retry runs at most once a
   second (a second sweep within the same second would find nothing).
-- **Persistence**: bindings live in RAM only. On startup omnidns recreates its
-  nftables table from scratch.
+- **Persistence**: bindings live in RAM; the nftables maps outlive the
+  process. A restart turns their elements back into placeholder bindings
+  (below); only a stop deletes the table.
+
+### Restart
+
+procd sends SIGTERM both to stop and to restart, so the daemon never
+deletes its table on exit. `omnidns -F` deletes it: the init script runs it
+when the service stops (`stop`, `shutdown`, package removal) but not from
+its own `restart`, and a procd respawn after a crash never runs it. `-F`
+racing a daemon that is still exiting is harmless: only startup creates
+the table (an fwmask change recreates it only if it still exists), so the
+exiting daemon's last element updates just fail.
+
+At startup omnidns reads the table, if any:
+
+1. The table's userdata holds a layout version, the fwmask and the
+   allocation secret. If the table is missing, has another version or
+   fwmask, lacks one of its fixed chains, or cannot be read, omnidns
+   bootstraps with a fresh secret, as on a first start, and logs why.
+2. Otherwise the shadow state is rebuilt from the kernel: the mark chains
+   present, and the configuration's pools if every policy rule carries the
+   tag of exactly that state (each policy rule records one); else the
+   policy rules count as stale.
+3. The four maps are read and paired per fake. A pair `fake → real`,
+   `fake → jump mark_V` with `mark_V` present and the fake allocatable in
+   the current pool becomes a *placeholder* binding: a reserved policy
+   carrying the mark, no endpoint, refcount 0, nothing to wait for, and
+   `safe_until = now + fakeip_ttl_max + fakeip_grace`, the longest a client
+   may legitimately hold it. Every other element is destroyed, as are
+   pairs beyond `fakeip_max_bindings` (the first ones in address order, v4
+   first, are kept: the kernel keeps no age). A map with more than twice
+   `fakeip_max_bindings` elements, or more than 8192 chains, makes it
+   bootstrap instead, which bounds the work on kernel state.
+4. The placeholders' marks join the kept marks (more than 4096 in all:
+   bootstrap). After the destroys have landed, a normal reconcile runs,
+   which sends nothing if the table already matches the configuration.
+
+A placeholder is evicted like any expired binding and counts against
+`fakeip_max_bindings`. A bind that probes a placeholder with its own
+(family, real, mark) claims it: the new binding takes over the fake with
+no nftables operation, since the kernel already has that mapping, and
+keeps at least the placeholder's `safe_until`. With the earlier secret, a
+key's candidates are the same as before the restart, so a re-queried name
+usually gets its old fake back; claiming is safe without that, because
+the mapping is identical. A placeholder with any other mapping is a live
+binding until its `safe_until`, so no fake is re-pointed while a client of
+the earlier process may still use it. Placeholders answer no PTR query
+(they have no name).
+
+Placeholders hold their capacity for the full `fakeip_ttl_max` +
+`fakeip_grace`, whatever was left of their life before the restart, and
+eviction is lazy: after a crash or restart with a table near
+`fakeip_max_bindings`, new fake-IP names may get SERVFAIL until enough
+placeholders expire or are claimed.
 
 ### Abuse limits
 
@@ -388,27 +447,33 @@ output_reject      (filter, output,     filter-1):  same
 
 ### Control plane and data plane
 
-- **Startup**: one transaction deletes and recreates the table.
+- **Startup**: the existing table is taken over and reconciled (see
+  [Restart](#restart)); otherwise one transaction deletes and recreates it.
 - **Reload**: one transaction reconciles chains and rules against the
-  desired state. It never flushes maps, except on an fwmask change (see
+  desired state. It never touches the maps, except on an fwmask change (see
   below). Mark chains are kept across reloads
   until the fwmask changes, because walks in flight may still bind with a
   mark the new config no longer uses. An fwmask change is only accepted
-  with no live binding (see [Reload](#reload)), yet a failed element batch
-  rolls back the deletes it carried, so the kernel may still hold elements
-  the binding table already dropped, jumping to an old mark chain. Their
-  chain could then never be deleted (EBUSY), so that transaction flushes
-  the four maps before it deletes the old chains. At most 4096 mark chains are
+  with no live binding (see [Reload](#reload)). The kernel cannot update a
+  table's userdata, which records the fwmask, so that transaction
+  recreates the whole table (same secret, empty maps). That also drops
+  elements a failed element batch left behind: it rolls back the deletes
+  it carried, so the kernel may still hold elements the binding table
+  already dropped, jumping to an old mark chain that could otherwise never
+  be deleted (EBUSY). The transaction fails if the table is gone (deleted
+  by `omnidns -F`), so it never brings a table back. At most 4096 mark chains are
   installed, which bounds the transaction (a bootstrap is then about
   12000 messages and 2.1 MB, a reconcile replacing every chain 16000 and
   2.4 MB; the socket send buffer is 4 MB, doubled by the kernel, and must
   hold the whole transaction): a reload that would
   need more, counting the kept ones, is rejected rather than drop a chain
-  that may still be in use; a restart starts over with the configuration's
-  own marks. If the desired state (pools, fwmask, mark set) equals what
+  that may still be in use; a restart keeps only the configuration's own
+  marks and those of the fakes it takes over. If the desired state (pools, fwmask, mark set) equals what
   the last successful transaction installed, no transaction is sent. The
   cost is that a no-op reload no longer repairs rules someone edited
-  inside our chains; the next real change, or a restart, does. That repair
+  inside our chains; the next real change, or a restart, does (each policy
+  rule carries a tag of the state it was written for, and a restart
+  rewrites them unless all of them carry the right one). That repair
   was only ever partial: a deleted chain or table made every reconcile
   fail instead.
 - **Large transactions** stay one transaction each. Element lists (only
@@ -595,7 +660,8 @@ step succeeds does it replace the old one:
 
 On any failure, the previous configuration stays in effect and the reason
 goes to syslog. Live bindings and their map elements are never touched by a
-reload (an fwmask change, which needs none to be live, flushes the maps).
+reload (an fwmask change, which needs none to be live, recreates the table
+and with it the maps).
 A walk that latched a mark before an fwmask change and binds after it
 finds that mark's chain gone, so that query alone gets SERVFAIL.
 

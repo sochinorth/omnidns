@@ -91,16 +91,16 @@ Rule options (`config rule '<id>'`, evaluated in file order):
 - When a response is rewritten, its DNSSEC records are stripped.
 - With no IPv6 pool configured, AAAA under a fakeip verdict returns NODATA,
   so the real IPv6 address never leaks.
-- Allocation is deterministic per process run:
-  `hash(secret, rule, mark, name, real IP)`.
+- Allocation is deterministic: `hash(secret, rule, mark, name, real IP)`.
+  The secret is kept in the nftables table, so it survives restarts.
 - A binding stays alive until its TTL plus `fakeip_grace` (600 s) has passed.
   Established flows survive beyond that through conntrack.
 - Fake records get their TTL capped at `fakeip_ttl_max` (3600 s), and so do
   the bindings behind them.
 - A single answer yields at most 32 fakes.
 - Upstream TTLs of 2³¹ or more are treated as 0 (RFC 2181).
-- Bindings live in RAM only. On startup omnidns owns and recreates
-  `table inet omnidns`.
+- omnidns owns `table inet omnidns`. A restart keeps it and the fake IPs
+  clients hold (see below); a stop deletes it.
 - Reverse lookups (PTR) for fake addresses are answered locally.
 
 nftables sketch:
@@ -128,6 +128,28 @@ You provide the policy routing itself, e.g.
 - Rejects fake-pool or fwmask changes that would strand live bindings.
 - If anything fails, the previous config stays in effect and the error is
   logged to syslog.
+
+## Restart and stop
+
+- **Restart** (`/etc/init.d/omnidns restart`, a procd respawn after a
+  crash, an instance restart): the new daemon takes over the existing
+  table. Every fake a client may still hold keeps working, with its mark,
+  for `fakeip_ttl_max` + `fakeip_grace` (70 minutes by default), and a name
+  queried again gets the same fake back. Startup logs
+  `kept N fake IPs of the existing table`.
+- The table is recreated from scratch instead (all fakes lost, logged) when
+  it was made by another omnidns version, the `fwmask` changed while the
+  daemon was down, or it cannot be taken over. Fakes outside a changed pool
+  are dropped.
+- Fakes taken over count against `fakeip_max_bindings` until they expire
+  or a query takes them over again. If the table was nearly full, new
+  fake-IP names can get SERVFAIL for up to `fakeip_ttl_max` +
+  `fakeip_grace` after the restart.
+- **Stop** (`/etc/init.d/omnidns stop`, shutdown, package removal) runs
+  `omnidns -F`, which deletes the table and exits. The daemon itself never
+  deletes it on exit (unless started with `-x`, for tests). Use
+  `omnidns -F [-t table]` by hand to remove the table after killing the
+  daemon yourself.
 
 ## Deploying on OpenWrt
 
