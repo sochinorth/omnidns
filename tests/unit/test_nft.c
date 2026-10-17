@@ -9,6 +9,8 @@
 #include <linux/netfilter/nf_tables.h>
 #include <libmnl/libmnl.h>
 #include <libnftnl/set.h>
+#include <libnftnl/table.h>
+#include <libnftnl/rule.h>
 #include <libnftnl/common.h>
 #include <libubox/uloop.h>
 
@@ -1182,6 +1184,110 @@ TEST(adopt_mismatch_bootstraps)
 	free(el);
 }
 
+/* commit one table or rule message in a batch of its own; 0 or -errno */
+static int raw_commit(uint16_t type, uint16_t flags, struct nftnl_table *t, struct nftnl_rule *r)
+{
+	struct mnl_socket *nl = mnl_socket_open(NETLINK_NETFILTER);
+	char buf[8192];
+	struct mnl_nlmsg_batch *b = mnl_nlmsg_batch_start(buf, sizeof(buf));
+	struct nlmsghdr *nlh;
+	int err = -errno;
+	ssize_t len;
+
+	if (!nl)
+		return err;
+	mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID);
+	nftnl_batch_begin(mnl_nlmsg_batch_current(b), 1);
+	mnl_nlmsg_batch_next(b);
+	nlh = nftnl_nlmsg_build_hdr(mnl_nlmsg_batch_current(b), type, NFPROTO_INET,
+	                            flags | NLM_F_ACK, 2);
+	if (t)
+		nftnl_table_nlmsg_build_payload(nlh, t);
+	else
+		nftnl_rule_nlmsg_build_payload(nlh, r);
+	mnl_nlmsg_batch_next(b);
+	nftnl_batch_end(mnl_nlmsg_batch_current(b), 3);
+	mnl_nlmsg_batch_next(b);
+	err = 0;
+	if (mnl_socket_sendto(nl, mnl_nlmsg_batch_head(b), mnl_nlmsg_batch_size(b)) < 0 ||
+	    (len = mnl_socket_recvfrom(nl, buf, sizeof(buf))) < 0 ||
+	    mnl_cb_run(buf, (size_t)len, 0, 0, NULL, NULL) < 0)
+		err = -errno;
+	mnl_nlmsg_batch_stop(b);
+	mnl_socket_close(nl);
+	return err;
+}
+
+/* userdata TLVs (type, length, value) */
+static size_t tlv(uint8_t *p, uint8_t type, uint8_t len, const void *v, size_t vlen)
+{
+	p[0] = type;
+	p[1] = len;
+	memcpy(p + 2, v, vlen);
+	return 2 + vlen;
+}
+
+/*
+ * A userdata TLV claiming more bytes than the attribute holds is ignored,
+ * never read past (ASan): the table's (a secret cut short, a lone type
+ * byte), a rule's (a tag cut short).
+ */
+TEST(adopt_crafted_userdata)
+{
+	static const uint32_t m1[] = { 0x01000000 };
+	struct nft_desired d = desired(true, false, m1, 1);
+	uint32_t ver = NFT_LAYOUT_VERSION, mask = d.fwmask;
+	uint8_t got[NFT_SECRET_LEN], ud[64], *u;
+	struct nftnl_table *t;
+	struct nftnl_rule *r;
+	struct nft_elem *el;
+	uint32_t nel;
+	size_t len;
+	char *o;
+
+	len = tlv(ud, 0x80, 4, &ver, 4);
+	len += tlv(ud + len, 0x81, 4, &mask, 4);
+	for (int lone = 0; lone < 2; lone++) {
+		size_t l = len + (lone ? 0 : tlv(ud + len, 0x82, NFT_SECRET_LEN, secret_a, 3));
+
+		if (lone)
+			ud[l++] = 0x82;
+		free(sh("nft delete table inet " TABLE " 2>/dev/null"));
+		/* an exact-size copy, so that ASan sees a read past it */
+		u = malloc(l);
+		memcpy(u, ud, l);
+		t = nftnl_table_alloc();
+		nftnl_table_set_str(t, NFTNL_TABLE_NAME, TABLE);
+		nftnl_table_set_data(t, NFTNL_TABLE_USERDATA, u, (uint32_t)l);
+		REQUIRE(raw_commit(NFT_MSG_NEWTABLE, NLM_F_CREATE, t, NULL) == 0);
+		nftnl_table_free(t);
+		free(u);
+		CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	}
+
+	nft_set_secret(n, secret_a);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	r = nftnl_rule_alloc();
+	nftnl_rule_set_str(r, NFTNL_RULE_TABLE, TABLE);
+	nftnl_rule_set_str(r, NFTNL_RULE_CHAIN, "forward_reject");
+	len = tlv(ud, 0x80, 8, &ver, 2);
+	nftnl_rule_set_data(r, NFTNL_RULE_USERDATA, ud, (uint32_t)len);
+	REQUIRE(raw_commit(NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, NULL, r) == 0);
+	nftnl_rule_free(r);
+	{
+		struct nft_ctx *m;
+
+		REQUIRE(adopt(&d, 100, got, &el, &nel, &m) == 1);
+		free(el);
+		CHECK_EQ(nft_reconcile(m, &d), 0);	/* the rule was not ours */
+		nft_close(m);
+	}
+	o = list_table();
+	CHECK(has(o, "chain forward_reject {\n\t\ttype filter hook forward priority filter - 1; "
+	          "policy accept;\n\t\tip daddr 198.18.0.0/15 reject with icmp port-unreachable\n\t}"));
+	free(o);
+}
+
 /* ---- real packets in the netns ---- */
 
 static int tcp_connect(const char *dst, int port)
@@ -1594,6 +1700,7 @@ int main(int argc, char **argv)
 	RUN(adopt_dump);
 	RUN(adopt_reconcile_keeps_elements);
 	RUN(adopt_mismatch_bootstraps);
+	RUN(adopt_crafted_userdata);
 	RUN(wire_v4v6_all_marks);
 	RUN(wire_batch_max);
 	RUN(batch_buffers);

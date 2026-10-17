@@ -1069,39 +1069,35 @@ struct table_st {
 	uint8_t secret[NFT_SECRET_LEN];
 };
 
-static int table_ud_cb(const struct nftnl_udata *a, void *data)
+/*
+ * The value of the first TLV (type, length, value) of `type` and length
+ * `vlen` in libnftnl userdata, or NULL. Bounds-checked: nftnl_udata_parse()
+ * only checks where a TLV starts, and the kernel stores userdata as given.
+ */
+static const void *udata_get(const uint8_t *p, uint32_t len, uint8_t type, uint8_t vlen)
 {
-	struct table_st *st = data;
-	uint8_t len = nftnl_udata_len(a);
-
-	switch (nftnl_udata_type(a)) {
-	case UD_VERSION:
-		if (len == 4)
-			st->version = nftnl_udata_get_u32(a);
-		break;
-	case UD_FWMASK:
-		if (len == 4)
-			st->fwmask = nftnl_udata_get_u32(a);
-		break;
-	case UD_SECRET:
-		if (len == NFT_SECRET_LEN) {
-			memcpy(st->secret, nftnl_udata_get(a), NFT_SECRET_LEN);
-			st->has_secret = true;
-		}
-		break;
-	}
-	return MNL_CB_OK;
+	for (uint32_t off = 0; off + 2 <= len && off + 2 + p[off + 1] <= len; off += 2 + p[off + 1])
+		if (p[off] == type && p[off + 1] == vlen)
+			return p + off + 2;
+	return NULL;
 }
 
 static int table_cb(const struct nlmsghdr *nlh, void *priv)
 {
 	struct nftnl_table *t = oom(nftnl_table_alloc());
-	const void *u;
-	uint32_t len;
+	struct table_st *st = priv;
+	const void *u, *v;
+	uint32_t len = 0;
 	int r = nftnl_table_nlmsg_parse(nlh, t);
 
-	if (!r && (u = nftnl_table_get_data(t, NFTNL_TABLE_USERDATA, &len)))
-		nftnl_udata_parse(u, len, table_ud_cb, priv);
+	u = r ? NULL : nftnl_table_get_data(t, NFTNL_TABLE_USERDATA, &len);
+	if ((v = udata_get(u, len, UD_VERSION, 4)))
+		memcpy(&st->version, v, 4);
+	if ((v = udata_get(u, len, UD_FWMASK, 4)))
+		memcpy(&st->fwmask, v, 4);
+	if ((v = udata_get(u, len, UD_SECRET, NFT_SECRET_LEN)))
+		memcpy(st->secret, v, NFT_SECRET_LEN);
+	st->has_secret = v;
 	nftnl_table_free(t);
 	errno = EPROTO;
 	return r ? MNL_CB_ERROR : MNL_CB_OK;
@@ -1168,33 +1164,18 @@ struct rule_st {
 	bool bad;
 };
 
-static int rule_ud_cb(const struct nftnl_udata *a, void *data)
-{
-	struct rule_st *st = data;
-	uint64_t tag;
-
-	if (nftnl_udata_type(a) == UD_TAG && nftnl_udata_len(a) == sizeof(tag)) {
-		memcpy(&tag, nftnl_udata_get(a), sizeof(tag));
-		if (tag == st->tag)
-			st->bad = false;
-	}
-	return MNL_CB_OK;
-}
-
 static int rule_cb(const struct nlmsghdr *nlh, void *priv)
 {
 	struct nftnl_rule *r = oom(nftnl_rule_alloc());
 	struct rule_st *st = priv;
-	bool bad = st->bad;
-	const void *u;
-	uint32_t len;
+	const void *u = NULL, *tag;
+	uint32_t len = 0;
 
 	st->n++;
-	st->bad = true;		/* unless this rule carries the tag */
-	if (nftnl_rule_nlmsg_parse(nlh, r) >= 0 &&
-	    (u = nftnl_rule_get_data(r, NFTNL_RULE_USERDATA, &len)))
-		nftnl_udata_parse(u, len, rule_ud_cb, st);
-	st->bad |= bad;
+	if (nftnl_rule_nlmsg_parse(nlh, r) >= 0)
+		u = nftnl_rule_get_data(r, NFTNL_RULE_USERDATA, &len);
+	tag = udata_get(u, len, UD_TAG, sizeof(st->tag));
+	st->bad |= !tag || memcmp(tag, &st->tag, sizeof(st->tag));
 	nftnl_rule_free(r);
 	return MNL_CB_OK;
 }
