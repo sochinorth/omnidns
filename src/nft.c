@@ -257,6 +257,16 @@ static const struct {
 	{ "output_reject", "filter", NF_INET_LOCAL_OUT, NF_IP_PRI_FILTER - 1 },
 };
 
+/* i of fixed_chains[i] named `name`, else NFIXED */
+static int fixed_index(const char *name)
+{
+	int i = 0;
+
+	while (i < NFIXED && strcmp(name, fixed_chains[i].name))
+		i++;
+	return i;
+}
+
 static void txn_fixed_chain(struct nft_ctx *n, struct txn *t, int i)
 {
 	struct nftnl_chain *c = chain_new(n, fixed_chains[i].name);
@@ -270,13 +280,20 @@ static void txn_fixed_chain(struct nft_ctx *n, struct txn *t, int i)
 	txn_chain(n, t, NFT_MSG_NEWCHAIN, c);
 }
 
-static void txn_flush_chain(struct nft_ctx *n, struct txn *t, const char *chain)
+static struct nftnl_rule *rule_new(struct nft_ctx *n, const char *chain)
 {
 	struct nftnl_rule *r = oom(nftnl_rule_alloc());
-	struct nlmsghdr *nlh;
 
 	nftnl_rule_set_str(r, NFTNL_RULE_TABLE, n->table);
 	nftnl_rule_set_str(r, NFTNL_RULE_CHAIN, chain);
+	return r;
+}
+
+static void txn_flush_chain(struct nft_ctx *n, struct txn *t, const char *chain)
+{
+	struct nftnl_rule *r = rule_new(n, chain);
+	struct nlmsghdr *nlh;
+
 	nlh = txn_msg(n, t, NFT_MSG_DELRULE, 0, 1024);
 	nftnl_rule_nlmsg_build_payload(nlh, r);
 	nbuf_commit(&t->b, nlh);
@@ -292,27 +309,7 @@ static void txn_set(struct nft_ctx *n, struct txn *t, struct nftnl_set *s)
 	nbuf_commit(&t->b, nlh);
 }
 
-static void txn_elems(struct nft_ctx *n, struct txn *t, int type,
-                      struct nftnl_set *s, uint32_t nelem)
-{
-	struct nlmsghdr *nlh;
-
-	nlh = txn_msg(n, t, type, type == NFT_MSG_NEWSETELEM ? NLM_F_CREATE : 0,
-	              1024 + (size_t)nelem * 160);
-	nftnl_set_elems_nlmsg_build_payload(nlh, s);
-	nbuf_commit(&t->b, nlh);
-}
-
 /* ---- rule expressions ---- */
-
-static struct nftnl_rule *rule_new(struct nft_ctx *n, const char *chain)
-{
-	struct nftnl_rule *r = oom(nftnl_rule_alloc());
-
-	nftnl_rule_set_str(r, NFTNL_RULE_TABLE, n->table);
-	nftnl_rule_set_str(r, NFTNL_RULE_CHAIN, chain);
-	return r;
-}
 
 static void txn_rule(struct nft_ctx *n, struct txn *t, struct nftnl_rule *r, uint64_t tag)
 {
@@ -462,6 +459,7 @@ static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
 	struct nftnl_set *s = oom(nftnl_set_alloc());
 	uint32_t id = ++n->set_id, zero = 0;
 	struct nftnl_rule *r;
+	struct nlmsghdr *nlh;
 	char name[32];
 
 	if (!id)
@@ -497,7 +495,9 @@ static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
 			nftnl_set_elem_set_str(e, NFTNL_SET_ELEM_CHAIN, name);
 			nftnl_set_elem_add(s, e);
 		}
-		txn_elems(n, t, NFT_MSG_NEWSETELEM, s, CHUNK_MAX);
+		nlh = txn_msg(n, t, NFT_MSG_NEWSETELEM, NLM_F_CREATE, 1024 + CHUNK_MAX * 160);
+		nftnl_set_elems_nlmsg_build_payload(nlh, s);
+		nbuf_commit(&t->b, nlh);
 		nftnl_set_free(s);
 	}
 
@@ -943,23 +943,29 @@ static void txn_create(struct nft_ctx *n, struct txn *t, const struct shadow *s,
 	txn_end(n, t);
 }
 
+/* s (taken over) becomes the shadow state, with the chains to rewrite */
+static void state_set(struct nft_ctx *n, struct shadow *s, bool stale, uint32_t *dirty,
+                      uint32_t ndirty)
+{
+	shadow_free(&n->sh);
+	n->sh = *s;
+	n->have_state = true;
+	n->stale = stale;
+	free(n->dirty);
+	n->dirty = dirty;
+	n->ndirty = ndirty;
+}
+
 /* Commit t; on success s becomes the shadow state, else it is freed. */
 static int ctl_apply(struct nft_ctx *n, struct txn *t, struct shadow *s, const char *what)
 {
 	int err = ctl_commit(n, t, what);
 
-	if (err) {
+	if (err)
 		shadow_free(s);
-		return err;
-	}
-	shadow_free(&n->sh);
-	n->sh = *s;
-	n->have_state = true;
-	n->stale = false;
-	free(n->dirty);
-	n->dirty = NULL;
-	n->ndirty = 0;
-	return 0;
+	else
+		state_set(n, s, false, NULL, 0);
+	return err;
 }
 
 void nft_set_secret(struct nft_ctx *n, const uint8_t secret[NFT_SECRET_LEN])
@@ -1153,7 +1159,7 @@ static bool parse_mark_chain(const char *name, uint32_t fwmask, uint32_t *v)
 	char buf[32];
 	unsigned long x;
 
-	if (strncmp(name, "mark_", 5) || strlen(name) != 13)
+	if (strncmp(name, "mark_", 5))
 		return false;
 	x = strtoul(name + 5, NULL, 16);
 	mark_chain_name(buf, (uint32_t)x);
@@ -1173,7 +1179,7 @@ static int chain_cb(const struct nlmsghdr *nlh, void *priv)
 	struct nftnl_chain *c = oom(nftnl_chain_alloc());
 	struct readback *rb = priv;
 	const char *name, *table, *type;
-	int r = MNL_CB_ERROR;
+	int r = MNL_CB_ERROR, i;
 	bool base;
 	uint32_t v;
 
@@ -1191,9 +1197,7 @@ static int chain_cb(const struct nlmsghdr *nlh, void *priv)
 	}
 	base = nftnl_chain_is_set(c, NFTNL_CHAIN_HOOKNUM);
 	type = nftnl_chain_get_str(c, NFTNL_CHAIN_TYPE);
-	for (int i = 0; i < NFIXED; i++) {
-		if (strcmp(name, fixed_chains[i].name))
-			continue;
+	if ((i = fixed_index(name)) < NFIXED) {
 		rb->fixed |= 1u << i;
 		rb->unusable |= fixed_chains[i].type ? !base || !type ||
 		        strcmp(type, fixed_chains[i].type) ||
@@ -1260,9 +1264,7 @@ static int rule_cb(const struct nlmsghdr *nlh, void *priv)
 	}
 	if (!(chain = nftnl_rule_get_str(r, NFTNL_RULE_CHAIN)))
 		goto out;
-	for (i = 0; i < NFIXED && strcmp(chain, fixed_chains[i].name); i++)
-		;
-	if (i < NFIXED) {
+	if ((i = (uint32_t)fixed_index(chain)) < NFIXED) {
 		fixed_rules(&rb->s, (int)i, rb->ptag, &tag);
 	} else if (parse_mark_chain(chain, rb->s.fwmask, &v) &&
 	           (m = bsearch(&v, rb->s.marks, rb->s.nmarks, sizeof(v), cmp_u32))) {
@@ -1484,14 +1486,8 @@ static int adopt_read(struct nft_ctx *n, const struct nft_desired *d, uint32_t m
 	*nelems = pair_elems(rb.v[0], rb.nv[0], rb.v[1], rb.nv[1], out);
 	*elems = out;
 
-	shadow_free(&n->sh);
-	n->sh = rb.s;
-	n->sh.marks = oom(realloc(rb.s.marks, nr * sizeof(uint32_t)));
-	n->have_state = true;
-	n->stale = rb.stale;
-	free(n->dirty);
-	n->dirty = dirty;
-	n->ndirty = ndirty;
+	rb.s.marks = oom(realloc(rb.s.marks, nr * sizeof(uint32_t)));
+	state_set(n, &rb.s, rb.stale, dirty, ndirty);
 	memcpy(n->secret, rb.secret, NFT_SECRET_LEN);
 	memcpy(secret, rb.secret, NFT_SECRET_LEN);
 	log_info("nft: adopting table %s: %u map elements, %u mark chains (%u to rewrite)%s",
