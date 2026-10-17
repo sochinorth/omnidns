@@ -1262,6 +1262,180 @@ TEST(build_reuse)
 	dns_msg_free(&big);
 }
 
+/* ---- randomized messages ---- */
+
+static uint32_t rnd_state;
+
+static uint32_t rnd(uint32_t n)
+{
+	rnd_state ^= rnd_state << 13;
+	rnd_state ^= rnd_state >> 17;
+	rnd_state ^= rnd_state << 5;
+	return n ? rnd_state % n : rnd_state;
+}
+
+/* A name from a small vocabulary in mixed case, so that names share
+ * suffixes (and differ only by case) often: compression gets exercised. */
+static uint8_t rnd_name(uint8_t *out)
+{
+	static const char *const labs[] = {
+		"www", "WWW", "example", "Example", "EXAMPLE", "cdn", "a", "mail", "svc",
+		"com", "org", "Org", "x1", "ns", "edge",
+		"a-long-label-to-fill-names-with-0123456789-abcdefghijklmnopqrst",
+	};
+	int nl = (int)rnd(5), i;
+	uint8_t n = 0;
+
+	if (rnd(4) == 0)
+		nl += (int)rnd(4);
+	for (i = 0; i < nl; i++) {
+		const char *l = labs[rnd(sizeof(labs) / sizeof(labs[0]))];
+		size_t len = strlen(l);
+
+		if (n + 1 + len + 1 > DNS_MAX_NAME)
+			break;
+		out[n++] = (uint8_t)len;
+		memcpy(out + n, l, len);
+		n += (uint8_t)len;
+	}
+	out[n++] = 0;
+	return n;
+}
+
+/* Fill m with a random message (records in section order, valid rdata). */
+static void rnd_msg(struct dns_msg *m)
+{
+	static const uint16_t types[] = {
+		DNS_T_A, DNS_T_AAAA, DNS_T_CNAME, DNS_T_NS, DNS_T_PTR, DNS_T_MX, DNS_T_SOA,
+		DNS_T_TXT, DNS_T_DNAME, DNS_T_SRV, DNS_T_HTTPS, DNS_T_RRSIG, 3, 4, 7, 8, 9, 14,
+	};
+	uint8_t owner[DNS_MAX_NAME], rd[8192];
+	int nrr = (int)rnd(12), i, sec = DNS_S_AN;
+
+	dns_msg_init(m);
+	m->id = (uint16_t)rnd(0);
+	m->flags = (uint16_t)rnd(0);
+	if (rnd(10)) {
+		uint8_t q[DNS_MAX_NAME], ql = rnd_name(q);
+
+		dns_msg_set_question(m, q, ql, (uint16_t)rnd(70), rnd(8) ? DNS_C_IN : (uint16_t)rnd(0));
+	}
+	if (rnd(3) == 0) {
+		m->edns.present = true;
+		m->edns.udp_size = (uint16_t)rnd(0);
+		m->edns.ext_rcode = (uint8_t)rnd(0);
+		m->edns.version = (uint8_t)rnd(2);
+		m->edns.do_bit = rnd(2);
+	}
+	if (rnd(8) == 0)
+		nrr += (int)rnd(400);
+	for (i = 0; i < nrr; i++) {
+		uint16_t type = types[rnd(sizeof(types) / sizeof(types[0]))], n = 0;
+		uint8_t ol = rnd_name(owner);
+		uint32_t k;
+
+		if (rnd(6) == 0 && sec < DNS_S_AR)
+			sec++;
+		switch (type) {
+		case DNS_T_A: case DNS_T_AAAA:
+			n = type == DNS_T_A ? 4 : 16;
+			for (k = 0; k < n; k++)
+				rd[k] = (uint8_t)rnd(0);
+			break;
+		case DNS_T_MX:
+			rd[0] = 0;
+			rd[1] = (uint8_t)rnd(0);
+			n = 2 + rnd_name(rd + 2);
+			break;
+		case DNS_T_SRV:
+			memset(rd, 1, 6);
+			n = 6 + rnd_name(rd + 6);
+			break;
+		case DNS_T_SOA: case 14:
+			n = rnd_name(rd);
+			n += rnd_name(rd + n);
+			if (type == DNS_T_SOA) {
+				for (k = 0; k < 20; k++)
+					rd[n++] = (uint8_t)rnd(0);
+			}
+			break;
+		case DNS_T_TXT: case DNS_T_HTTPS: case DNS_T_RRSIG:
+			n = (uint16_t)rnd(rnd(10) ? 300 : sizeof(rd));
+			for (k = 0; k < n; k++)
+				rd[k] = (uint8_t)rnd(0);
+			if (type == DNS_T_HTTPS && n >= 3) {
+				uint8_t t[DNS_MAX_NAME], tl = rnd_name(t);
+
+				if (2u + tl <= n)
+					memcpy(rd + 2, t, tl);
+			}
+			break;
+		default:	/* one name */
+			n = rnd_name(rd);
+			break;
+		}
+		if (dns_msg_add_rr(m, (enum dns_section)sec, owner, ol, type,
+		                   rnd(10) ? DNS_C_IN : (uint16_t)rnd(0), rnd(0), rd, n))
+			abort();
+	}
+}
+
+/* Build m at sizes from too small for the question to 64 KiB; hash it all. */
+static uint64_t rnd_builds(const struct dns_msg *m)
+{
+	static const size_t limits[] = { 12, 40, 100, 512, 1232, 4096, 20000, DNS_MAX_MSG };
+	static uint8_t out[DNS_MAX_MSG];
+	uint64_t h = 1469598103934665603ull;
+	size_t li, k;
+
+	for (li = 0; li < sizeof(limits) / sizeof(limits[0]); li++) {
+		int n = dns_build(m, out, limits[li]);
+		uint8_t rc[4] = { (uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n };
+
+		for (k = 0; k < 4; k++)
+			h = (h ^ rc[k]) * 1099511628211ull;
+		for (k = 0; n > 0 && k < (size_t)n; k++)
+			h = (h ^ out[k]) * 1099511628211ull;
+	}
+	return h;
+}
+
+#define RND_MSGS 600
+
+/*
+ * dns_build() of random messages at every size limit, byte for byte as
+ * recorded (build_golden.inc, FNV-1a 64 per message over the results of
+ * all limits) from the build before the streaming builder replaced it.
+ * WIRE_GOLDEN_RECORD=<file> writes the table anew instead.
+ */
+TEST(build_golden)
+{
+	static const uint64_t golden[] = {
+#include "build_golden.inc"
+	};
+	FILE *rec = getenv("WIRE_GOLDEN_RECORD") ? fopen(getenv("WIRE_GOLDEN_RECORD"), "w") : NULL;
+	struct dns_msg m;
+	int i, bad = 0;
+
+	if (!rec)
+		REQUIRE(sizeof(golden) / sizeof(golden[0]) == RND_MSGS);
+	rnd_state = 0x9e3779b9u;
+	for (i = 0; i < RND_MSGS; i++) {
+		uint64_t h;
+
+		rnd_msg(&m);
+		h = rnd_builds(&m);
+		if (rec)
+			fprintf(rec, "0x%016" PRIx64 "ull,\n", h);
+		else if (h != golden[i] && bad++ < 5)
+			fprintf(stderr, "  random message %d: built bytes differ\n", i);
+		dns_msg_free(&m);
+	}
+	if (rec)
+		fclose(rec);
+	CHECK_EQ(bad, 0);
+}
+
 int main(void)
 {
 	uint8_t key[16] = { 1, 2, 3 };
@@ -1292,5 +1466,6 @@ int main(void)
 	RUN(growth_rebase);
 	RUN(rcode_and_types);
 	RUN(build_reuse);
+	RUN(build_golden);
 	return test_summary();
 }

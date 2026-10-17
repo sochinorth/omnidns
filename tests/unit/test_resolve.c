@@ -26,6 +26,72 @@
 #define TABLE "omnitest_resolve"
 #define HOLD 1		/* script err: never answer */
 
+/*
+ * ---- golden answers ----
+ *
+ * Every answer the resolver hands to its callback, and the stored bytes of
+ * every cache hit, as the tests below produce them, pinned byte for byte
+ * (length and FNV-1a 64) in resolve_golden.inc: what assembly and
+ * serialization write is fixed for every path these tests exercise.
+ * RESOLVE_GOLDEN_RECORD=<file> writes the table anew instead of checking.
+ */
+struct gold {
+	const char *test;
+	uint16_t seq;			/* within the test */
+	char kind;			/* 'a' answer delivered, 'h' cache hit */
+	uint32_t len;
+	uint64_t fnv;
+};
+
+static const struct gold golden[] = {
+#include "resolve_golden.inc"
+	{ NULL, 0, 0, 0, 0 }
+};
+
+static const char *gold_test;
+static uint16_t gold_seq;
+static size_t gold_seen;
+static FILE *gold_rec;
+
+static uint64_t fnv64(const uint8_t *p, size_t n)
+{
+	uint64_t h = 1469598103934665603ull;
+
+	while (n--)
+		h = (h ^ *p++) * 1099511628211ull;
+	return h;
+}
+
+static void gold_note(char kind, const uint8_t *msg, size_t len)
+{
+	uint16_t seq = gold_seq++;
+	uint64_t h = fnv64(msg, len);
+	const struct gold *g;
+
+	if (gold_rec) {
+		fprintf(gold_rec, "{ \"%s\", %u, '%c', %zu, 0x%016" PRIx64 "ull },\n",
+		        gold_test, seq, kind, len, h);
+		return;
+	}
+	for (g = golden; g->test; g++)
+		if (g->seq == seq && !strcmp(g->test, gold_test))
+			break;
+	if (g->test)
+		gold_seen++;
+	if (!g->test || g->kind != kind || g->len != len || g->fnv != h) {
+		fprintf(stderr, "  golden: %s #%u (%c, %zu bytes) is not the recorded answer "
+		        "(%c, %u bytes)\n", gold_test, seq, kind, len, g->test ? g->kind : '-',
+		        g->test ? g->len : 0);
+		test_cur_failed = 1;
+	}
+}
+
+#define RUNG(name) do {							\
+	gold_test = #name;						\
+	gold_seq = 0;							\
+	RUN(name);							\
+} while (0)
+
 /* ---- scripted upstream stub ---- */
 
 struct script {
@@ -57,7 +123,7 @@ static void S(const char *srv, const char *qname, uint16_t qtype, int rcode, con
 	struct script *s = &scripts[nscripts++];
 
 	snprintf(s->srv, sizeof(s->srv), "%s", srv);
-	snprintf(s->qname, sizeof(s->qname), "%s", qname);
+	snprintf(s->qname, sizeof(s->qname), "%.255s", qname);
 	s->qtype = qtype;
 	s->rcode = rcode;
 	s->err = 0;
@@ -152,7 +218,7 @@ static void build_rrs(struct dns_msg *m, const char *text)
 
 	for (line = strtok_r(copy, ";", &s1); line; line = strtok_r(NULL, ";", &s1)) {
 		char *s2, *sec = strtok_r(line, " ", &s2), *owner, *type, *a;
-		uint8_t rd[2048];
+		static uint8_t rd[8192];
 		uint16_t n = 0, t;
 		struct dns_name on, x;
 		uint32_t ttl;
@@ -210,6 +276,13 @@ static void build_rrs(struct dns_msg *m, const char *text)
 			if (a)
 				put16(rd, !strcmp(a, "DNAME") ? DNS_T_DNAME : DNS_T_A);
 			n = 24;
+		} else if (!strcmp(type, "RAW")) {	/* "RAW type len": opaque bytes */
+			int k;
+
+			t = (uint16_t)atoi(a);
+			n = (uint16_t)atoi(strtok_r(NULL, " ", &s2));
+			for (k = 0; k < n; k++)
+				rd[k] = (uint8_t)(k * 7 + n);
 		} else {
 			fprintf(stderr, "bad type %s\n", type);
 			abort();
@@ -435,6 +508,7 @@ static void take(const uint8_t *msg, size_t len, uint32_t age)
 
 static void res_cb(void *ctx, const uint8_t *msg, size_t len)
 {
+	gold_note('a', msg, len);
 	ncb++;
 	cur = NULL;
 	take(msg, len, 0);
@@ -488,6 +562,7 @@ static bool hit(const char *qname, uint16_t qtype)
 	dns_msg_free(&q);
 	if (r)
 		return false;
+	gold_note('h', h.msg, h.len);
 	ncb = 1;
 	qlog[0] = 0;
 	nqueries = 0;
@@ -1748,6 +1823,7 @@ static void pending_cb(void *ctx, const uint8_t *msg, size_t len)
 {
 	struct pending *p = ctx;
 
+	gold_note('a', msg, len);
 	p->ncb++;
 	if (dns_parse(&p->m, msg, len))
 		dns_msg_reset(&p->m);
@@ -1835,6 +1911,188 @@ TEST(u_fwmask_change_in_flight)
 	dns_msg_free(&fresh.m);
 }
 
+/* ---- answers pinned by the golden table only ---- */
+
+/*
+ * Records for a TXT answer at `owner` whose serialization (base bytes before
+ * the first TXT record, each owner a 2-byte pointer) totals `total` bytes,
+ * followed by `nar` glue A records of `glue_owner` (16 bytes each).
+ */
+static void big_rrs(char *buf, size_t cap, const char *owner, size_t base, size_t total,
+                    int nar, const char *glue_owner)
+{
+	size_t rest = total - base - 16 * (size_t)nar, w = 0;
+	int i;
+
+	for (; rest > 2 * (12 + 4000); rest -= 12 + 4000)
+		w += (size_t)snprintf(buf + w, cap - w, "an %s 300 RAW 16 4000;", owner);
+	w += (size_t)snprintf(buf + w, cap - w, "an %s 300 RAW 16 %zu;", owner, rest - 12);
+	for (i = 0; i < nar; i++)
+		w += (size_t)snprintf(buf + w, cap - w, "ar %s 300 A 10.2.0.%d;", glue_owner, i);
+}
+
+/* run qname twice: answered, then from the cache */
+static bool run2(const char *qname, uint16_t qtype)
+{
+	return run(qname, qtype) && run(qname, qtype) && no_queries();
+}
+
+/*
+ * Paths the other tests do not reach, here for the golden table: answers at
+ * and past 64 KiB (each kind of cut, passed through and assembled), the
+ * record cap, DNSSEC records stripped and kept, mixed case compressing into
+ * the question, synthesized DNAME aliases, rewritten and dropped SVCB
+ * records, and answers held while other requests build (waiting for nft,
+ * or deferred out of resolve_start()).
+ */
+TEST(zz_golden_paths)
+{
+	static char rr[20][40000], name[20][64];
+	static const size_t totals[] = { 65534, 65535, 65536 };
+	struct pending p[4];
+	size_t i;
+	int k, n = 0;
+
+	setup(CFG_V6);
+
+	/* passed through: AN at the limit (TC past it), then AR cut there */
+	for (i = 0; i < 3; i++, n++) {
+		snprintf(name[n], sizeof(name[n]), "t%02d.pt.example", n);
+		big_rrs(rr[n], sizeof(rr[n]), name[n], 32, totals[i], 0, NULL);
+		S("10.0.0.1", name[n], DNS_T_TXT, 0, rr[n]);
+		REQUIRE(run2(name[n], DNS_T_TXT));
+		CHECK_EQ(!!(res.flags & DNS_F_TC), totals[i] > DNS_MAX_MSG);
+		CHECK_EQ(res_len, totals[i] > DNS_MAX_MSG ? 32 : (int)totals[i]);
+	}
+	for (i = 0; i < 3; i++, n++) {
+		snprintf(name[n], sizeof(name[n]), "t%02d.pt.example", n);
+		big_rrs(rr[n], sizeof(rr[n]), name[n], 32, totals[i] + 1, 3, name[n]);
+		S("10.0.0.1", name[n], DNS_T_TXT, 0, rr[n]);
+		REQUIRE(run2(name[n], DNS_T_TXT));
+		CHECK(!(res.flags & DNS_F_TC));
+		CHECK_EQ(count(DNS_S_AR), totals[i] < DNS_MAX_MSG ? 3 : 2);
+	}
+	/* assembled (an alias answered by another upstream): the same cuts */
+	for (i = 0; i < 6; i++, n++) {
+		char target[64];
+
+		snprintf(name[n], sizeof(name[n]), "a%02d.pt.example", n);
+		snprintf(target, sizeof(target), "b%02d.fwd2.example", n);
+		snprintf(rr[n], sizeof(rr[n]), "an %s 300 CNAME %s", name[n], target);
+		S("10.0.0.1", name[n], DNS_T_TXT, 0, rr[n]);
+		n++;
+		snprintf(name[n], sizeof(name[n]), "%s", target);
+		big_rrs(rr[n], sizeof(rr[n]), target, 55, totals[i % 3] + (i < 3 ? 0 : 1),
+		        i < 3 ? 0 : 3, target);
+		S("10.0.0.2", target, DNS_T_TXT, 0, rr[n]);
+		REQUIRE(run2(name[n - 1], DNS_T_TXT));
+		if (i < 3) {
+			CHECK_EQ(!!(res.flags & DNS_F_TC), totals[i] > DNS_MAX_MSG);
+			CHECK_EQ(res_len, totals[i] > DNS_MAX_MSG ? 32 : (int)totals[i]);
+		} else {
+			CHECK(!(res.flags & DNS_F_TC));
+			CHECK_EQ(count(DNS_S_AR), totals[i % 3] < DNS_MAX_MSG ? 3 : 2);
+		}
+	}
+
+	/* the record cap: an alias plus 511 records fits, plus 512 does not */
+	setup(CFG_V6);
+	for (k = 511; k <= 512; k++) {
+		char q[64], t[64];
+		size_t w = 0;
+		int j;
+
+		snprintf(q, sizeof(q), "cap%d.pt.example", k);
+		snprintf(t, sizeof(t), "cap%d.fwd2.example", k);
+		snprintf(rr[0], sizeof(rr[0]), "an %s 300 CNAME %s", q, t);
+		for (j = 0; j < k; j++)
+			w += (size_t)snprintf(rr[1 + k - 511] + w, sizeof(rr[1]) - w,
+			                      "an %s 300 A 10.3.%d.%d;", t, j / 256, j % 256);
+		S("10.0.0.1", q, DNS_T_A, 0, rr[0]);
+		S("10.0.0.2", t, DNS_T_A, 0, rr[1 + k - 511]);
+		REQUIRE(run(q, DNS_T_A));
+		CHECK_EQ(rcode(), k == 511 ? DNS_R_NOERROR : DNS_R_SERVFAIL);
+		setup(CFG_V6);
+	}
+
+	/* rewritten: RRSIG, NSEC, NSEC3, DS stripped; kept in a negative answer */
+	S("10.0.0.2", "sig.vpn.example", DNS_T_A, 0,
+	  "an sig.vpn.example 300 A 1.2.3.4;an sig.vpn.example 300 RRSIG;"
+	  "ns vpn.example 300 SOA 60;ns vpn.example 300 RAW 47 12;ns vpn.example 300 RAW 43 8;"
+	  "ns vpn.example 300 RAW 50 9;ns vpn.example 300 RRSIG;ar ns.vpn.example 300 RAW 16 5");
+	REQUIRE(run2("sig.vpn.example", DNS_T_A));
+	CHECK_EQ(count(DNS_S_NS), 1);
+	S("10.0.0.1", "n.pt.example", DNS_T_A, 0, "an n.pt.example 300 CNAME n.fwd2.example");
+	S("10.0.0.2", "n.fwd2.example", DNS_T_A, DNS_R_NXDOMAIN,
+	  "ns fwd2.example 900 SOA 100;ns fwd2.example 900 RAW 47 10;ns fwd2.example 900 RRSIG;"
+	  "ar ns.fwd2.example 900 A 3.3.3.3;ar ns.vpn.example 900 A 3.3.3.4");
+	REQUIRE(run2("n.pt.example", DNS_T_A));
+	CHECK_EQ(count(DNS_S_NS), 3);
+	CHECK_EQ(count(DNS_S_AR), 1);
+
+	/* mixed case: owners and rdata names compress into the client's question */
+	S("10.0.0.1", "mix.pt.example", DNS_T_A, 0,
+	  "an mix.pt.example 300 CNAME Sub.MIX.pt.example;an sub.mix.pt.example 300 A 1.1.1.1;"
+	  "ns PT.example 300 SOA 60;ar ns.pt.example 60 A 2.2.2.2");
+	REQUIRE(run2("MiX.Pt.ExAmPlE", DNS_T_A));
+	S("10.0.0.1", "mx.pt.example", DNS_T_MX, 0,
+	  "an mx.pt.example 300 MX 10 MAIL.mx.pt.example;an mx.pt.example 300 MX 20 mail.MX.pt.example;"
+	  "ar mail.mx.pt.example 300 A 1.2.3.4;ar mail.mx.pt.example 300 AAAA 2001:db8::1");
+	REQUIRE(run2("mX.pT.example", DNS_T_MX));
+	S("10.0.0.1", "asm.pt.example", DNS_T_A, 0, "an asm.pt.example 300 CNAME AsM.FWD2.example");
+	S("10.0.0.2", "asm.fwd2.example", DNS_T_A, 0,
+	  "an asm.fwd2.example 300 A 1.1.1.1;ns fwd2.example 300 SOA 5;"
+	  "ar ns.FWD2.example 300 A 1.1.1.2");
+	REQUIRE(run2("AsM.Pt.Example", DNS_T_A));
+	/* DNAME: the synthesized alias keeps the client's case */
+	S("10.0.0.1", "www.dnm.pt.example", DNS_T_A, 0, "an dnm.pt.example 900 DNAME Tgt.Pt.Example");
+	S("10.0.0.1", "www.tgt.pt.example", DNS_T_A, 0, "an www.tgt.pt.example 300 A 7.7.7.7");
+	REQUIRE(run2("WwW.DnM.Pt.Example", DNS_T_A));
+	CHECK_EQ(count(DNS_S_AN), 3);
+	/* synthesized SOA under a mixed-case question */
+	REQUIRE(run2("X.Ads.Example", DNS_T_A));
+	REQUIRE(run2("y.ADS.example", DNS_T_TXT));
+
+	/* SVCB: hints rewritten under a mixed-case owner; a blocked target dropped */
+	S("10.0.0.2", "svc.vpn.example", DNS_T_HTTPS, 0,
+	  "an svc.vpn.example 300 HTTPS 1 . alpn=h2 ipv4hint=1.2.3.4,1.2.3.5;"
+	  "an svc.vpn.example 300 HTTPS 2 Alt.Svc.Vpn.example ipv4hint=5.6.7.8 ipv6hint=2001:db8::7;"
+	  "an svc.vpn.example 300 RRSIG;ns vpn.example 300 RRSIG;ar alt.svc.vpn.example 300 A 5.6.7.8");
+	REQUIRE(run2("Svc.Vpn.Example", DNS_T_HTTPS));
+	CHECK_EQ(count(DNS_S_AN), 2);
+	S("10.0.0.1", "h.pt.example", DNS_T_HTTPS, 0,
+	  "an h.pt.example 300 HTTPS 1 x.ads.example alpn=h2;an h.pt.example 300 HTTPS 2 . alpn=h3;"
+	  "ns pt.example 300 RAW 43 8;ns pt.example 300 RRSIG;ar h.pt.example 300 RAW 16 3");
+	REQUIRE(run2("h.pt.example", DNS_T_HTTPS));
+	CHECK_EQ(count(DNS_S_AN), 1);
+	CHECK_EQ(count(DNS_S_NS), 0);
+
+	/* held answers: two walks waiting for nft at once, then answers deferred
+	 * out of resolve_start() (block, ANY, fake PTR) while others start */
+	memset(p, 0, sizeof(p));
+	for (k = 0; k < 4; k++)
+		dns_msg_init(&p[k].m);
+	npending = 0;
+	S("10.0.0.2", "p1.vpn.example", DNS_T_A, 0, "an p1.vpn.example 300 A 1.2.3.4");
+	S("10.0.0.2", "p2.vpn.example", DNS_T_A, 0,
+	  "an p2.vpn.example 300 CNAME q2.vpn.example;an q2.vpn.example 200 A 1.2.3.5;"
+	  "an q2.vpn.example 200 A 1.2.3.6");
+	REQUIRE(start_pending("p1.vpn.example", &p[0]));
+	REQUIRE(start_pending("p2.vpn.example", &p[1]));
+	run_loop(3000);
+	CHECK_EQ(p[0].ncb + p[1].ncb, 2);
+	CHECK_EQ(p[0].m.nrr, 1);
+	CHECK_EQ(p[1].m.nrr, 3);
+	REQUIRE(start_pending("b1.ads.example", &p[2]));
+	REQUIRE(start_pending("Bee2.Ads.example", &p[3]));
+	run_loop(3000);
+	CHECK_EQ(p[2].ncb + p[3].ncb, 2);
+	CHECK(p[3].m.qlen == N("Bee2.Ads.example").len &&
+	      !memcmp(dns_msg_qname(&p[3].m), N("Bee2.Ads.example").data, p[3].m.qlen));
+	for (k = 0; k < 4; k++)
+		dns_msg_free(&p[k].m);
+}
+
 static int rm_cb(const char *p, const struct stat *st, int flag, struct FTW *f)
 {
 	return remove(p);
@@ -1866,38 +2124,53 @@ int main(int argc, char **argv)
 	}
 	o.nft = nft;
 	dns_msg_init(&res);
+	if (getenv("RESOLVE_GOLDEN_RECORD")) {
+		gold_rec = fopen(getenv("RESOLVE_GOLDEN_RECORD"), "w");
+		if (!gold_rec)
+			return 1;
+		fprintf(gold_rec, "/* Recorded by test_resolve (RESOLVE_GOLDEN_RECORD=<file>): every\n"
+		        " * answer and cache hit as test, sequence, kind, length, FNV-1a 64. */\n");
+	}
 
-	RUN(a_plain_forward);
-	RUN(b_block_direct);
-	RUN(c_cname_cloaking);
-	RUN(d_fakeip_latch);
-	RUN(e_latch_pins_upstream);
-	RUN(f_forward_then_fakeip);
-	RUN(g_forward_requery);
-	RUN(h_dname);
-	RUN(i_dangling);
-	RUN(j_loops_and_limits);
-	RUN(k_aaaa);
-	RUN(l_https_service_mode);
-	RUN(m_https_alias_mode);
-	RUN(n_ptr);
-	RUN(o_any);
-	RUN(p_nxdomain_second_step);
-	RUN(q_cancel);
-	RUN(r_reload_revalidation);
-	RUN(s_upstream_error);
-	RUN(t_other_qtypes_steered);
-	RUN(u_fwmask_change_in_flight);
-	RUN(v_wire_compat);
-	RUN(w_deps_dedup);
-	RUN(x_authority_addresses);
-	RUN(y_pass_through_chain_only);
-	RUN(z_dname_owner_records);
-	RUN(z_alias_mode_params);
-	RUN(z_svcb_target_hints);
+	RUNG(a_plain_forward);
+	RUNG(b_block_direct);
+	RUNG(c_cname_cloaking);
+	RUNG(d_fakeip_latch);
+	RUNG(e_latch_pins_upstream);
+	RUNG(f_forward_then_fakeip);
+	RUNG(g_forward_requery);
+	RUNG(h_dname);
+	RUNG(i_dangling);
+	RUNG(j_loops_and_limits);
+	RUNG(k_aaaa);
+	RUNG(l_https_service_mode);
+	RUNG(m_https_alias_mode);
+	RUNG(n_ptr);
+	RUNG(o_any);
+	RUNG(p_nxdomain_second_step);
+	RUNG(q_cancel);
+	RUNG(r_reload_revalidation);
+	RUNG(s_upstream_error);
+	RUNG(t_other_qtypes_steered);
+	RUNG(u_fwmask_change_in_flight);
+	RUNG(v_wire_compat);
+	RUNG(w_deps_dedup);
+	RUNG(x_authority_addresses);
+	RUNG(y_pass_through_chain_only);
+	RUNG(z_dname_owner_records);
+	RUNG(z_alias_mode_params);
+	RUNG(z_svcb_target_hints);
+	RUNG(zz_golden_paths);
 
 	teardown();
 	CHECK_EQ(live_handles, 0);
+	if (gold_rec) {
+		fclose(gold_rec);
+	} else if (gold_seen != sizeof(golden) / sizeof(golden[0]) - 1) {
+		fprintf(stderr, "golden: %zu of %zu recorded answers produced\n", gold_seen,
+		        sizeof(golden) / sizeof(golden[0]) - 1);
+		test_failures++;
+	}
 	dns_msg_free(&res);
 	nft_destroy_table(nft);
 	nft_close(nft);
