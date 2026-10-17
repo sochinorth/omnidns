@@ -196,8 +196,55 @@ static void build_check(const struct dns_msg *a, size_t maxlen)
 	dns_msg_free(&b);
 }
 
+/*
+ * Stream a subset of a's records straight from a's storage, as resolve
+ * assembles an answer, at a size limit taken from the input: it must be
+ * what dns_build() gives for a copy of that subset, and parse back.
+ */
+static void stream_check(const struct dns_msg *a, uint32_t seed)
+{
+	static struct dns_builder b;
+	size_t cap = 12 + seed % (DNS_MAX_MSG - 11);
+	struct dns_msg s, p;
+	uint16_t i;
+	int r, n, w;
+
+	if (!a->has_q)
+		return;
+	dns_msg_init(&s);
+	dns_msg_init(&p);
+	ASSERT(dns_msg_set_question(&s, dns_msg_qname(a), a->qlen, a->qtype, a->qclass) == 0);
+	s.flags = a->flags;
+	r = dns_build_begin(&b, out1, cap, 0, a->flags, dns_msg_qname(a), a->qlen, a->qtype,
+	                    a->qclass);
+	for (i = 0; i < a->nrr; i++) {
+		const struct dns_rr *rr = &a->rr[i];
+
+		if (i % 3 == 0 && (seed >> (i % 32)) & 1)
+			continue;
+		ASSERT(dns_msg_add_rr(&s, rr->section, rr->owner, rr->owner_len, rr->type,
+		                      rr->cls, rr->ttl, rr->rdata, rr->rdlen) == 0);
+		if (!r)
+			ASSERT(dns_build_add_rr(&b, rr->section, rr) == 0);
+	}
+	w = dns_build(&s, out2, cap);
+	if (r) {
+		ASSERT(r == -ENOSPC && w == -ENOSPC);
+	} else {
+		n = dns_build_end(&b);
+		ASSERT(n == w && (size_t)n <= cap && !memcmp(out1, out2, (size_t)n));
+		ASSERT(dns_parse(&p, out1, (size_t)n) == 0);
+		check_msg(&p);
+		check_rebuilt(&s, &p);
+	}
+	dns_msg_free(&s);
+	dns_msg_free(&p);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
+	uint32_t seed = size >= 4 ? (uint32_t)data[size - 1] << 24 | (uint32_t)data[size - 2] << 16 |
+	                            (uint32_t)data[size - 3] << 8 | data[size - 4] : (uint32_t)size;
 	struct dns_msg m, c;
 	int r;
 
@@ -216,8 +263,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	check_rebuilt(&m, &c);
 	build_check(&m, DNS_MAX_MSG);
 	build_check(&m, 512);
-	render_check(&m, size >= 4 ? (uint32_t)data[size - 1] << 24 | (uint32_t)data[size - 2] << 16 |
-	                            (uint32_t)data[size - 3] << 8 | data[size - 4] : (uint32_t)size);
+	render_check(&m, seed);
+	stream_check(&m, seed);
 	ASSERT(dns_parse_query(&c, data, size) == 0);
 	ASSERT(c.has_q == m.has_q && c.nrr == 0);
 out:
