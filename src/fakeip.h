@@ -216,9 +216,7 @@ bool fakeip_hold_find(const struct fakeip_hold *h, int family, const uint8_t *fa
 uint32_t fakeip_adopt_elems(struct fakeip_db *db, const struct nft_elem *el, uint32_t nel,
                             uint32_t hold, const struct fakeip_hold *h);
 
-/* true if `fake` holds a placeholder (its mark in *mark if non-NULL); tests */
-bool fakeip_placeholder(struct fakeip_db *db, int family, const uint8_t *fake, uint32_t *mark);
-uint32_t fakeip_placeholders(const struct fakeip_db *db);	/* unclaimed */
+uint32_t fakeip_placeholders(const struct fakeip_db *db);	/* unclaimed (tests) */
 bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr);
 
 /*

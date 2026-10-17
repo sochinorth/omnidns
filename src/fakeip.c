@@ -768,17 +768,6 @@ struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *f
 	return b && !is_placeholder(db, b) ? b : NULL;
 }
 
-bool fakeip_placeholder(struct fakeip_db *db, int family, const uint8_t *fake, uint32_t *mark)
-{
-	struct binding *b = lookup_any(db, family, fake);
-
-	if (!b || !is_placeholder(db, b))
-		return false;
-	if (mark)
-		*mark = fakeip_mark(db, b);
-	return true;
-}
-
 uint32_t fakeip_placeholders(const struct fakeip_db *db)
 {
 	return db->nplaceholders;

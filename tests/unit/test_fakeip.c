@@ -1310,6 +1310,22 @@ static const uint8_t *addr4(uint32_t a)
 	return buf;
 }
 
+/* true if v4 `fake` holds a placeholder (reserved rule id ""), its mark in *mark */
+static bool placeholder4(struct fakeip_db *db, const uint8_t *fake, uint32_t *mark)
+{
+	struct binding *b;
+	uint32_t it = 0;
+
+	while ((b = fakeip_next(db, &it))) {
+		if (b->family != 4 || memcmp(binding_fake(b), fake, 4))
+			continue;
+		if (mark)
+			*mark = fakeip_mark(db, b);
+		return !fakeip_rule_id(db, b)[0];
+	}
+	return false;
+}
+
 /* the fake an earlier process with SECRET gave the key */
 static uint32_t earlier_fake(const struct ip_prefix *p4, const char *rule, uint32_t mark,
                              const char *name, uint32_t real)
@@ -1347,7 +1363,7 @@ TEST(adopt_placeholders)
 	CHECK_EQ(fakeip_count(db), 2);
 	CHECK_EQ(fakeip_placeholders(db), 2);
 	CHECK_EQ(fakeip_live_count(db), 2);
-	CHECK(fakeip_placeholder(db, 4, addr4(0xc6120006), &mark));
+	CHECK(placeholder4(db, addr4(0xc6120006), &mark));
 	CHECK_EQ(mark, 0x200);
 	/* not a binding to answer from (PTR) */
 	CHECK(!fakeip_lookup(db, 4, addr4(0xc6120005)));
@@ -1432,7 +1448,7 @@ TEST(adopt_other_mapping_quarantined)
 	b = bind4(db, "warp", 0x100, "a.example", 0x0a000001, 1, &err);
 	REQUIRE(b);
 	CHECK(fake4(b) != f);
-	CHECK(fakeip_placeholder(db, 4, addr4(f), NULL));
+	CHECK(placeholder4(db, addr4(f), NULL));
 	/* still live a second before safe_until */
 	time_override_advance(3600 + 600);
 	cur_ticket++;
@@ -1809,9 +1825,9 @@ TEST(hold_adopt_elems)
 	CHECK_EQ(n_del, 2);
 	CHECK_EQ(n_kern, 2);
 	CHECK(kern_find(4, el[1].fake) < 0 && kern_find(4, el[3].fake) < 0);
-	CHECK(fakeip_placeholder(db, 4, el[0].fake, &mark));
+	CHECK(placeholder4(db, el[0].fake, &mark));
 	CHECK_EQ(mark, 0x100);
-	CHECK(fakeip_placeholder(db, 4, el[2].fake, &mark));
+	CHECK(placeholder4(db, el[2].fake, &mark));
 	CHECK_EQ(mark, 0x200);
 	/* .7: 3 - 2 = 1 s left */
 	time_override_advance(1);
@@ -1819,7 +1835,7 @@ TEST(hold_adopt_elems)
 	time_override_advance(1);
 	CHECK_EQ(fakeip_live_count(db), 1);
 	CHECK_EQ(fakeip_evict_expired(db), 1);
-	CHECK(fakeip_placeholder(db, 4, el[0].fake, NULL));
+	CHECK(placeholder4(db, el[0].fake, NULL));
 	/* .5: 480 - 2 s left */
 	time_override_advance(476);
 	CHECK_EQ(fakeip_live_count(db), 1);
