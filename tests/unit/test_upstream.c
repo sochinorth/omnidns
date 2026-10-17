@@ -126,10 +126,17 @@ static void log_clear(const struct fake *f)
 
 /* ---- upstream sets ---- */
 
+/* the sets of the running test; put after it by RUN_UP(), however it ended */
+static struct upstream_set *sets[4];
+static int nsets;
+
 static struct upstream_set *mkset(uint64_t id, int n, const uint16_t *ports)
 {
 	struct upstream_set *u = calloc(1, sizeof(*u) + n * sizeof(u->srv[0]));
 
+	if (nsets == sizeof(sets) / sizeof(sets[0]))
+		abort();
+	sets[nsets++] = u;
 	u->refcnt = 1;
 	u->id = id;
 	u->n = n;
@@ -169,6 +176,27 @@ static void watchdog_cb(struct uloop_timeout *t)
 	watchdog_fired = true;
 	uloop_end();
 }
+
+/*
+ * Results live on the test functions' stacks. A test may return with
+ * queries still pending: run_loop() gave up on a lost reply, or a failed
+ * REQUIRE returned early. Their callbacks would write into a dead frame
+ * from a later test's loop, so each test is followed by
+ * upstream_shutdown(), which frees every pending query without calling
+ * it (the module is usable again afterwards; see shutdown_many), and then
+ * by putting the test's sets.
+ */
+static void end_test(void)
+{
+	upstream_shutdown();
+	while (nsets)
+		upstream_set_put(sets[--nsets]);
+}
+
+#define RUN_UP(name) do {						\
+	RUN(name);							\
+	end_test();							\
+} while (0)
 
 static void run_loop(int want, int timeout_ms)
 {
@@ -264,7 +292,6 @@ TEST(normal)
 	CHECK_EQ(r.nan, 1);
 	ip_is(&r, "192.0.2.1");
 	CHECK_EQ(log_count(&srv_a, "a.example.com", "udp"), 1);
-	upstream_set_put(u);
 }
 
 TEST(nxdomain)
@@ -277,7 +304,6 @@ TEST(nxdomain)
 	CHECK_EQ(r.called, 1);
 	CHECK_EQ(r.err, 0);
 	CHECK_EQ(r.rcode, DNS_R_NXDOMAIN);
-	upstream_set_put(u);
 }
 
 TEST(dead_first)
@@ -293,7 +319,6 @@ TEST(dead_first)
 	CHECK_EQ(r.err, 0);
 	ip_is(&r, "198.51.100.1");
 	CHECK(r.t_ms - t0 < 250);	/* ICMP refusal, no timeout */
-	upstream_set_put(u);
 }
 
 TEST(drop_first)
@@ -311,7 +336,6 @@ TEST(drop_first)
 	CHECK(r.t_ms - t0 >= 280);
 	CHECK(r.t_ms - t0 < 1000);
 	CHECK_EQ(upstream_get_stats()->timeouts, to + 1);
-	upstream_set_put(u);
 }
 
 TEST(servfail_next)
@@ -330,7 +354,6 @@ TEST(servfail_next)
 	CHECK_EQ(r2.called, 1);
 	ip_is(&r2, "198.51.100.4");
 	CHECK_EQ(log_count(&srv_a, "fail.example.com", NULL), 1);
-	upstream_set_put(u);
 }
 
 TEST(all_fail)
@@ -345,7 +368,6 @@ TEST(all_fail)
 	CHECK_EQ(r.called, 1);
 	CHECK_EQ(r.err, -EIO);
 	CHECK_EQ(upstream_get_stats()->failures, f + 1);
-	upstream_set_put(u);
 }
 
 TEST(tc_tcp)
@@ -380,7 +402,6 @@ TEST(tc_tcp)
 	CHECK_EQ(i, 2);
 	CHECK_EQ(udp_at, 0);
 	CHECK_EQ(tcp_at, 1);
-	upstream_set_put(u);
 }
 
 TEST(coalesce)
@@ -400,7 +421,6 @@ TEST(coalesce)
 	}
 	CHECK_EQ(upstream_get_stats()->coalesced, co + 4);
 	CHECK_EQ(log_count(&srv_a, "co.example.com", NULL), 1);
-	upstream_set_put(u);
 }
 
 /* The message is checked after every callback ran, from where each took it. */
@@ -471,7 +491,6 @@ TEST(coalesce_steal)
 	stolen_is(&r[0], "192.0.2.1");
 	CHECK_EQ(r[1].called, 1);
 	ip_is(&r[1], "192.0.2.3");
-	upstream_set_put(u);
 }
 
 TEST(no_coalesce_qtype)
@@ -486,7 +505,6 @@ TEST(no_coalesce_qtype)
 	CHECK_EQ(r1.called, 1);
 	CHECK_EQ(r2.called, 1);
 	CHECK_EQ(log_count(&srv_a, "co.example.com", NULL), 2);
-	upstream_set_put(u);
 }
 
 TEST(cancel_one)
@@ -503,7 +521,6 @@ TEST(cancel_one)
 	CHECK_EQ(r[1].called, 0);
 	CHECK_EQ(r[2].called, 1);
 	ip_is(&r[2], "192.0.2.1");
-	upstream_set_put(u);
 }
 
 TEST(cancel_all)
@@ -528,7 +545,6 @@ TEST(cancel_all)
 	CHECK(watchdog_fired);
 	for (int i = 0; i < 4; i++)
 		CHECK_EQ(r[i].called, 0);
-	upstream_set_put(u);
 }
 
 TEST(deadline)
@@ -547,7 +563,6 @@ TEST(deadline)
 	CHECK_EQ(r.err, -ETIMEDOUT);
 	CHECK(dt >= 480);
 	CHECK(dt < 800);
-	upstream_set_put(u);
 }
 
 TEST(reentrant)
@@ -573,7 +588,6 @@ TEST(reentrant)
 	CHECK_EQ(child.called, 1);
 	CHECK_EQ(child.err, 0);
 	ip_is(&child, "192.0.2.2");
-	upstream_set_put(u);
 }
 
 /* ---- spoofing responder ---- */
@@ -666,7 +680,6 @@ TEST(spoof)
 	CHECK(upstream_get_stats()->spoofed >= sp + 3);
 	uloop_fd_delete(&spoof_fd);
 	close(spoof_fd.fd);
-	upstream_set_put(u);
 }
 
 /* The question check is case-insensitive: an upper-cased echo of the
@@ -702,7 +715,6 @@ TEST(spoof_case)
 	spoof_upcase = false;
 	uloop_fd_delete(&spoof_fd);
 	close(spoof_fd.fd);
-	upstream_set_put(u);
 }
 
 TEST(shutdown_inflight)
@@ -719,7 +731,6 @@ TEST(shutdown_inflight)
 	CHECK_EQ(u->refcnt, 1);
 	run_loop(1, 100);
 	CHECK(watchdog_fired);
-	upstream_set_put(u);
 }
 
 /* Many exchanges (some coalesced) in flight at shutdown: every waiter is
@@ -750,7 +761,6 @@ TEST(shutdown_many)
 	CHECK_EQ(ok.called, 1);
 	CHECK_EQ(ok.err, 0);
 	ip_is(&ok, "192.0.2.1");
-	upstream_set_put(u);
 }
 
 /* The direct query writer must match the generic dns_build() construction
@@ -859,25 +869,24 @@ int main(void)
 		fake_stop(&srv_b);
 		return 77;
 	}
-	RUN(normal);
-	RUN(nxdomain);
-	RUN(dead_first);
-	RUN(drop_first);
-	RUN(servfail_next);
-	RUN(all_fail);
-	RUN(tc_tcp);
-	RUN(coalesce);
-	RUN(coalesce_steal);
-	RUN(no_coalesce_qtype);
-	RUN(cancel_one);
-	RUN(cancel_all);
-	RUN(deadline);
-	RUN(reentrant);
-	RUN(spoof);
-	RUN(spoof_case);
-	RUN(shutdown_inflight);
-	RUN(shutdown_many);
-	upstream_shutdown();
+	RUN_UP(normal);
+	RUN_UP(nxdomain);
+	RUN_UP(dead_first);
+	RUN_UP(drop_first);
+	RUN_UP(servfail_next);
+	RUN_UP(all_fail);
+	RUN_UP(tc_tcp);
+	RUN_UP(coalesce);
+	RUN_UP(coalesce_steal);
+	RUN_UP(no_coalesce_qtype);
+	RUN_UP(cancel_one);
+	RUN_UP(cancel_all);
+	RUN_UP(deadline);
+	RUN_UP(reentrant);
+	RUN_UP(spoof);
+	RUN_UP(spoof_case);
+	RUN_UP(shutdown_inflight);
+	RUN_UP(shutdown_many);
 	uloop_done();
 	fake_stop(&srv_a);
 	fake_stop(&srv_b);
