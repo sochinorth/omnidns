@@ -954,6 +954,206 @@ int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
 	return (int)b->len;
 }
 
+/* ---- streaming builder ---- */
+
+static void wb_rehead(struct dns_builder *b)
+{
+	int i;
+
+	memset(b->head, 0xff, sizeof(b->head));
+	for (i = 0; i < b->nent; i++) {
+		struct dns_ctab_ent *e = &b->ent[i];
+
+		e->next = b->head[e->hash % DNS_CTAB_BUCKETS];
+		b->head[e->hash % DNS_CTAB_BUCKETS] = (uint16_t)i;
+	}
+}
+
+/* Roll the output and the table back to a record boundary. */
+static void wb_rollback(struct dns_builder *b, size_t len, int nent)
+{
+	b->len = len;
+	if (b->nent != nent) {
+		b->nent = nent;
+		wb_rehead(b);
+	}
+}
+
+static int wb_find(const struct dns_builder *b, const uint8_t *s, uint8_t slen, uint32_t h)
+{
+	uint16_t i;
+
+	for (i = b->head[h % DNS_CTAB_BUCKETS]; i != CTAB_NONE; i = b->ent[i].next) {
+		const struct dns_ctab_ent *e = &b->ent[i];
+
+		if (e->hash == h && dns_name_eq(e->name, e->len, s, slen))
+			return e->off;
+	}
+	return -1;
+}
+
+static void wb_remember(struct dns_builder *b, const uint8_t *s, uint8_t slen, uint32_t h)
+{
+	struct dns_ctab_ent *e;
+
+	if (b->len >= CTAB_OFF_MAX || b->nent >= DNS_CTAB_MAX)
+		return;
+	e = &b->ent[b->nent];
+	e->name = s;
+	e->len = slen;
+	e->hash = h;
+	e->off = (uint16_t)b->len;
+	e->next = b->head[h % DNS_CTAB_BUCKETS];
+	b->head[h % DNS_CTAB_BUCKETS] = (uint16_t)b->nent++;
+}
+
+static int wb_bytes(struct dns_builder *b, const void *p, size_t n)
+{
+	if (b->cap - b->len < n)
+		return -ENOSPC;
+	memcpy(b->out + b->len, p, n);
+	b->len += n;
+	return 0;
+}
+
+/*
+ * Write a valid uncompressed name, compressed; returns its length or
+ * -ENOSPC. Suffix hashes are computed right to left so that each suffix
+ * costs O(its first label).
+ */
+static int wb_name(struct dns_builder *b, const uint8_t *name)
+{
+	uint8_t offs[DNS_MAX_NAME / 2 + 1];
+	uint32_t hash[DNS_MAX_NAME / 2 + 1], h = 2166136261u;
+	int nl = 0, k, off;
+	size_t i = 0, j;
+	uint8_t len;
+
+	while (name[i]) {
+		offs[nl++] = (uint8_t)i;
+		i += (size_t)name[i] + 1;
+	}
+	len = (uint8_t)(i + 1);
+	for (k = nl - 1; k >= 0; k--) {
+		for (j = offs[k]; j <= offs[k] + (size_t)name[offs[k]]; j++)
+			h = (h ^ lc(name[j])) * 16777619u;
+		hash[k] = h;
+	}
+	for (k = 0; k < nl; k++) {
+		uint8_t sl = len - offs[k], ptr[2];
+
+		off = wb_find(b, name + offs[k], sl, hash[k]);
+		if (off >= 0) {
+			put16(ptr, 0xc000 | off);
+			return wb_bytes(b, ptr, 2) ? -ENOSPC : len;
+		}
+		wb_remember(b, name + offs[k], sl, hash[k]);
+		if (wb_bytes(b, name + offs[k], (size_t)name[offs[k]] + 1))
+			return -ENOSPC;
+	}
+	return wb_bytes(b, "", 1) ? -ENOSPC : len;
+}
+
+static int wb_rdata(struct dns_builder *b, uint16_t type, const uint8_t *rd, uint16_t rdlen)
+{
+	const struct rd_layout *lo = rd_layout(type);
+	size_t off;
+	int i, n;
+
+	if (!lo)
+		return wb_bytes(b, rd, rdlen);
+	if (wb_bytes(b, rd, lo->pre))
+		return -ENOSPC;
+	off = lo->pre;
+	for (i = 0; i < lo->names; i++) {
+		n = wb_name(b, rd + off);
+		if (n < 0)
+			return n;
+		off += (size_t)n;
+	}
+	return wb_bytes(b, rd + off, rdlen - off);
+}
+
+int dns_build_begin(struct dns_builder *b, uint8_t *out, size_t cap, uint16_t id,
+                    uint16_t flags, const uint8_t *qname, uint8_t qlen, uint16_t qtype,
+                    uint16_t qclass)
+{
+	uint8_t q[4];
+
+	b->out = out;
+	b->cap = cap > DNS_MAX_MSG ? DNS_MAX_MSG : cap;
+	b->len = DNS_HDR_LEN;
+	b->id = id;
+	b->flags = flags;
+	b->qd = qname != NULL;
+	b->nrr = 0;
+	memset(b->cnt, 0, sizeof(b->cnt));
+	b->sec = DNS_S_AN;
+	b->cut = false;
+	b->nent = 0;
+	memset(b->head, 0xff, sizeof(b->head));
+	if (b->cap < DNS_HDR_LEN)
+		return -ENOSPC;
+	if (qname) {
+		put16(q, qtype);
+		put16(q + 2, qclass);
+		if (wb_name(b, qname) < 0 || wb_bytes(b, q, 4))
+			return -ENOSPC;
+	}
+	b->qend = b->len;
+	b->qent = b->nent;
+	return 0;
+}
+
+int dns_build_add(struct dns_builder *b, enum dns_section sec,
+                  const uint8_t *owner, uint8_t owner_len,
+                  uint16_t type, uint16_t cls, uint32_t ttl,
+                  const uint8_t *rdata, uint16_t rdlen)
+{
+	size_t save = b->len, rdpos;
+	int nent = b->nent;
+	uint8_t fix[DNS_RR_FIXED];
+
+	if ((unsigned)sec > DNS_S_AR || sec < b->sec)
+		return -EINVAL;
+	if (b->nrr == DNS_MAX_RRS)
+		return -E2BIG;
+	b->nrr++;
+	b->sec = (uint8_t)sec;
+	if (b->cut)
+		return 0;
+	put16(fix, type);
+	put16(fix + 2, cls);
+	put32(fix + 4, ttl);
+	put16(fix + 8, 0);
+	if (wb_name(b, owner) < 0 || wb_bytes(b, fix, DNS_RR_FIXED) ||
+	    (rdpos = b->len, wb_rdata(b, type, rdata, rdlen))) {
+		b->cut = true;
+		if (sec == DNS_S_AR) {
+			wb_rollback(b, save, nent);
+		} else {
+			wb_rollback(b, b->qend, b->qent);
+			b->flags |= DNS_F_TC;
+			memset(b->cnt, 0, sizeof(b->cnt));
+		}
+		return 0;
+	}
+	put16(b->out + rdpos - 2, (uint16_t)(b->len - rdpos));
+	b->cnt[sec]++;
+	return 0;
+}
+
+int dns_build_end(struct dns_builder *b)
+{
+	put16(b->out, b->id);
+	put16(b->out + 2, b->flags);
+	put16(b->out + 4, b->qd);
+	put16(b->out + 6, b->cnt[0]);
+	put16(b->out + 8, b->cnt[1]);
+	put16(b->out + 10, b->cnt[2]);
+	return (int)b->len;
+}
+
 /* ---- rendering a built response ---- */
 
 /* Offset just past the (possibly compressed) name at off, or 0. */

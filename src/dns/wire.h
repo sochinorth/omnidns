@@ -232,6 +232,67 @@ void dns_msg_set_rcode(struct dns_msg *m, int rcode);	/* sets ext_rcode too */
 int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen);
 
 /*
+ * Streaming serialization: a message written record by record straight
+ * into the caller's buffer, compressed and cut as dns_build() describes:
+ *
+ *	dns_build_begin(b, out, cap, id, flags, qname, qlen, qtype, qclass);
+ *	dns_build_add(b, sec, ...);	once per record, in section order
+ *	len = dns_build_end(b);
+ *
+ * cap (at most DNS_MAX_MSG is used) bounds the message. A record that does
+ * not fit is rolled back; in the AR section it ends the message there, in
+ * AN or NS it leaves header and question with TC set and zero counts.
+ * Either way the records added after it are left out.
+ *
+ * Names are not validated: the owner and the names of compressible rdata
+ * (the layouts listed above) must be valid, as every dns_msg's are. The
+ * compression table points into them, so the question and every record
+ * passed must stay in place until dns_build_end().
+ */
+#define DNS_CTAB_MAX		256
+#define DNS_CTAB_BUCKETS	256
+
+struct dns_ctab_ent {
+	const uint8_t *name;		/* uncompressed suffix in the source */
+	uint32_t hash;
+	uint16_t off, next;
+	uint8_t len;
+};
+
+struct dns_builder {
+	uint8_t *out;
+	size_t cap, len, qend;
+	uint16_t id, flags, qd, nrr;
+	uint16_t cnt[3];
+	uint8_t sec;			/* of the last record added */
+	bool cut;			/* a record did not fit: the rest is left out */
+	int nent, qent;			/* table entries, those of the question */
+	uint16_t head[DNS_CTAB_BUCKETS];
+	struct dns_ctab_ent ent[DNS_CTAB_MAX];
+};
+
+/* qname NULL: no question. Returns 0, or -ENOSPC if the question does not
+ * fit. */
+int dns_build_begin(struct dns_builder *b, uint8_t *out, size_t cap, uint16_t id,
+                    uint16_t flags, const uint8_t *qname, uint8_t qlen, uint16_t qtype,
+                    uint16_t qclass);
+/* Returns 0 (written, or left out by a cut), -EINVAL out of section order,
+ * -E2BIG past DNS_MAX_RRS records (cut ones included). */
+int dns_build_add(struct dns_builder *b, enum dns_section sec,
+                  const uint8_t *owner, uint8_t owner_len,
+                  uint16_t type, uint16_t cls, uint32_t ttl,
+                  const uint8_t *rdata, uint16_t rdlen);
+/* Writes the header; returns the message length. */
+int dns_build_end(struct dns_builder *b);
+
+static inline int dns_build_add_rr(struct dns_builder *b, enum dns_section sec,
+                                   const struct dns_rr *rr)
+{
+	return dns_build_add(b, sec, rr->owner, rr->owner_len, rr->type, rr->cls, rr->ttl,
+	                     rr->rdata, rr->rdlen);
+}
+
+/*
  * Render a response built once by dns_build() (one question, no OPT) for
  * one client: the bytes a dns_build() of the same message stamped for that
  * client would give, without rebuilding it.

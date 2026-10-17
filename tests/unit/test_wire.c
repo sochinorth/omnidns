@@ -1436,6 +1436,123 @@ TEST(build_golden)
 	CHECK_EQ(bad, 0);
 }
 
+/* dns_build() of m through the streaming builder: OPT reserved and appended */
+static int stream_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
+{
+	static struct dns_builder b;
+	size_t optlen = m->edns.present ? 11 : 0;
+	uint16_t i;
+	int n, r;
+
+	if (maxlen > DNS_MAX_MSG)
+		maxlen = DNS_MAX_MSG;
+	if (maxlen < 12 + optlen)
+		return -ENOSPC;
+	r = dns_build_begin(&b, out, maxlen - optlen, m->id, m->flags, dns_msg_qname(m), m->qlen,
+	                    m->qtype, m->qclass);
+	for (i = 0; !r && i < m->nrr; i++)
+		r = dns_build_add_rr(&b, m->rr[i].section, &m->rr[i]);
+	if (r)
+		return r;
+	n = dns_build_end(&b);
+	if (m->edns.present) {
+		uint16_t ar = (uint16_t)((out[10] << 8 | out[11]) + 1);
+		uint32_t ttl = (uint32_t)m->edns.ext_rcode << 24 | (uint32_t)m->edns.version << 16 |
+		               (m->edns.do_bit ? 0x8000u : 0);
+
+		out[10] = (uint8_t)(ar >> 8);
+		out[11] = (uint8_t)ar;
+		out[n] = 0;
+		out[n + 1] = 0;
+		out[n + 2] = DNS_T_OPT;
+		out[n + 3] = (uint8_t)(m->edns.udp_size >> 8);
+		out[n + 4] = (uint8_t)m->edns.udp_size;
+		out[n + 5] = (uint8_t)(ttl >> 24);
+		out[n + 6] = (uint8_t)(ttl >> 16);
+		out[n + 7] = (uint8_t)(ttl >> 8);
+		out[n + 8] = (uint8_t)ttl;
+		out[n + 9] = 0;
+		out[n + 10] = 0;
+		n += 11;
+	}
+	return n;
+}
+
+/* The streaming builder writes exactly what dns_build() does, cuts included. */
+TEST(stream_vs_build)
+{
+	static const size_t limits[] = { 11, 12, 40, 100, 512, 1232, 4096, 20000, DNS_MAX_MSG };
+	static uint8_t o1[DNS_MAX_MSG], o2[DNS_MAX_MSG];
+	struct dns_msg m;
+	int i, bad = 0, n1, n2, ntc = 0, nar = 0, nfull = 0;
+	size_t li;
+
+	rnd_state = 0x2545f491u;
+	for (i = 0; i < 3000; i++) {
+		rnd_msg(&m);
+		for (li = 0; li < sizeof(limits) / sizeof(limits[0]); li++) {
+			memset(o2, 0x5a, limits[li]);
+			n1 = dns_build(&m, o1, limits[li]);
+			n2 = stream_build(&m, o2, limits[li]);
+			if ((n1 != n2 || (n1 > 0 && memcmp(o1, o2, (size_t)n1))) && bad++ < 5)
+				fprintf(stderr, "  message %d, limit %zu: %d vs %d bytes\n", i,
+				        limits[li], n1, n2);
+			if (n1 < 12 || (m.flags & DNS_F_TC))
+				continue;
+			if (o1[2] & 0x02)
+				ntc++;	/* AN/NS cut */
+			else if ((o1[10] << 8 | o1[11]) < dns_msg_count(&m, DNS_S_AR) + m.edns.present)
+				nar++;	/* AR cut */
+			else if (m.nrr > 20)
+				nfull++;
+		}
+		dns_msg_free(&m);
+	}
+	CHECK_EQ(bad, 0);
+	/* every outcome is well represented */
+	CHECK(ntc > 1000 && nar > 300 && nfull > 100);
+}
+
+/* Section order, the record cap, and records offered after a cut. */
+TEST(stream_rules)
+{
+	static struct dns_builder b;
+	uint8_t q[64], out[512], a[4] = { 192, 0, 2, 1 };
+	uint8_t ql = wn(q, "www.example.org");
+	int i, n;
+
+	REQUIRE(dns_build_begin(&b, out, sizeof(out), 7, DNS_F_QR, q, ql, DNS_T_A, DNS_C_IN) == 0);
+	CHECK_EQ(dns_build_add(&b, DNS_S_NS, q, ql, DNS_T_A, 1, 60, a, 4), 0);
+	CHECK_EQ(dns_build_add(&b, DNS_S_AN, q, ql, DNS_T_A, 1, 60, a, 4), -EINVAL);
+	CHECK_EQ(dns_build_add(&b, DNS_S_AR + 1, q, ql, DNS_T_A, 1, 60, a, 4), -EINVAL);
+	/* glue until the 512 bytes are full: the rest is left out, but counted */
+	for (i = 1; i < DNS_MAX_RRS; i++)
+		CHECK_EQ(dns_build_add(&b, DNS_S_AR, q, ql, DNS_T_A, 1, 60, a, 4), 0);
+	CHECK_EQ(dns_build_add(&b, DNS_S_AR, q, ql, DNS_T_A, 1, 60, a, 4), -E2BIG);
+	n = dns_build_end(&b);
+	CHECK_EQ(n, 33 + 16 * 29);
+	CHECK_EQ(out[2] & 0x02, 0);
+	CHECK_EQ(out[9], 1);
+	CHECK_EQ(out[11], 28);
+
+	/* an answer record that does not fit: TC, header and question only,
+	 * whatever comes after */
+	REQUIRE(dns_build_begin(&b, out, 60, 7, DNS_F_QR, q, ql, DNS_T_A, DNS_C_IN) == 0);
+	CHECK_EQ(dns_build_add(&b, DNS_S_AN, q, ql, DNS_T_A, 1, 60, a, 4), 0);
+	CHECK_EQ(dns_build_add(&b, DNS_S_AN, q, ql, DNS_T_CNAME, 1, 60, q, ql), 0);
+	CHECK_EQ(dns_build_add(&b, DNS_S_AR, q, ql, DNS_T_A, 1, 60, a, 4), 0);
+	CHECK_EQ(dns_build_end(&b), 33);
+	CHECK(out[2] & 0x02);
+	CHECK(!out[7] && !out[9] && !out[11]);
+
+	/* no room for the question */
+	CHECK_EQ(dns_build_begin(&b, out, 20, 7, 0, q, ql, DNS_T_A, DNS_C_IN), -ENOSPC);
+	CHECK_EQ(dns_build_begin(&b, out, 11, 7, 0, NULL, 0, 0, 0), -ENOSPC);
+	REQUIRE(dns_build_begin(&b, out, 12, 7, 0, NULL, 0, 0, 0) == 0);
+	CHECK_EQ(dns_build_end(&b), 12);
+	CHECK_EQ(out[5], 0);
+}
+
 int main(void)
 {
 	uint8_t key[16] = { 1, 2, 3 };
@@ -1467,5 +1584,7 @@ int main(void)
 	RUN(rcode_and_types);
 	RUN(build_reuse);
 	RUN(build_golden);
+	RUN(stream_vs_build);
+	RUN(stream_rules);
 	return test_summary();
 }
