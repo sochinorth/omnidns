@@ -49,7 +49,6 @@
  * (NFTA_RULE_USERDATA) identifying the shadow state that wrote them. nft
  * uses the low TLV types itself (comments) and ignores unknown ones.
  */
-#define LAYOUT_VERSION	1
 enum { UD_VERSION = 0x80, UD_FWMASK, UD_SECRET };	/* table */
 #define UD_TAG		0x80				/* policy rules */
 
@@ -207,7 +206,7 @@ static void txn_table(struct nft_ctx *n, struct txn *t, int type, uint16_t flags
 	if (fwmask) {
 		struct nftnl_udata_buf *u = oom(nftnl_udata_buf_alloc(64));
 
-		nftnl_udata_put_u32(u, UD_VERSION, LAYOUT_VERSION);
+		nftnl_udata_put_u32(u, UD_VERSION, NFT_LAYOUT_VERSION);
 		nftnl_udata_put_u32(u, UD_FWMASK, fwmask);
 		nftnl_udata_put(u, UD_SECRET, NFT_SECRET_LEN, n->secret);
 		nftnl_table_set_data(tb, NFTNL_TABLE_USERDATA, nftnl_udata_buf_data(u),
@@ -1370,7 +1369,7 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	if (err)
 		goto fail;
 	why = "made by another omnidns version";
-	if (tst.version != LAYOUT_VERSION || !tst.has_secret)
+	if (tst.version != NFT_LAYOUT_VERSION || !tst.has_secret)
 		goto fail;
 	why = "made for another fwmask";
 	if (tst.fwmask != d->fwmask)

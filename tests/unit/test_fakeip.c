@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -1335,13 +1336,13 @@ TEST(adopt_placeholders)
 	reset();
 	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
 	REQUIRE(db);
-	CHECK_EQ(adopt4(db, addr4(0xc6120005), 0x0a000001, 0x100, 3600), 0);
-	CHECK_EQ(adopt4(db, addr4(0xc6120006), 0x0a000001, 0x200, 3600), 0);
+	CHECK_EQ(adopt4(db, addr4(0xc6120005), 0x0a000001, 0x100, 3600 + 600), 0);
+	CHECK_EQ(adopt4(db, addr4(0xc6120006), 0x0a000001, 0x200, 3600 + 600), 0);
 	/* outside the pool, an excluded address, a mark without chain, taken */
-	CHECK_EQ(adopt4(db, addr4(0xc6140005), 0x0a000001, 0x100, 3600), -EINVAL);
-	CHECK_EQ(adopt4(db, addr4(0xc6120000), 0x0a000001, 0x100, 3600), -EINVAL);
-	CHECK_EQ(adopt4(db, addr4(0xc6120007), 0x0a000001, dead_mark, 3600), -ESTALE);
-	CHECK_EQ(adopt4(db, addr4(0xc6120005), 0x0a000002, 0x100, 3600), -EEXIST);
+	CHECK_EQ(adopt4(db, addr4(0xc6140005), 0x0a000001, 0x100, 3600 + 600), -EINVAL);
+	CHECK_EQ(adopt4(db, addr4(0xc6120000), 0x0a000001, 0x100, 3600 + 600), -EINVAL);
+	CHECK_EQ(adopt4(db, addr4(0xc6120007), 0x0a000001, dead_mark, 3600 + 600), -ESTALE);
+	CHECK_EQ(adopt4(db, addr4(0xc6120005), 0x0a000002, 0x100, 3600 + 600), -EEXIST);
 	CHECK_EQ(fakeip_count(db), 2);
 	CHECK_EQ(fakeip_placeholders(db), 2);
 	CHECK_EQ(fakeip_live_count(db), 2);
@@ -1350,7 +1351,7 @@ TEST(adopt_placeholders)
 	/* not a binding to answer from (PTR) */
 	CHECK(!fakeip_lookup(db, 4, addr4(0xc6120005)));
 	CHECK_EQ(n_add + n_del, 0);
-	/* safe_until = now + hold + grace */
+	/* safe_until = now + hold (the grace included) */
 	time_override_advance(3600 + 600);
 	CHECK_EQ(fakeip_live_count(db), 2);
 	time_override_advance(1);
@@ -1374,7 +1375,7 @@ TEST(adopt_claim)
 	REQUIRE(f);
 	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
 	REQUIRE(db);
-	REQUIRE(adopt4(db, addr4(f), 0x0a000001, 0x100, 3600) == 0);
+	REQUIRE(adopt4(db, addr4(f), 0x0a000001, 0x100, 3600 + 600) == 0);
 	b = bind4(db, "warp", 0x100, "a.example", 0x0a000001, 60, &err);
 	REQUIRE(b);
 	CHECK_EQ(fake4(b), f);		/* the same fake as before the restart */
@@ -1396,7 +1397,7 @@ TEST(adopt_claim)
 	f = earlier_fake(&p4, "warp", 0x100, "b.example", 0x0a000001);
 	reset();
 	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
-	REQUIRE(adopt4(db, addr4(f), 0x0a000001, 0x100, 3600) == 0);
+	REQUIRE(adopt4(db, addr4(f), 0x0a000001, 0x100, 3600 + 600) == 0);
 	/* other mark or other real address: not claimable, a new fake */
 	b = bind4(db, "warp", 0x200, "b.example", 0x0a000001, 60, &err);
 	REQUIRE(b);
@@ -1426,7 +1427,7 @@ TEST(adopt_other_mapping_quarantined)
 	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
 	REQUIRE(db);
 	/* the key's first candidate holds another mapping */
-	REQUIRE(adopt4(db, addr4(f), 0x0a000009, 0x100, 3600) == 0);
+	REQUIRE(adopt4(db, addr4(f), 0x0a000009, 0x100, 3600 + 600) == 0);
 	b = bind4(db, "warp", 0x100, "a.example", 0x0a000001, 1, &err);
 	REQUIRE(b);
 	CHECK(fake4(b) != f);
@@ -1487,6 +1488,312 @@ TEST(adopt_capacity)
 	fakeip_free(db);
 }
 
+/* ---- hold file: what a clean exit hands to the next adoption ---- */
+
+static char hold_dir[64], hold_file[96];
+
+static void hold_setup(void)
+{
+	if (!hold_dir[0]) {
+		strcpy(hold_dir, "/tmp/omnihold.XXXXXX");
+		if (!mkdtemp(hold_dir))
+			abort();
+		snprintf(hold_file, sizeof(hold_file), "%s/t.hold", hold_dir);
+	}
+	unlink(hold_file);
+}
+
+static void hold_cleanup(void)
+{
+	if (hold_dir[0]) {
+		unlink(hold_file);
+		rmdir(hold_dir);
+	}
+}
+
+static size_t file_get(uint8_t *buf, size_t cap)
+{
+	FILE *f = fopen(hold_file, "rb");
+	size_t n;
+
+	if (!f)
+		return 0;
+	n = fread(buf, 1, cap, f);
+	fclose(f);
+	return n;
+}
+
+static void file_put(const uint8_t *buf, size_t len)
+{
+	FILE *f = fopen(hold_file, "wb");
+
+	if (!f)
+		abort();
+	fwrite(buf, 1, len, f);
+	fclose(f);
+}
+
+static bool hold_has(const struct fakeip_hold *h, const struct binding *b, uint32_t *hold)
+{
+	return fakeip_hold_find(h, b->family, b->fake, hold);
+}
+
+/* at 1000: a live, b expired, a placeholder in quarantine, d expired but
+ * referenced, e a live v6 one; then 650 s pass */
+static struct fakeip_db *hold_db(struct binding **bs)
+{
+	static struct ip_prefix p4, p6;
+	struct fakeip_db *db;
+	int err;
+
+	p4 = pfx("198.18.0.0", 15);
+	p6 = pfx("fd00:198:18::", 64);
+	db = fakeip_new(&p4, &p6, 100, 600, SECRET, NFT);
+	if (!db)
+		return NULL;
+	bs[0] = bind4(db, "r", 0x100, "a.example", 0x0a000001, 300, &err);	/* 1900 */
+	bs[1] = bind4(db, "r", 0x100, "b.example", 0x0a000002, 0, &err);	/* 1600 */
+	if (adopt4(db, addr4(0xc6120005), 0x0a000003, 0x200, 3000))		/* 4000 */
+		return NULL;
+	bs[3] = bind4(db, "r", 0x100, "d.example", 0x0a000004, 0, &err);	/* 1600 */
+	bs[4] = bind6(db, "r", 0x100, "e.example", 5, 100, &err);		/* 1700 */
+	if (!bs[0] || !bs[1] || !bs[3] || !bs[4])
+		return NULL;
+	fakeip_ref(bs[3]);
+	cur_ticket++;
+	time_override_advance(650);
+	return db;
+}
+
+TEST(hold_round_trip)
+{
+	struct binding *bs[5];
+	struct fakeip_db *db;
+	struct fakeip_hold *h;
+	uint8_t buf[512];
+	uint32_t hold = 0;
+	int err = 0;
+
+	reset();
+	hold_setup();
+	db = hold_db(bs);
+	REQUIRE(db);
+	CHECK_EQ(fakeip_hold_save(db, hold_file, 5000), 0);
+	/* a, the placeholder, d, e: a 32-byte header, 24 bytes per record */
+	CHECK_EQ(file_get(buf, sizeof(buf)), 32 + 4 * 24);
+	/* 10 s later on the boot clock */
+	h = fakeip_hold_load(hold_file, SECRET, 200, 5010, &err);
+	REQUIRE(h);
+	CHECK_EQ(err, 0);
+	CHECK(access(hold_file, F_OK) && errno == ENOENT);	/* read once */
+	CHECK_EQ(fakeip_hold_count(h), 4);
+	CHECK(hold_has(h, bs[0], &hold));
+	CHECK_EQ(hold, 250 - 10);
+	CHECK(!hold_has(h, bs[1], NULL));	/* evictable at the exit */
+	CHECK(fakeip_hold_find(h, 4, addr4(0xc6120005), &hold));
+	CHECK_EQ(hold, 2350 - 10);
+	CHECK(hold_has(h, bs[3], &hold));	/* referenced: listed, nothing left */
+	CHECK_EQ(hold, 0);
+	CHECK(hold_has(h, bs[4], &hold));
+	CHECK_EQ(hold, 50 - 10);
+	CHECK(!fakeip_hold_find(h, 6, bs[0]->fake, NULL));	/* the family counts */
+	fakeip_hold_free(h);
+
+	/* elapsed time beyond a hold clamps it at 0 */
+	CHECK_EQ(fakeip_hold_save(db, hold_file, 5000), 0);
+	h = fakeip_hold_load(hold_file, SECRET, 200, 5000 + 100, &err);
+	REQUIRE(h);
+	CHECK(hold_has(h, bs[4], &hold));
+	CHECK_EQ(hold, 0);
+	CHECK(hold_has(h, bs[0], &hold));
+	CHECK_EQ(hold, 150);
+	fakeip_hold_free(h);
+
+	/* an empty database writes a valid empty file */
+	fakeip_unref(db, bs[3]);
+	time_override_advance(10000);
+	CHECK_EQ(fakeip_evict_expired(db), 5);
+	CHECK_EQ(fakeip_hold_save(db, hold_file, 7000), 0);
+	h = fakeip_hold_load(hold_file, SECRET, 0, 7000, &err);
+	REQUIRE(h);
+	CHECK_EQ(fakeip_hold_count(h), 0);
+	fakeip_hold_free(h);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+}
+
+/* a damaged file is rejected (the adoption is then conservative) and deleted */
+static int hold_try(const uint8_t *buf, size_t len, const uint8_t *secret, uint32_t max,
+                    uint64_t clock)
+{
+	struct fakeip_hold *h;
+	int err = 0;
+
+	file_put(buf, len);
+	h = fakeip_hold_load(hold_file, secret, max, clock, &err);
+	CHECK(access(hold_file, F_OK) && errno == ENOENT);
+	if (h) {
+		fakeip_hold_free(h);
+		return 1;
+	}
+	return err;
+}
+
+TEST(hold_rejected)
+{
+	static const uint8_t other[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17 };
+	struct binding *bs[5];
+	struct fakeip_db *db;
+	uint8_t buf[512], bad[512];
+	size_t len, i;
+	int err = 0;
+
+	reset();
+	hold_setup();
+	db = hold_db(bs);
+	REQUIRE(db);
+	REQUIRE(fakeip_hold_save(db, hold_file, 5000) == 0);
+	len = file_get(buf, sizeof(buf));
+	REQUIRE(len == 32 + 4 * 24);
+	CHECK_EQ(hold_try(buf, len, SECRET, 200, 5000), 1);
+	/* no file: a crash, or a stop */
+	CHECK(!fakeip_hold_load(hold_file, SECRET, 200, 5000, &err));
+	CHECK_EQ(err, -ENOENT);
+	/* another table's secret */
+	CHECK_EQ(hold_try(buf, len, other, 200, 5000), -ESTALE);
+	/* written "after" now: another boot */
+	CHECK_EQ(hold_try(buf, len, SECRET, 200, 4999), -ERANGE);
+	/* the record bound */
+	CHECK_EQ(hold_try(buf, len, SECRET, 3, 5000), -E2BIG);
+	CHECK_EQ(hold_try(buf, len, SECRET, 4, 5000), 1);
+	/* truncated anywhere, trailing bytes */
+	for (i = 0; i < len; i += 5)
+		CHECK_EQ(hold_try(buf, i, SECRET, 200, 5000), -EINVAL);
+	CHECK_EQ(hold_try(buf, len - 1, SECRET, 200, 5000), -EINVAL);
+	memset(bad, 0, sizeof(bad));
+	memcpy(bad, buf, len);
+	CHECK_EQ(hold_try(bad, len + 1, SECRET, 200, 5000), -EINVAL);
+	CHECK_EQ(hold_try(bad, len + 24, SECRET, 200, 5000), -EINVAL);	/* count is 4 */
+	/* garbage */
+	for (i = 0; i < len; i++)
+		bad[i] = (uint8_t)(i * 37 + 11);
+	CHECK_EQ(hold_try(bad, len, SECRET, 200, 5000), -EINVAL);
+	/* one bit of the magic, the version, the count, the fingerprint */
+	for (i = 7; i < 24; i += 4) {
+		memcpy(bad, buf, len);
+		bad[i] ^= 1;
+		CHECK(hold_try(bad, len, SECRET, 200, 5000) < 0);
+	}
+	/* bad records: family, padding, v4 tail, a duplicate */
+	memcpy(bad, buf, len);
+	bad[32] = 5;
+	CHECK_EQ(hold_try(bad, len, SECRET, 200, 5000), -EINVAL);
+	memcpy(bad, buf, len);
+	bad[32 + 2] = 1;
+	CHECK_EQ(hold_try(bad, len, SECRET, 200, 5000), -EINVAL);
+	memcpy(bad, buf, len);
+	for (i = 0; i < 4 && bad[32 + i * 24] != 4; i++)
+		;
+	REQUIRE(i < 4);
+	bad[32 + i * 24 + 8 + 15] = 1;
+	CHECK_EQ(hold_try(bad, len, SECRET, 200, 5000), -EINVAL);
+	memcpy(bad, buf, len);
+	memcpy(bad + 32 + 24, bad + 32, 24);
+	CHECK_EQ(hold_try(bad, len, SECRET, 200, 5000), -EINVAL);
+	/* not a regular file */
+	REQUIRE(!mkdir(hold_file, 0700));
+	CHECK(!fakeip_hold_load(hold_file, SECRET, 200, 5000, &err));
+	CHECK(err < 0);
+	rmdir(hold_file);
+	fakeip_unref(db, bs[3]);
+	fakeip_free(db);
+}
+
+static struct nft_elem elem4(uint32_t fake, uint32_t real, uint32_t mark, bool ok)
+{
+	struct nft_elem e = { .family = 4, .ok = ok, .mark = mark };
+
+	memcpy(e.fake, addr4(fake), 4);
+	memcpy(e.real, addr4(real), 4);
+	return e;
+}
+
+TEST(hold_adopt_elems)
+{
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	struct fakeip_db *db, *old;
+	struct fakeip_hold *h;
+	struct nft_elem el[4];
+	uint32_t i, mark;
+	int err = 0;
+
+	reset();
+	hold_setup();
+	/* the earlier process, exiting 20 s after its own adoption: .5 live,
+	 * .6 expired (unlisted), .7 3 s from the end of its quarantine; .8 is
+	 * an inconsistent element */
+	el[0] = elem4(0xc6120005, 0x0a000001, 0x100, true);
+	el[1] = elem4(0xc6120006, 0x0a000002, 0x100, true);
+	el[2] = elem4(0xc6120007, 0x0a000003, 0x200, true);
+	el[3] = elem4(0xc6120008, 0x0a000004, 0x100, false);
+	old = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
+	REQUIRE(old);
+	REQUIRE(fakeip_adopt(old, 4, el[0].fake, el[0].real, 0x100, 500) == 0);
+	REQUIRE(fakeip_adopt(old, 4, el[1].fake, el[1].real, 0x100, 10) == 0);
+	REQUIRE(fakeip_adopt(old, 4, el[2].fake, el[2].real, 0x200, 23) == 0);
+	time_override_advance(20);
+	REQUIRE(fakeip_hold_save(old, hold_file, 300) == 0);
+	fakeip_free(old);
+	for (i = 0; i < 4; i++)
+		kern_put(4, el[i].fake, el[i].mark);
+
+	/* the new process reads it 2 s later */
+	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
+	REQUIRE(db);
+	h = fakeip_hold_load(hold_file, SECRET, 200, 302, &err);
+	REQUIRE(h);
+	CHECK_EQ(fakeip_adopt_elems(db, el, 4, 4200, h), 2);
+	fakeip_hold_free(h);
+	/* the unlisted and the inconsistent element are destroyed */
+	CHECK_EQ(n_del, 2);
+	CHECK_EQ(n_kern, 2);
+	CHECK(kern_find(4, el[1].fake) < 0 && kern_find(4, el[3].fake) < 0);
+	CHECK(fakeip_placeholder(db, 4, el[0].fake, &mark));
+	CHECK_EQ(mark, 0x100);
+	CHECK(fakeip_placeholder(db, 4, el[2].fake, &mark));
+	CHECK_EQ(mark, 0x200);
+	/* .7: 3 - 2 = 1 s left */
+	time_override_advance(1);
+	CHECK_EQ(fakeip_live_count(db), 2);
+	time_override_advance(1);
+	CHECK_EQ(fakeip_live_count(db), 1);
+	CHECK_EQ(fakeip_evict_expired(db), 1);
+	CHECK(fakeip_placeholder(db, 4, el[0].fake, NULL));
+	/* .5: 480 - 2 s left */
+	time_override_advance(476);
+	CHECK_EQ(fakeip_live_count(db), 1);
+	time_override_advance(1);
+	CHECK_EQ(fakeip_live_count(db), 0);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+
+	/* no hold file: every consistent element is quarantined for `hold` */
+	reset();
+	for (i = 0; i < 4; i++)
+		kern_put(4, el[i].fake, el[i].mark);
+	db = fakeip_new(&p4, NULL, 100, 600, SECRET, NFT);
+	REQUIRE(db);
+	CHECK_EQ(fakeip_adopt_elems(db, el, 4, 4200, NULL), 3);
+	CHECK_EQ(n_del, 1);
+	time_override_advance(4200);
+	CHECK_EQ(fakeip_live_count(db), 3);
+	time_override_advance(1);
+	CHECK_EQ(fakeip_live_count(db), 0);
+	CHECK_EQ(kern_bad, 0);
+	fakeip_free(db);
+	hold_cleanup();
+}
+
 int main(void)
 {
 	RUN(determinism);
@@ -1511,5 +1818,8 @@ int main(void)
 	RUN(adopt_claim);
 	RUN(adopt_other_mapping_quarantined);
 	RUN(adopt_capacity);
+	RUN(hold_round_trip);
+	RUN(hold_rejected);
+	RUN(hold_adopt_elems);
 	return test_summary();
 }

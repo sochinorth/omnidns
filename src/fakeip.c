@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "dns/wire.h"
 #include "fakeip.h"
@@ -143,6 +147,12 @@ static void store32be(uint8_t *p, uint32_t v)
 	p[1] = v >> 16;
 	p[2] = v >> 8;
 	p[3] = v;
+}
+
+static void store64be(uint8_t *p, uint64_t v)
+{
+	store32be(p, v >> 32);
+	store32be(p + 4, (uint32_t)v);
 }
 
 /* the (off+1)-th address of the pool; off < pool_usable() */
@@ -785,7 +795,7 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	};
 	const struct ip_prefix *p = db_pool(db, k.family);
 	struct binding *b;
-	uint64_t khash;
+	uint64_t khash, t;
 	int pid;
 
 	if (!p || !pool_allocatable(p, k.family, fake))
@@ -810,7 +820,8 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	b->family = k.family;
 	memcpy(b->fake, fake, alen(k.family));
 	memcpy(b->real, real, alen(k.family));
-	b->safe_until = safe_until_for(db, omni_now(), hold);
+	t = (uint64_t)omni_now() + hold;	/* hold includes the grace */
+	b->safe_until = t > UINT32_MAX ? UINT32_MAX : (uint32_t)t;
 	if (hmap_put(&db->by_key, khash, b)) {
 		free(b);
 		policy_put(db, pid);
@@ -826,6 +837,259 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	s3_insert(&db->s3, &b->s3, khash);
 	stall_wake(db, b);
 	return 0;
+}
+
+/* ---- hold file ---- */
+
+/*
+ * Big-endian. Header: magic, format version, record count, fingerprint
+ * (hold_fingerprint()), CLOCK_BOOTTIME second of the write. Record: family,
+ * three zero bytes, remaining hold in seconds, fake (v4: 4 bytes, then 12
+ * zero bytes).
+ */
+#define HOLD_MAGIC	"OMNIHOLD"
+#define HOLD_VERSION	1
+#define HOLD_HDR	32
+#define HOLD_REC	24
+
+struct hold_rec {
+	uint8_t family;
+	uint32_t hold;
+	uint8_t fake[16];
+};
+
+struct fakeip_hold {
+	uint32_t n;
+	struct hold_rec rec[];	/* sorted by (family, fake) */
+};
+
+/* ties a file to one table instance (its secret) and layout, without
+ * revealing the secret */
+static uint64_t hold_fingerprint(const uint8_t secret[16])
+{
+	uint8_t in[16] = "omnidns hold";
+
+	store32be(in + 12, NFT_LAYOUT_VERSION);
+	return siphash24(secret, in, sizeof(in));
+}
+
+static int write_all(int fd, const uint8_t *p, size_t len)
+{
+	while (len) {
+		ssize_t w = write(fd, p, len);
+
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+		p += w;
+		len -= (size_t)w;
+	}
+	return 0;
+}
+
+int fakeip_hold_save(struct fakeip_db *db, const char *path, uint64_t clock)
+{
+	uint32_t now = omni_now(), it = 0, n = 0;
+	struct binding *b;
+	uint8_t *buf, *p;
+	char tmp[4096];
+	int fd, ret;
+
+	ret = snprintf(tmp, sizeof(tmp), "%s.%ld.tmp", path, (long)getpid());
+	if (ret < 0 || (size_t)ret >= sizeof(tmp))
+		return -ENAMETOOLONG;
+	buf = calloc(1, HOLD_HDR + (size_t)hmap_len(&db->by_key) * HOLD_REC);
+	if (!buf)
+		return -ENOMEM;
+	p = buf + HOLD_HDR;
+	while ((b = hmap_next(&db->by_key, &it))) {
+		if (binding_evictable(b, now))
+			continue;
+		p[0] = b->family;
+		store32be(p + 4, b->safe_until > now ? b->safe_until - now : 0);
+		memcpy(p + 8, b->fake, alen(b->family));
+		p += HOLD_REC;
+		n++;
+	}
+	memcpy(buf, HOLD_MAGIC, 8);
+	store32be(buf + 8, HOLD_VERSION);
+	store32be(buf + 12, n);
+	store64be(buf + 16, hold_fingerprint(db->secret));
+	store64be(buf + 24, clock);
+	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0) {
+		ret = -errno;
+		free(buf);
+		return ret;
+	}
+	ret = write_all(fd, buf, (size_t)(p - buf));
+	free(buf);
+	if (close(fd) && !ret)
+		ret = -errno;
+	/* no fsync: the file lives on tmpfs, and only for this boot */
+	if (!ret && rename(tmp, path))
+		ret = -errno;
+	if (ret)
+		unlink(tmp);
+	return ret;
+}
+
+static int hold_cmp(const void *a, const void *b)
+{
+	const struct hold_rec *x = a, *y = b;
+
+	if (x->family != y->family)
+		return x->family < y->family ? -1 : 1;
+	return memcmp(x->fake, y->fake, 16);
+}
+
+static int hold_parse(const uint8_t *buf, size_t len, const uint8_t secret[16],
+                      uint32_t max_records, uint64_t clock, struct fakeip_hold **out)
+{
+	static const uint8_t zero[16];
+	struct fakeip_hold *h;
+	uint64_t written, elapsed;
+	uint32_t n, i;
+
+	if (len < HOLD_HDR || memcmp(buf, HOLD_MAGIC, 8) || load32be(buf + 8) != HOLD_VERSION)
+		return -EINVAL;
+	n = load32be(buf + 12);
+	if (n > max_records)
+		return -E2BIG;
+	if ((len - HOLD_HDR) % HOLD_REC || (len - HOLD_HDR) / HOLD_REC != n)
+		return -EINVAL;		/* truncated, or trailing bytes */
+	if (load64be(buf + 16) != hold_fingerprint(secret))
+		return -ESTALE;
+	written = load64be(buf + 24);
+	if (written > clock)
+		return -ERANGE;
+	elapsed = clock - written;
+	h = malloc(sizeof(*h) + (size_t)n * sizeof(h->rec[0]));
+	if (!h)
+		return -ENOMEM;
+	h->n = n;
+	for (i = 0; i < n; i++) {
+		const uint8_t *r = buf + HOLD_HDR + (size_t)i * HOLD_REC;
+		struct hold_rec *e = &h->rec[i];
+		uint32_t hold = load32be(r + 4);
+
+		if ((r[0] != 4 && r[0] != 6) || memcmp(r + 1, zero, 3) ||
+		    (r[0] == 4 && memcmp(r + 12, zero, 12))) {
+			free(h);
+			return -EINVAL;
+		}
+		e->family = r[0];
+		e->hold = hold > elapsed ? (uint32_t)(hold - elapsed) : 0;
+		memcpy(e->fake, r + 8, 16);
+	}
+	qsort(h->rec, n, sizeof(h->rec[0]), hold_cmp);
+	for (i = 1; i < n; i++) {
+		if (!hold_cmp(&h->rec[i - 1], &h->rec[i])) {
+			free(h);
+			return -EINVAL;
+		}
+	}
+	*out = h;
+	return 0;
+}
+
+struct fakeip_hold *fakeip_hold_load(const char *path, const uint8_t secret[16],
+                                     uint32_t max_records, uint64_t clock, int *err)
+{
+	struct fakeip_hold *h = NULL;
+	uint64_t max = HOLD_HDR + (uint64_t)max_records * HOLD_REC;
+	struct stat st;
+	uint8_t *buf = NULL;
+	size_t len = 0;
+	ssize_t r;
+	int fd, ret;
+
+	fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0) {
+		*err = -errno;
+		return NULL;
+	}
+	/* whatever it says, it is never read twice */
+	unlink(path);
+	if (fstat(fd, &st)) {
+		ret = -errno;
+		goto out;
+	}
+	ret = -EINVAL;
+	if (!S_ISREG(st.st_mode))
+		goto out;
+	ret = -E2BIG;
+	if ((uint64_t)st.st_size > max)
+		goto out;
+	ret = -ENOMEM;
+	/* one spare byte: a file that grew after the fstat is not a valid one */
+	buf = malloc((size_t)st.st_size + 1);
+	if (!buf)
+		goto out;
+	for (;;) {
+		r = read(fd, buf + len, (size_t)st.st_size + 1 - len);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r < 0) {
+			ret = -errno;
+			goto out;
+		}
+		if (!r || (len += (size_t)r) == (size_t)st.st_size + 1)
+			break;
+	}
+	ret = len == (size_t)st.st_size ? hold_parse(buf, len, secret, max_records, clock, &h)
+	                                : -EINVAL;
+out:
+	free(buf);
+	close(fd);
+	*err = ret;
+	return h;
+}
+
+void fakeip_hold_free(struct fakeip_hold *h)
+{
+	free(h);
+}
+
+uint32_t fakeip_hold_count(const struct fakeip_hold *h)
+{
+	return h ? h->n : 0;
+}
+
+bool fakeip_hold_find(const struct fakeip_hold *h, int family, const uint8_t *fake,
+                      uint32_t *hold)
+{
+	struct hold_rec k = { .family = norm_family(family) };
+	const struct hold_rec *e;
+
+	if (!h)
+		return false;
+	memcpy(k.fake, fake, alen(k.family));
+	e = bsearch(&k, h->rec, h->n, sizeof(k), hold_cmp);
+	if (e && hold)
+		*hold = e->hold;
+	return e != NULL;
+}
+
+uint32_t fakeip_adopt_elems(struct fakeip_db *db, const struct nft_elem *el, uint32_t nel,
+                            uint32_t hold, const struct fakeip_hold *h)
+{
+	uint32_t i, kept = 0, t;
+
+	for (i = 0; i < nel; i++) {
+		const struct nft_elem *e = &el[i];
+
+		t = hold;
+		if (e->ok && (!h || fakeip_hold_find(h, e->family, e->fake, &t)) &&
+		    !fakeip_adopt(db, e->family, e->fake, e->real, e->mark, t)) {
+			kept++;
+			continue;
+		}
+		nft_elem_del(db->nft, e->family, e->fake);
+	}
+	return kept;
 }
 
 bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr)

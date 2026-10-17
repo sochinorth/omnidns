@@ -53,6 +53,7 @@
 #define FAKEIP_MAX_POLICIES 65535	/* policy ids 0..65534 */
 
 struct nft_ctx;
+struct nft_elem;
 
 /*
  * Layout: no padding holes, the endpoint follows the fixed part directly
@@ -125,9 +126,9 @@ struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *f
  * Adoption at startup (main.c, after nft_adopt()): a map element the
  * kernel still holds from an earlier process becomes a placeholder
  * binding: fake -> (real, mark) under a reserved policy (rule id ""), no
- * endpoint, refcnt 0, its ticket done (0), safe_until = now + hold + grace
- * (hold: fakeip_ttl_max, the longest a client may have been told to keep
- * it). Placeholders count against max_bindings and are evicted like any
+ * endpoint, refcnt 0, its ticket done (0), safe_until = now + hold (hold:
+ * fakeip_ttl_max + fakeip_grace, the longest a client may have been told
+ * to keep it, or what the hold file says is left). Placeholders count against max_bindings and are evicted like any
  * expired binding (their elements destroyed). A bind whose key maps to the
  * same (family, real, mark) claims a placeholder it probes: the binding
  * takes over that fake with no nft op (the kernel has the mapping) and
@@ -139,6 +140,48 @@ struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *f
  */
 int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const uint8_t *real,
                  uint32_t mark, uint32_t hold);
+/*
+ * Hold file: what a cleanly exiting process knows and its successor does
+ * not, i.e. which map elements a client may still use and for how long.
+ * Written at exit (main.c, after the last element batch is acked) and read
+ * back at adoption; see docs/DESIGN.md (Restart) for the format.
+ *
+ * fakeip_hold_save(): one record (family, fake, remaining hold) per binding
+ * that is not evictable now (placeholders included): hold = safe_until - now
+ * (0 if past, for a referenced binding). `clock` is the CLOCK_BOOTTIME
+ * second of the write, `secret` the table's (fingerprinted, never stored).
+ * Written to a temporary file renamed over `path`. Returns 0 or -errno.
+ */
+int fakeip_hold_save(struct fakeip_db *db, const char *path, uint64_t clock);
+
+struct fakeip_hold;
+
+/*
+ * Read the hold file at `path` and delete it (whatever it holds). Returns
+ * it with every hold reduced by `clock` - its write time (clamped at 0), or
+ * NULL with *err: -ENOENT (no file), -ESTALE (another table's secret or
+ * another layout), -ERANGE (written in the future: another boot), -E2BIG
+ * (more than max_records), -EINVAL (malformed: truncated, trailing bytes,
+ * bad record, duplicate), -errno. NULL means "trust nothing".
+ */
+struct fakeip_hold *fakeip_hold_load(const char *path, const uint8_t secret[16],
+                                     uint32_t max_records, uint64_t clock, int *err);
+void fakeip_hold_free(struct fakeip_hold *h);
+uint32_t fakeip_hold_count(const struct fakeip_hold *h);
+/* true if listed, its adjusted hold in *hold */
+bool fakeip_hold_find(const struct fakeip_hold *h, int family, const uint8_t *fake,
+                      uint32_t *hold);
+
+/*
+ * Adoption of the elements nft_adopt() read: each consistent element (ok)
+ * becomes a placeholder (fakeip_adopt()) held for `hold`, or, given a hold
+ * file `h`, for the hold it lists; an element `h` does not list was
+ * evictable when the earlier process exited. Every element not adopted is
+ * destroyed (nft_elem_del(), queued). Returns the number adopted.
+ */
+uint32_t fakeip_adopt_elems(struct fakeip_db *db, const struct nft_elem *el, uint32_t nel,
+                            uint32_t hold, const struct fakeip_hold *h);
+
 /* true if `fake` holds a placeholder (its mark in *mark if non-NULL); tests */
 bool fakeip_placeholder(struct fakeip_db *db, int family, const uint8_t *fake, uint32_t *mark);
 uint32_t fakeip_placeholders(const struct fakeip_db *db);	/* unclaimed */

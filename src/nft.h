@@ -55,6 +55,9 @@
 
 #define NFT_BATCH_MAX 1024
 #define NFT_SECRET_LEN 16
+/* version of the table layout (table userdata); nft_adopt() takes over
+ * only a table of this version */
+#define NFT_LAYOUT_VERSION 1
 
 struct nft_ctx;
 
