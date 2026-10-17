@@ -16,6 +16,23 @@ start_service() {
 	procd_close_instance
 }
 
+# The daemon keeps its nftables table on exit, so a restart (and a procd
+# respawn) takes over the fake IPs clients hold. Only a real stop (stop,
+# shutdown, package removal) deletes the table. rc.common defines restart()
+# before sourcing this script and its procd part does not redefine it, so
+# this override is the one that runs.
+restart() {
+	OMNIDNS_RESTART=1
+	trap '' TERM
+	stop "$@"
+	trap - TERM
+	start "$@"
+}
+
+service_stopped() {
+	[ -n "$OMNIDNS_RESTART" ] || "$PROG" -F -c /etc/config/$CONF
+}
+
 # Upstream resolv.conf files and namesets are re-read on SIGHUP.
 reload_service() {
 	procd_send_signal omnidns '*' HUP

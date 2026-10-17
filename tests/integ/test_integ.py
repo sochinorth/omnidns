@@ -202,7 +202,8 @@ EOF""")
     def start_daemon(self):
         log = open(self.dir + "/daemon.log", "a")
         env = dict(os.environ)
-        self.daemon = subprocess.Popen([self.binary, "-f", "-t", TABLE, "-x",
+        # no -x: a restart takes the table over (it goes with the netns)
+        self.daemon = subprocess.Popen([self.binary, "-f", "-t", TABLE,
                                         "-c", self.dir + "/omnidns"],
                                        stdout=log, stderr=log, env=env)
         for _ in range(50):
@@ -705,6 +706,97 @@ def mark_chain_overflow_rejects_reload(env):
     finally:
         p.terminate()
         p.wait(10)
+
+
+@test
+def restart_keeps_fakes(env):
+    """A restart (SIGTERM, start again, no -F) takes the table over: fakes
+    clients hold keep working with their mark, and a re-queried name gets
+    the same fake back."""
+    fake = answers(env.q("warp.test", "A"), "A")[0]
+    other = answers(env.q("inner.warp.test", "A"), "A")[0]
+    check(in_pool(fake) and in_pool(other), "no fakes: %r %r" % (fake, other))
+    env.daemon.terminate()
+    env.daemon.wait(10)
+    check(env.nft_map("fake2real_v4").get(fake) == REAL_A, "table not kept on exit")
+    off = len(env.daemon_log())
+    env.start_daemon()
+    log = env.daemon_log()[off:]
+    m = re.search(r"kept (\d+) fake IPs", log)
+    check(m and int(m.group(1)) >= 2, "table not adopted:\n" + log)
+    # before any query: the adopted elements carry the connection and mark
+    before = env.counters()
+    out = env.connect(fake)
+    check(out == "hello from " + REAL_A, "connect via kept fake: %r" % out)
+    after = env.counters()
+    check(after[0] > before[0] and after[1] > before[1],
+          "mark lost across the restart: %r -> %r" % (before, after))
+    check(env.connect(other) == "hello from " + REAL_A, "other kept fake broken")
+    check(answers(env.q("warp.test", "A"), "A") == [fake], "re-queried name got a new fake")
+    check(env.nft_map("fake2real_v4").get(fake) == REAL_A, "kept element lost")
+
+
+@test
+def restart_quarantine_and_flush(env):
+    """A fake nobody re-queries after a restart keeps working (and holds its
+    capacity) until fakeip_ttl_max + fakeip_grace have passed, then it can be
+    reclaimed. `omnidns -F` deletes the table. Runs a second daemon (own
+    port, table and pool, short lifetimes, one binding)."""
+    table, port = TABLE + "r", 5397
+    d = env.dir + "/restart"
+    os.makedirs(d, exist_ok=True)
+    with open(d + "/w.txt", "w") as f:
+        f.write("*.warp.test\nplain.test\n")
+    cfg = (CONFIG.replace("option port '53'", "option port '%d'" % port)
+           .replace("198.18.0.0/15", "100.65.0.0/16")
+           .replace("{d}/warp.txt", d + "/w.txt")
+           .replace("option block_mode", "option fakeip_ttl_max '2'\n\toption fakeip_grace '2'\n"
+                    "\toption fakeip_max_bindings '1'\n\toption block_mode"))
+    with open(d + "/omnidns", "w") as f:
+        f.write(cfg.format(lan=LAN, d=env.dir))
+    lf = open(d + "/daemon.log", "a")
+
+    def start():
+        p = subprocess.Popen([env.binary, "-f", "-t", table, "-c", d + "/omnidns"],
+                             stdout=lf, stderr=lf)
+        for _ in range(100):
+            try:
+                dnsmini.query(LAN, port, "ads.test", "A", timeout=0.2)
+                return p
+            except OSError:
+                time.sleep(0.1)
+        p.kill()
+        raise AssertionError("second daemon did not come up")
+
+    def q(name):
+        return dnsmini.query(LAN, port, name, "A")
+
+    p = start()
+    try:
+        fake = answers(q("warp.test"), "A")[0]
+        check(fake.startswith("100.65."), "no fake: %r" % fake)
+        p.terminate()
+        p.wait(10)
+        p = start()
+        t0 = time.monotonic()
+        check(env.connect(fake) == "hello from " + REAL_A, "kept fake broken after restart")
+        r = q("plain.test")
+        check(r["rcode"] == 2, "the kept fake does not hold its capacity: %r" % r)
+        time.sleep(max(0, t0 + 5.2 - time.monotonic()))
+        plain = answers(q("plain.test"), "A")
+        check(plain and plain[0].startswith("100.65."), "no fake after the quarantine")
+        out = env.connect(fake)
+        check(out != "hello from " + REAL_A, "fake still mapped after the quarantine: %r" % out)
+    finally:
+        p.terminate()
+        p.wait(10)
+    check(env.nft_map("fake2real_v4", table), "table not kept on exit")
+    for _ in range(2):  # an absent table is success too
+        r = subprocess.run([env.binary, "-F", "-t", table, "-c", d + "/omnidns"],
+                           capture_output=True, text=True)
+        check(r.returncode == 0, "omnidns -F failed: %s" % r.stderr)
+        r = subprocess.run("nft list table inet " + table, shell=True, capture_output=True)
+        check(r.returncode != 0, "table left after omnidns -F")
 
 
 def enter_netns():

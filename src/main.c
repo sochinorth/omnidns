@@ -53,6 +53,8 @@ static bool log_to_stderr;
  * (live bindings reject it, expired ones are evicted). A walk that latched
  * a mark before the change and binds after it is refused by fakeip_bind()
  * (nft_mark_known(): the chain is gone), so it never creates a binding.
+ * At startup, the bindings adopted from an earlier process's table
+ * (placeholders) bring their marks (adopt_table()).
  */
 static uint32_t kept_marks[MAX_MARKS];
 static uint32_t nkept_marks;
@@ -99,6 +101,85 @@ static int build_desired(const struct config *cfg, struct nft_desired *d, uint32
 	d->marks = marks;
 	d->nmarks = n;
 	return 0;
+}
+
+/*
+ * Startup with the table an earlier process left (a restart): take over its
+ * secret, so keys probe the same fakes, and keep its map elements as
+ * placeholder bindings, so fakes clients still hold keep working. Elements
+ * that are not a consistent pair inside the current pools with a known mark
+ * chain are destroyed; beyond fakeip_max_bindings, those after the first
+ * max_bindings in address order (v4 first) are too, since the kernel keeps
+ * no age. Their marks join kept_marks. On success omni.fdb exists and the
+ * table is reconciled with the configuration; otherwise nothing is kept and
+ * the caller bootstraps.
+ */
+static bool adopt_table(void)
+{
+	static uint32_t marks[MAX_MARKS];
+	const struct config *cfg = omni.cfg;
+	struct nft_desired d;
+	struct nft_elem *el;
+	uint8_t secret[NFT_SECRET_LEN];
+	uint32_t nel, i, kept = 0;
+	uint64_t max = 2 * (uint64_t)cfg->fakeip_max_bindings;
+	int ret;
+
+	if (build_desired(cfg, &d, marks, false))
+		return false;
+	if (nft_adopt(omni.nft, &d, max > UINT32_MAX ? UINT32_MAX : (uint32_t)max, secret,
+	              &el, &nel) != 1)
+		return false;
+	omni.fdb = fakeip_new(cfg->has_pool4 ? &cfg->pool4 : NULL,
+	                      cfg->has_pool6 ? &cfg->pool6 : NULL,
+	                      cfg->fakeip_max_bindings, cfg->fakeip_grace, secret, omni.nft);
+	if (!omni.fdb) {
+		free(el);
+		return false;
+	}
+	nkept_marks = 0;
+	ret = 0;
+	for (i = 0; i < nel; i++) {
+		const struct nft_elem *e = &el[i];
+
+		if (!ret && e->ok && !fakeip_adopt(omni.fdb, e->family, e->fake, e->real, e->mark,
+		                                   cfg->fakeip_ttl_max)) {
+			kept++;
+			ret = add_mark(kept_marks, &nkept_marks, e->mark);
+			continue;
+		}
+		nft_elem_del(omni.nft, e->family, e->fake);
+	}
+	free(el);
+	if (ret) {
+		log_warn("startup: fake IPs of the existing table use more than %d marks",
+		         MAX_MARKS);
+		goto fail;
+	}
+	ret = build_desired(cfg, &d, marks, true);
+	if (ret) {
+		log_warn("startup: more than %d marks with those of the existing table's fake IPs",
+		         MAX_MARKS);
+		goto fail;
+	}
+	/* the deletes must land before chains they reference go */
+	nft_flush(omni.nft);
+	ret = nft_drain(omni.nft);
+	if (!ret)
+		ret = nft_reconcile(omni.nft, &d);
+	if (ret)
+		goto fail;
+	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
+	nkept_marks = d.nmarks;
+	log_info("startup: kept %u fake IPs of the existing table, dropped %u", kept, nel - kept);
+	return true;
+
+fail:
+	log_warn("startup: cannot take over the existing table; recreating it");
+	fakeip_free(omni.fdb);
+	omni.fdb = NULL;
+	nkept_marks = 0;
+	return false;
 }
 
 static void apply_runtime_limits(const struct config *cfg)
@@ -220,33 +301,44 @@ static struct uloop_timeout sweep_timer = { .cb = sweep_cb };
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"usage: %s [-c config] [-f] [-t nft_table] [-x]\n"
+		"usage: %s [-c config] [-f] [-t nft_table] [-x | -F]\n"
 		"  -c  UCI config file (default /etc/config/omnidns)\n"
 		"  -f  log to stderr instead of syslog\n"
 		"  -t  nftables table name (default omnidns)\n"
-		"  -x  delete the nftables table on exit\n", prog);
+		"  -x  delete the nftables table on exit (by default a restarted\n"
+		"      daemon takes it over, with the fake IPs clients hold)\n"
+		"  -F  delete the nftables table and exit (service stop)\n", prog);
 }
 
 int main(int argc, char **argv)
 {
 	static uint32_t marks[MAX_MARKS];
 	struct nft_desired d;
-	uint8_t secret[16];
+	uint8_t secret[NFT_SECRET_LEN];
+	bool flush_only = false;
 	char err[512];
 	int opt, ret = 1;
 
 	omni.config_path = "/etc/config/omnidns";
-	while ((opt = getopt(argc, argv, "c:ft:xh")) != -1) {
+	while ((opt = getopt(argc, argv, "c:ft:xFh")) != -1) {
 		switch (opt) {
 		case 'c': omni.config_path = optarg; break;
 		case 'f': log_to_stderr = true; break;
 		case 't': nft_table = optarg; break;
 		case 'x': destroy_on_exit = true; break;
+		case 'F': flush_only = true; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
 	}
 
 	log_init("omnidns", log_to_stderr, LOG_INFO);
+	if (flush_only) {
+		/* the config is not read: a broken one must not keep the table */
+		omni.nft = nft_open(nft_table);
+		ret = !omni.nft || nft_destroy_table(omni.nft);
+		nft_close(omni.nft);
+		return ret;
+	}
 	hash_init();
 	if (getrandom(secret, sizeof(secret), 0) != sizeof(secret)) {
 		log_err("getrandom: %s", strerror(errno));
@@ -272,16 +364,20 @@ int main(int argc, char **argv)
 		log_err("cannot open nftables netlink socket");
 		goto out_loop;
 	}
-	if (build_desired(omni.cfg, &d, marks, false) || nft_bootstrap(omni.nft, &d)) {
-		log_err("nftables bootstrap failed");
-		goto out_nft;
+	nft_set_secret(omni.nft, secret);
+	if (!adopt_table()) {
+		nft_set_secret(omni.nft, secret);	/* adoption may have read another */
+		if (build_desired(omni.cfg, &d, marks, false) || nft_bootstrap(omni.nft, &d)) {
+			log_err("nftables bootstrap failed");
+			goto out_nft;
+		}
+		memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
+		nkept_marks = d.nmarks;
+		omni.fdb = fakeip_new(omni.cfg->has_pool4 ? &omni.cfg->pool4 : NULL,
+		                      omni.cfg->has_pool6 ? &omni.cfg->pool6 : NULL,
+		                      omni.cfg->fakeip_max_bindings, omni.cfg->fakeip_grace,
+		                      secret, omni.nft);
 	}
-	memcpy(kept_marks, marks, d.nmarks * sizeof(*marks));
-	nkept_marks = d.nmarks;
-	omni.fdb = fakeip_new(omni.cfg->has_pool4 ? &omni.cfg->pool4 : NULL,
-	                      omni.cfg->has_pool6 ? &omni.cfg->pool6 : NULL,
-	                      omni.cfg->fakeip_max_bindings, omni.cfg->fakeip_grace,
-	                      secret, omni.nft);
 	omni.cache = cache_new(omni.cfg->cache_size, omni.cfg->cache_max_bytes, omni.fdb);
 	if (!omni.fdb || !omni.cache) {
 		log_err("out of memory");
