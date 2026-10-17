@@ -1968,7 +1968,7 @@ static void fail_inflight(struct nft_ctx *n, int err)
 		batch_complete(n, b, b->err ? b->err : err);
 }
 
-/* Read all pending acks until the socket would block. */
+/* Read all pending acks until the socket would block; complete failed batches. */
 static void async_read(struct nft_ctx *n)
 {
 	int fd = mnl_socket_get_fd(n->async);
@@ -1984,18 +1984,16 @@ static void async_read(struct nft_ctx *n)
 				log_err("nft: async recv: %s", strerror(errno));
 				fail_inflight(n, -errno);
 			}
-			return;
+			break;
 		}
 		parse_acks(buf, (int)len, async_ack, n);
 	}
+	complete_failed(n);
 }
 
 static void async_fd_cb(struct uloop_fd *u, unsigned int events)
 {
-	struct nft_ctx *n = container_of(u, struct nft_ctx, ufd);
-
-	async_read(n);
-	complete_failed(n);
+	async_read(container_of(u, struct nft_ctx, ufd));
 }
 
 int nft_drain(struct nft_ctx *n)
@@ -2017,7 +2015,6 @@ int nft_drain(struct nft_ctx *n)
 			break;
 		}
 		async_read(n);
-		complete_failed(n);
 	}
 	n->draining = false;
 	return n->drain_err;
