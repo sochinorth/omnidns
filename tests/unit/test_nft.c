@@ -850,8 +850,8 @@ TEST(fakeip_failed_batch)
 	b = fakeip_bind(db, "r", 0x05000000, (const uint8_t *)"\1b\0", 3, 4, r, 60, &err);
 	REQUIRE(a && b);
 	CHECK_EQ(a->ticket, b->ticket);
-	memcpy(afake, a->fake, 4);
-	memcpy(bfake, b->fake, 4);
+	memcpy(afake, binding_fake(a), 4);
+	memcpy(bfake, binding_fake(b), 4);
 	fakeip_ref(a);		/* a cache entry still holds it */
 	nft_flush(n);		/* sent; encoded elements discarded */
 	c = fakeip_bind(db, "r", 0x02000000, (const uint8_t *)"\1c\0", 3, 4, r, 60, &err);
@@ -868,7 +868,7 @@ TEST(fakeip_failed_batch)
 	CHECK_EQ(fakeip_count(db), 1);
 	CHECK(!fakeip_lookup(db, 4, afake));
 	CHECK(!fakeip_lookup(db, 4, bfake));
-	CHECK(fakeip_lookup(db, 4, c->fake) == c);
+	CHECK(fakeip_lookup(db, 4, binding_fake(c)) == c);
 	/* a later (deferred) wait on the failed ticket still reports it */
 	wait_on(&wa, a->ticket);
 	run_loop();
@@ -877,7 +877,7 @@ TEST(fakeip_failed_batch)
 	o = list_table();
 	inet_ntop(AF_INET, afake, buf, sizeof(buf));
 	CHECK(lacks(o, buf));
-	inet_ntop(AF_INET, c->fake, buf, sizeof(buf));
+	inet_ntop(AF_INET, binding_fake(c), buf, sizeof(buf));
 	strcat(buf, " : 10.3.3.3");
 	CHECK(has(o, buf));
 	free(o);

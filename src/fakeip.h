@@ -85,6 +85,34 @@ struct binding {
 _Static_assert(offsetof(struct binding, endpoint) == 2 * sizeof(void *) + 60,
                "binding layout");
 
+/* Read a binding's addresses and endpoint through these (fake and real
+ * are alen(family) bytes). */
+static inline size_t binding_alen(const struct binding *b)
+{
+	return b->family == 4 ? 4 : 16;
+}
+
+static inline size_t binding_size(int family, uint8_t endpoint_len)
+{
+	(void)family;
+	return offsetof(struct binding, endpoint) + endpoint_len;
+}
+
+static inline const uint8_t *binding_fake(const struct binding *b)
+{
+	return b->fake;
+}
+
+static inline const uint8_t *binding_real(const struct binding *b)
+{
+	return b->real;
+}
+
+static inline const uint8_t *binding_endpoint(const struct binding *b)
+{
+	return b->endpoint;
+}
+
 struct fakeip_db;
 
 /* p4/p6 may be NULL. secret: 16 random bytes (or fixed in tests). */

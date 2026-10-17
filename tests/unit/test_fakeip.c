@@ -213,7 +213,7 @@ static uint32_t fake4(const struct binding *b)
 {
 	uint32_t v;
 
-	memcpy(&v, b->fake, 4);
+	memcpy(&v, binding_fake(b), 4);
 	return ntohl(v);
 }
 
@@ -231,11 +231,11 @@ static bool allocatable(const struct ip_prefix *p, const struct binding *b)
 		int bits = p->plen - 8 * i;
 		uint8_t m = bits >= 8 ? 0xff : bits <= 0 ? 0 : (uint8_t)(0xff00 >> bits);
 
-		if ((b->fake[i] ^ p->addr[i]) & m)
+		if ((binding_fake(b)[i] ^ p->addr[i]) & m)
 			return false;
 	}
 	for (int i = 0; i < 16; i++)
-		if (b->fake[i] != p->addr[i])
+		if (binding_fake(b)[i] != p->addr[i])
 			return true;
 	return false;	/* subnet-router anycast */
 }
@@ -263,10 +263,10 @@ TEST(determinism)
 		y = bind4(b, "r1", 0x100, name, 0x01020300 + i, 60, &err);
 		z = bind4(c, "r1", 0x100, name, 0x01020300 + i, 60, &err);
 		REQUIRE(x && y && z);
-		CHECK(!memcmp(x->fake, y->fake, 4));
+		CHECK(!memcmp(binding_fake(x), binding_fake(y), 4));
 		CHECK(allocatable(&p4, x));
 		CHECK(allocatable(&p4, z));
-		differ += !!memcmp(x->fake, z->fake, 4);
+		differ += !!memcmp(binding_fake(x), binding_fake(z), 4);
 	}
 	CHECK(differ >= 15);
 	CHECK(!fakeip_has_pool(a, 6));
@@ -366,7 +366,7 @@ TEST(reclaim)
 	CHECK_EQ(n_add_replace, 1);
 	CHECK_EQ(n_del, 0);
 	CHECK_EQ(fakeip_count(db), 2);
-	CHECK(fakeip_lookup(db, 4, c->fake) == c);
+	CHECK(fakeip_lookup(db, 4, binding_fake(c)) == c);
 	while ((d = fakeip_next(db, &it)))
 		seen |= (d == b) | (d == c) << 1;
 	CHECK_EQ(seen, 3);
@@ -424,8 +424,8 @@ TEST(pins)
 	REQUIRE(bs[4]);
 	CHECK_EQ(n_del, 1);
 	CHECK_EQ(fakeip_count(db), 4);
-	CHECK(fakeip_lookup(db, 4, bs[0]->fake) == bs[0]);
-	CHECK(fakeip_lookup(db, 4, bs[4]->fake) == bs[4]);
+	CHECK(fakeip_lookup(db, 4, binding_fake(bs[0])) == bs[0]);
+	CHECK(fakeip_lookup(db, 4, binding_fake(bs[4])) == bs[4]);
 	CHECK_EQ(kern_bad, 0);
 	fakeip_free(db);
 }
@@ -453,7 +453,7 @@ TEST(keys)
 	CHECK(b[6] == b[0]);
 	for (int i = 0; i < 5; i++)
 		for (int j = i + 1; j < 5; j++)
-			CHECK(b[i] != b[j] && memcmp(b[i]->fake, b[j]->fake, 4));
+			CHECK(b[i] != b[j] && memcmp(binding_fake(b[i]), binding_fake(b[j]), 4));
 	CHECK_EQ(fakeip_count(db), 5);
 	CHECK_STR(fakeip_rule_id(db, b[0]), "r1");
 	CHECK_STR(fakeip_rule_id(db, b[2]), "r1");
@@ -462,13 +462,13 @@ TEST(keys)
 	CHECK_STR(fakeip_rule_id(db, b[1]), "r2");
 	CHECK_EQ(fakeip_policy_count(db), 3);
 	CHECK_EQ(fakeip_policy_refs(db, "r1", 1), 3);
-	CHECK(!memcmp(b[0]->endpoint, "\3www\7example\3com", 17));
+	CHECK(!memcmp(binding_endpoint(b[0]), "\3www\7example\3com", 17));
 	CHECK_EQ(b[0]->endpoint_len, 17);
-	CHECK(fakeip_in_pool(db, 4, b[0]->fake));
+	CHECK(fakeip_in_pool(db, 4, binding_fake(b[0])));
 	CHECK(fakeip_in_pool(db, AF_INET, (const uint8_t *)"\xc6\x13\xff\xff"));
 	CHECK(!fakeip_in_pool(db, 4, (const uint8_t *)"\xc6\x14\0\0"));
 	CHECK(!fakeip_lookup(db, 4, (const uint8_t *)"\xc6\x14\0\0"));
-	CHECK(fakeip_lookup(db, AF_INET, b[3]->fake) == b[3]);
+	CHECK(fakeip_lookup(db, AF_INET, binding_fake(b[3])) == b[3]);
 	fakeip_free(db);
 }
 
@@ -489,11 +489,11 @@ static void check_v6(const char *base, int plen)
 			break;
 		ok++;
 		CHECK(allocatable(&p6, b));
-		CHECK(fakeip_in_pool(db, 6, b->fake));
-		CHECK(fakeip_lookup(db, AF_INET6, b->fake) == b);
+		CHECK(fakeip_in_pool(db, 6, binding_fake(b)));
+		CHECK(fakeip_lookup(db, AF_INET6, binding_fake(b)) == b);
 		CHECK_EQ(b->family, 6);
 		if (plen <= 64)
-			CHECK(!memcmp(b->fake, p6.addr, 8));	/* low 2^64 only */
+			CHECK(!memcmp(binding_fake(b), p6.addr, 8));	/* low 2^64 only */
 	}
 	if (plen == 120) {
 		CHECK(ok <= 255);
@@ -539,19 +539,19 @@ TEST(fail_hook)
 	CHECK_EQ(a->ticket, 5);
 	fakeip_ref(a);
 	uint8_t afake[4];
-	memcpy(afake, a->fake, 4);
+	memcpy(afake, binding_fake(a), 4);
 	fail_batch(5);
 	CHECK_EQ(n_del, 0);
 	CHECK_EQ(fakeip_count(db), 1);
 	CHECK(!fakeip_lookup(db, 4, afake));
-	CHECK(fakeip_lookup(db, 4, c->fake) == c);
+	CHECK(fakeip_lookup(db, 4, binding_fake(c)) == c);
 	CHECK_STR(fakeip_rule_id(db, a), "r");
 	CHECK_EQ(fakeip_mark(db, a), 7);	/* detached but still valid while referenced */
 	a2 = bind4(db, "r", 7, "a.example", 1, 60, &err);
 	REQUIRE(a2);
 	CHECK(a2 != a);
 	CHECK_EQ(a2->ticket, 6);
-	CHECK(!memcmp(a2->fake, afake, 4));	/* deterministic */
+	CHECK(!memcmp(binding_fake(a2), afake, 4));	/* deterministic */
 	fakeip_unref(db, a);
 	CHECK_EQ(n_add, 4);
 	CHECK_EQ(n_kern, 2);
@@ -582,7 +582,7 @@ TEST(set_config)
 	it = 0;
 	while ((b = fakeip_next(db, &it)))
 		if (b->family == 4)
-			*(b->fake[1] == 18 ? &in : &out) += 1;
+			*(binding_fake(b)[1] == 18 ? &in : &out) += 1;
 	REQUIRE(in && out);
 	/* live bindings outside the shrunk pool */
 	time_override_advance(100);
@@ -612,15 +612,15 @@ TEST(set_config)
 	CHECK(!fakeip_in_pool(db, 4, hi));
 	it = 0;
 	while ((b = fakeip_next(db, &it)))
-		CHECK(b->family == 6 || b->fake[1] == 18);
+		CHECK(b->family == 6 || binding_fake(b)[1] == 18);
 	b = bind4(db, "r", 0, "new", 1, 10, &err);
 	REQUIRE(b);
-	CHECK_EQ(b->fake[1], 18);
+	CHECK_EQ(binding_fake(b)[1], 18);
 	CHECK_EQ(b->safe_until, omni_now() + 15);
 	/* shrinking max_bindings evicts expired ones */
 	CHECK_EQ(fakeip_set_config(db, &p16, &p6, 4, 5), 0);
 	CHECK(fakeip_count(db) <= 4);
-	CHECK(fakeip_lookup(db, 4, b->fake) == b);
+	CHECK(fakeip_lookup(db, 4, binding_fake(b)) == b);
 	CHECK_EQ(kern_bad, 0);
 	fakeip_free(db);
 }
@@ -808,8 +808,8 @@ static void check_invariants(struct fakeip_db *db, const struct ip_prefix *p4,
 	while ((b = fakeip_next(db, &it))) {
 		n++;
 		CHECK(allocatable(b->family == 4 ? p4 : p6, b));
-		CHECK(fakeip_lookup(db, b->family, b->fake) == b);
-		k = kern_find(b->family, b->fake);
+		CHECK(fakeip_lookup(db, b->family, binding_fake(b)) == b);
+		k = kern_find(b->family, binding_fake(b));
 		CHECK(k >= 0);
 		if (k >= 0)
 			CHECK_EQ(kern[k].mark, fakeip_mark(db, b));
@@ -843,7 +843,7 @@ static void check_policies(struct fakeip_db *db, struct binding *const *held, in
 		bool dup = false;
 
 		b = held[h];
-		if (!b || fakeip_lookup(db, b->family, b->fake) == b)
+		if (!b || fakeip_lookup(db, b->family, binding_fake(b)) == b)
 			continue;
 		for (int j = 0; j < h; j++)
 			dup |= held[j] == b;
@@ -1030,7 +1030,7 @@ TEST(policy_refcount)
 
 	/* a detached binding keeps its pair until the last unref */
 	fail_batch(b->ticket);
-	CHECK(!fakeip_lookup(db, 4, b->fake));
+	CHECK(!fakeip_lookup(db, 4, binding_fake(b)));
 	CHECK_EQ(fakeip_policy_refs(db, "r", 1), 1);
 	CHECK_STR(fakeip_rule_id(db, b), "r");
 	x = bind4(db, "r", 1, "b.example", 1, 60, &err);	/* same key, new binding */
@@ -1142,8 +1142,8 @@ static uint64_t pin_v4(struct fakeip_db *db, uint32_t *first)
 		}
 		if (i < 4)
 			first[i] = fake4(b);
-		h = fnv(h, b->fake, 4);
-		CHECK(fakeip_lookup(db, 4, b->fake) == b);
+		h = fnv(h, binding_fake(b), 4);
+		CHECK(fakeip_lookup(db, 4, binding_fake(b)) == b);
 	}
 	return h;
 }
@@ -1165,8 +1165,8 @@ static uint64_t pin_v6(const char *base, int plen)
 			h = fnv(h, &err, sizeof(err));
 			continue;
 		}
-		h = fnv(h, b->fake, 16);
-		CHECK(fakeip_lookup(db, 6, b->fake) == b);
+		h = fnv(h, binding_fake(b), 16);
+		CHECK(fakeip_lookup(db, 6, binding_fake(b)) == b);
 	}
 	fakeip_free(db);
 	return h;
@@ -1221,7 +1221,7 @@ TEST(pinned)
 		snprintf(name, sizeof(name), "old%d", i);
 		olds[i] = bind4(db, "r", 0, name, i, 5, &err);
 		REQUIRE(olds[i]);
-		h = fnv(h, olds[i]->fake, 4);
+		h = fnv(h, binding_fake(olds[i]), 4);
 	}
 	CHECK(!bind4(db, "r", 0, "new0", 1, 5, &err));
 	time_override_advance(10);
@@ -1231,9 +1231,9 @@ TEST(pinned)
 		snprintf(name, sizeof(name), "new%d", i);
 		b = bind4(db, "r", 0, name, i, 5, &err);
 		REQUIRE(b);
-		h = fnv(h, b->fake, 4);
-		CHECK(fakeip_lookup(db, 4, b->fake) == b);
-		CHECK(!memcmp(b->endpoint + 1, "new", 3));
+		h = fnv(h, binding_fake(b), 4);
+		CHECK(fakeip_lookup(db, 4, binding_fake(b)) == b);
+		CHECK(!memcmp(binding_endpoint(b) + 1, "new", 3));
 	}
 	fprintf(stderr, "  pin reclaim %#llx\n", (unsigned long long)h);
 	CHECK_EQ(h, PIN_RECLAIM);
@@ -1255,8 +1255,8 @@ TEST(pinned)
 	CHECK_EQ(fakeip_set_config(db, &p16, NULL, 1000, 0), 0);
 	it = 0;
 	while ((b = fakeip_next(db, &it))) {
-		CHECK_EQ(b->fake[1], 18);
-		CHECK(fakeip_lookup(db, 4, b->fake) == b);
+		CHECK_EQ(binding_fake(b)[1], 18);
+		CHECK(fakeip_lookup(db, 4, binding_fake(b)) == b);
 	}
 	h = FNV0;
 	for (int i = 0; i < 80; i++) {
@@ -1265,8 +1265,8 @@ TEST(pinned)
 		snprintf(name, sizeof(name), "k%d", i);
 		b = bind4(db, "r", 1, name, i, 5, &err);
 		REQUIRE(b);
-		CHECK_EQ(b->fake[1], 18);
-		h = fnv(h, b->fake, 4);
+		CHECK_EQ(binding_fake(b)[1], 18);
+		h = fnv(h, binding_fake(b), 4);
 	}
 	fprintf(stderr, "  pin reload %#llx\n", (unsigned long long)h);
 	CHECK_EQ(h, PIN_RELOAD);
@@ -1585,7 +1585,7 @@ static void file_put(const uint8_t *buf, size_t len)
 
 static bool hold_has(const struct fakeip_hold *h, const struct binding *b, uint32_t *hold)
 {
-	return fakeip_hold_find(h, b->family, b->fake, hold);
+	return fakeip_hold_find(h, b->family, binding_fake(b), hold);
 }
 
 /* at 1000: a live, b expired, a placeholder in quarantine, d expired but
@@ -1620,7 +1620,7 @@ TEST(hold_round_trip)
 	struct binding *bs[5];
 	struct fakeip_db *db;
 	struct fakeip_hold *h;
-	uint8_t buf[512];
+	uint8_t buf[512], f16[16] = { 0 };
 	uint32_t hold = 0;
 	int err = 0;
 
@@ -1646,7 +1646,8 @@ TEST(hold_round_trip)
 	CHECK_EQ(hold, 0);
 	CHECK(hold_has(h, bs[4], &hold));
 	CHECK_EQ(hold, 50 - 10);
-	CHECK(!fakeip_hold_find(h, 6, bs[0]->fake, NULL));	/* the family counts */
+	memcpy(f16, binding_fake(bs[0]), 4);	/* as stored: 4 + 12 zero bytes */
+	CHECK(!fakeip_hold_find(h, 6, f16, NULL));	/* the family counts */
 	fakeip_hold_free(h);
 
 	/* elapsed time beyond a hold clamps it at 0 */

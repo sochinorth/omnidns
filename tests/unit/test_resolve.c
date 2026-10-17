@@ -610,8 +610,8 @@ static bool is_fake(int fam, const uint8_t *addr, const char *real, uint32_t mar
 	uint8_t r[16];
 
 	inet_pton(fam == 4 ? AF_INET : AF_INET6, real, r);
-	if (!b || memcmp(b->real, r, fam == 4 ? 4 : 16) || fakeip_mark(o.fdb, b) != mark ||
-	    strcmp(ntext(b->endpoint, b->endpoint_len), endpoint)) {
+	if (!b || memcmp(binding_real(b), r, fam == 4 ? 4 : 16) || fakeip_mark(o.fdb, b) != mark ||
+	    strcmp(ntext(binding_endpoint(b), b->endpoint_len), endpoint)) {
 		fprintf(stderr, "    not a fake of %s/%x/%s\n", real, mark, endpoint);
 		return false;
 	}
@@ -1829,7 +1829,7 @@ TEST(u_fwmask_change_in_flight)
 	b = fakeip_lookup(o.fdb, 4, fresh.m.rr[0].rdata);
 	REQUIRE(b);
 	CHECK_EQ(fakeip_mark(o.fdb, b), 0x00010000u);
-	CHECK(in_kernel(4, b->fake, "1.2.3.5", 0x00010000u));
+	CHECK(in_kernel(4, binding_fake(b), "1.2.3.5", 0x00010000u));
 	CHECK_EQ(fakeip_count(o.fdb), 1);
 	dns_msg_free(&stale.m);
 	dns_msg_free(&fresh.m);

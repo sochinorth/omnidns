@@ -244,8 +244,8 @@ static bool key_eq(const void *val, const void *key, void *ctx)
 	/* interned: equal ids <=> equal (rule_id, mark) */
 	return b->policy == k->policy && b->family == k->family &&
 	       b->endpoint_len == k->endpoint_len &&
-	       !memcmp(b->endpoint, k->endpoint, k->endpoint_len) &&
-	       !memcmp(b->real, k->real, alen(k->family));
+	       !memcmp(binding_endpoint(b), k->endpoint, k->endpoint_len) &&
+	       !memcmp(binding_real(b), k->real, alen(k->family));
 }
 
 static bool fake_eq(const void *val, const void *key, void *ctx)
@@ -253,7 +253,26 @@ static bool fake_eq(const void *val, const void *key, void *ctx)
 	const struct binding *b = val;
 	const struct fkey *k = key;
 
-	return b->family == k->family && !memcmp(b->fake, k->fake, alen(k->family));
+	return b->family == k->family && !memcmp(binding_fake(b), k->fake, alen(k->family));
+}
+
+/* a zeroed binding with its key fields and tail filled in; NULL on ENOMEM */
+static struct binding *binding_new(int pid, int family, const uint8_t *fake,
+                                   const uint8_t *real, const uint8_t *endpoint,
+                                   uint8_t endpoint_len)
+{
+	struct binding *b = calloc(1, binding_size(family, endpoint_len));
+	size_t n = alen(family);
+
+	if (!b)
+		return NULL;
+	b->policy = pid;
+	b->family = family;
+	b->endpoint_len = endpoint_len;
+	memcpy(b->fake, fake, n);
+	memcpy(b->real, real, n);
+	memcpy(b->endpoint, endpoint, endpoint_len);
+	return b;
 }
 
 /* ---- policy table ---- */
@@ -368,7 +387,7 @@ static void binding_free(struct fakeip_db *db, struct binding *b)
 static void binding_unmap(struct fakeip_db *db, struct binding *b)
 {
 	hmap_del_ptr(&db->by_key, b->s3.hash, b);
-	hmap_del_ptr(&db->by_fake, fake_hash(b->family, b->fake), b);
+	hmap_del_ptr(&db->by_fake, fake_hash(b->family, binding_fake(b)), b);
 }
 
 /* Full removal; the binding is freed unless still referenced. */
@@ -378,7 +397,7 @@ static void binding_drop(struct fakeip_db *db, struct binding *b, bool nft_del)
 	b->s3.list.next = b->s3.list.prev = NULL;
 	binding_unmap(db, b);
 	if (nft_del)
-		nft_elem_del(db->nft, b->family, b->fake);
+		nft_elem_del(db->nft, b->family, binding_fake(b));
 	if (!b->refcnt)
 		binding_free(db, b);
 }
@@ -409,7 +428,7 @@ static void s3_on_evict(struct s3fifo *s, struct s3_node *n)
 
 	b->s3.list.next = b->s3.list.prev = NULL;
 	binding_unmap(db, b);
-	nft_elem_del(db->nft, b->family, b->fake);
+	nft_elem_del(db->nft, b->family, binding_fake(b));
 	binding_free(db, b);
 }
 
@@ -512,7 +531,8 @@ static uint32_t safe_until_for(const struct fakeip_db *db, uint32_t now, uint32_
 static bool claimable(const struct fakeip_db *db, const struct binding *o, const struct bkey *k)
 {
 	return is_placeholder(db, o) && o->family == k->family &&
-	       db->pol[o->policy]->mark == k->mark && !memcmp(o->real, k->real, alen(k->family));
+	       db->pol[o->policy]->mark == k->mark &&
+	       !memcmp(binding_real(o), k->real, alen(k->family));
 }
 
 /*
@@ -630,21 +650,15 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 		}
 	}
 	r = -ENOMEM;
-	b = calloc(1, offsetof(struct binding, endpoint) + k->endpoint_len);
+	b = binding_new(pid, k->family, fake, k->real, k->endpoint, k->endpoint_len);
 	if (!b)
 		goto fail_policy;
-	b->policy = pid;
-	b->family = k->family;
-	memcpy(b->fake, fake, alen(k->family));
-	memcpy(b->real, k->real, alen(k->family));
-	b->endpoint_len = k->endpoint_len;
-	memcpy(b->endpoint, k->endpoint, k->endpoint_len);
 	b->safe_until = safe_until_for(db, now, ttl);
 	if (b->safe_until < hold)	/* clients of the earlier process may hold it */
 		b->safe_until = hold;
 	if (hmap_put(&db->by_key, khash, b))
 		goto fail_free;
-	if (hmap_put(&db->by_fake, fake_hash(b->family, b->fake), b)) {
+	if (hmap_put(&db->by_fake, fake_hash(b->family, binding_fake(b)), b)) {
 		hmap_del_ptr(&db->by_key, khash, b);
 		goto fail_free;
 	}
@@ -655,7 +669,8 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	stall_wake(db, b);
 	/* a claimed placeholder: the kernel has this very mapping (ticket 0
 	 * counts as done) */
-	b->ticket = claim ? 0 : nft_elem_add(db->nft, b->family, b->fake, b->real, k->mark);
+	b->ticket = claim ? 0 : nft_elem_add(db->nft, b->family, binding_fake(b),
+	                                     binding_real(b), k->mark);
 	return b;
 
 fail_free:
@@ -817,17 +832,11 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	pid = policy_get(db, &k);
 	if (pid < 0)
 		return pid;
-	b = calloc(1, offsetof(struct binding, endpoint) + k.endpoint_len);
+	b = binding_new(pid, k.family, fake, real, fake, k.endpoint_len);
 	if (!b) {
 		policy_put(db, pid);
 		return -ENOMEM;
 	}
-	b->policy = pid;
-	b->family = k.family;
-	memcpy(b->fake, fake, alen(k.family));
-	memcpy(b->real, real, alen(k.family));
-	b->endpoint_len = k.endpoint_len;
-	memcpy(b->endpoint, fake, k.endpoint_len);
 	t = (uint64_t)omni_now() + hold;	/* hold includes the grace */
 	b->safe_until = t > UINT32_MAX ? UINT32_MAX : (uint32_t)t;
 	if (hmap_put(&db->by_key, khash, b)) {
@@ -835,7 +844,7 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 		policy_put(db, pid);
 		return -ENOMEM;
 	}
-	if (hmap_put(&db->by_fake, fake_hash(b->family, b->fake), b)) {
+	if (hmap_put(&db->by_fake, fake_hash(b->family, binding_fake(b)), b)) {
 		hmap_del_ptr(&db->by_key, khash, b);
 		free(b);
 		policy_put(db, pid);
@@ -917,7 +926,7 @@ int fakeip_hold_save(struct fakeip_db *db, const char *path, uint64_t clock)
 			continue;
 		p[0] = b->family;
 		store32be(p + 4, b->safe_until > now ? b->safe_until - now : 0);
-		memcpy(p + 8, b->fake, alen(b->family));
+		memcpy(p + 8, binding_fake(b), binding_alen(b));
 		p += HOLD_REC;
 		n++;
 	}
@@ -1111,7 +1120,7 @@ bool fakeip_in_pool(const struct fakeip_db *db, int family, const uint8_t *addr)
 
 static bool fits_pool(const struct ip_prefix *p, const struct binding *b)
 {
-	return p && pool_allocatable(p, b->family, b->fake);
+	return p && pool_allocatable(p, b->family, binding_fake(b));
 }
 
 int fakeip_set_config(struct fakeip_db *db, const struct ip_prefix *p4,

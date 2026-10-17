@@ -628,7 +628,8 @@ static bool try_ptr(struct resolve_req *r)
 	if (b) {
 		out_init(r, DNS_R_NOERROR);
 		if (dns_msg_add_rr(&r->out, DNS_S_AN, r->qname.data, r->qname.len,
-		                   DNS_T_PTR, DNS_C_IN, PTR_TTL, b->endpoint, b->endpoint_len))
+		                   DNS_T_PTR, DNS_C_IN, PTR_TTL, binding_endpoint(b),
+		                   b->endpoint_len))
 			return servfail(r), true;
 	} else {
 		out_init(r, DNS_R_NXDOMAIN);
@@ -892,7 +893,8 @@ static void commit_wait(struct resolve_req *r)
 	}
 	/* a failed batch drops its bindings from the DB */
 	for (i = 0; i < r->nbinds; i++)
-		if (fakeip_lookup(o->fdb, r->binds[i]->family, r->binds[i]->fake) != r->binds[i]) {
+		if (fakeip_lookup(o->fdb, r->binds[i]->family, binding_fake(r->binds[i])) !=
+		    r->binds[i]) {
 			servfail(r);
 			return;
 		}
@@ -957,7 +959,7 @@ static int hint_fn(void *ctx, int family, const uint8_t *in, uint8_t *out)
 	            family, in, h->ttl, &err);
 	if (!b)
 		return err == -EDQUOT ? 1 : err;
-	memcpy(out, b->fake, family == 4 ? 4 : 16);
+	memcpy(out, binding_fake(b), family == 4 ? 4 : 16);
 	return 0;
 }
 
@@ -999,7 +1001,7 @@ static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struc
 	if (!b)
 		return err == -EDQUOT ? 0 : err;
 	return dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len, rr->type,
-	                      rr->cls, ttl, b->fake, rr->rdlen);
+	                      rr->cls, ttl, binding_fake(b), rr->rdlen);
 }
 
 /*
