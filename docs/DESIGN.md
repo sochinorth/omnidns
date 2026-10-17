@@ -347,12 +347,15 @@ safe_until = now + min(TTL, fakeip_ttl_max) + fakeip_grace
   second (a second sweep within the same second would find nothing).
 - **Persistence**: bindings live in RAM; the nftables maps outlive the
   process. A restart turns their elements back into placeholder bindings
-  (below); only a stop deletes the table.
+  (below), held as long as a clean exit's hold file says, or for the
+  longest life a binding can have without one; only a stop deletes the
+  table.
 
 ### Restart
 
 procd sends SIGTERM both to stop and to restart, so the daemon never
-deletes its table on exit. `omnidns -F` deletes it: the init script runs it
+deletes its table on exit. `omnidns -F` deletes it (and the hold file,
+below): the init script runs it
 when the service stops (`stop`, `shutdown`, package removal) but not from
 its own `restart`, and a procd respawn after a crash never runs it. `-F`
 racing a daemon that is still exiting is harmless: only startup creates
@@ -373,8 +376,12 @@ At startup omnidns reads the table, if any:
    `fake → jump mark_V` with `mark_V` present and the fake allocatable in
    the current pool becomes a *placeholder* binding: a reserved policy
    carrying the mark, no endpoint, refcount 0, nothing to wait for, and
-   `safe_until = now + fakeip_ttl_max + fakeip_grace`, the longest a client
-   may legitimately hold it. Every other element is destroyed, as are
+   `safe_until = now + hold`. With a trusted hold file (below), `hold` is
+   what the file lists for that fake, less the time since it was written,
+   and an element it does not list is destroyed: it was evictable when the
+   earlier process exited, so no client may use it. Without one, `hold` is
+   `fakeip_ttl_max + fakeip_grace`, the longest a client may legitimately
+   hold any fake. Every other element is destroyed, as are
    pairs beyond `fakeip_max_bindings` (the first ones in address order, v4
    first, are kept: the kernel keeps no age). A map with more than twice
    `fakeip_max_bindings` elements, or more than 8192 chains, makes it
@@ -395,11 +402,78 @@ binding until its `safe_until`, so no fake is re-pointed while a client of
 the earlier process may still use it. Placeholders answer no PTR query
 (they have no name).
 
-Placeholders hold their capacity for the full `fakeip_ttl_max` +
-`fakeip_grace`, whatever was left of their life before the restart, and
-eviction is lazy: after a crash or restart with a table near
-`fakeip_max_bindings`, new fake-IP names may get SERVFAIL until enough
-placeholders expire or are claimed.
+Eviction is lazy, so after weeks of uptime the maps hold close to
+`fakeip_max_bindings` elements, most long expired. Without the hold file
+they would all come back as live placeholders and fill the table: new
+fake-IP names would get SERVFAIL for up to `fakeip_ttl_max` +
+`fakeip_grace`. That remains the behaviour after a crash.
+
+### Hold file
+
+On a clean exit (SIGTERM or SIGINT ends the loop; the cache and the walks
+in flight are freed and every element batch is acked) the daemon writes
+`<run_dir>/omnidns-<table>.hold` (`/var/run` by default, tmpfs; `-r`
+overrides it for tests, as `-t` does the table: an option, not an
+environment variable, because `-F` must find the same file and the
+daemon's other knobs are options too). Big-endian, a 32-byte header and
+24-byte records:
+
+```
+"OMNIHOLD" | u32 format version | u32 record count
+u64 fingerprint = SipHash-2-4(secret, "omnidns hold" | u32 layout version)
+u64 CLOCK_BOOTTIME seconds at the write
+records: u8 family | 3 zero bytes | u32 hold seconds | fake[16] (v4: 4 + 12 zero)
+```
+
+One record per binding not evictable at the write instant, placeholders
+included: `hold = max(safe_until - now, 0)`. A binding still referenced
+(`refcnt > 0`) is not evictable and is listed, with 0 if its `safe_until`
+has passed. That is enough: a reference only stops eviction while the
+process can still serve the answer holding it. Every answer already sent
+carries a TTL capped like the binding's, so its client stops using the
+fake by `safe_until`, and the new process has no cache to serve it from
+again. The fingerprint ties the file to the table instance without
+revealing the secret. It is written to a temporary file and renamed over
+the old one, so a reader sees the whole file or none of it; no fsync,
+since it lives on tmpfs and matters only within one boot.
+
+The clock is `CLOCK_BOOTTIME`, not the wall clock: it is the same for all
+processes of a boot and NTP never steps it. A router without RTC steps
+its wall clock at the first sync after boot, often around the time
+interface events restart services, and a forward step would shorten every
+hold.
+
+At adoption the file is read and deleted, whether it is trusted or not,
+so a later crash never reuses it. It is ignored (logged; full quarantine)
+when it is missing, has another magic, version or fingerprint, has more
+than `2 × fakeip_max_bindings` records, is not a regular file, its size
+is not exactly header + count × 24 (truncated, trailing bytes), a record
+has a bad family or non-zero padding, a fake is listed twice, or it was
+written later than now on the boot clock (another boot). The startup
+deletes it again once adopted or bootstrapped, so a file of another table
+or of no table never lingers. A write failure is logged and only costs
+the next start its full quarantine. `-x` (table deleted on exit) writes
+none.
+
+Overlapping instances (two daemons on the same table, as SO_REUSEPORT
+allows) are kept apart with `<run_dir>/omnidns-<table>.lock`. Each
+instance takes a shared flock on it before reading the table and keeps it
+for its life. An exiting instance writes the hold file only if it can
+turn its lock exclusive, i.e. no other instance holds it, and keeps it
+exclusive until the rename is done:
+
+- A new instance started before the old one exits holds the shared lock,
+  so the old one writes no file: the new one found none at its start and
+  quarantines everything, and none is left for a later crash of the new
+  one to trust (that file would not list the new instance's bindings,
+  whose elements would be destroyed).
+- A new instance started while the old one writes waits for the lock and
+  then reads the whole file; one started after reads it as in a plain
+  restart.
+- The old instance never touches the table at exit: everything it changed
+  was acked before the file was written, so the file and the maps agree.
+  Without the lock (it cannot be opened), an instance neither reads nor
+  writes a hold file.
 
 ### Abuse limits
 
