@@ -85,7 +85,7 @@ struct resolve_req {
 };
 
 enum { SCAN_ALIAS, SCAN_DONE, SCAN_QUERY };
-enum { ACT_SKIP = 0, ACT_KEEP, ACT_DROP, ACT_BIND, ACT_HINTS, ACT_BARE };
+enum { ACT_SKIP = 0, ACT_KEEP, ACT_DROP, ACT_BIND, ACT_HINTS };
 enum { LIFE_NONE, LIFE_POS, LIFE_NEG };
 
 struct plan {
@@ -163,20 +163,6 @@ static const struct dns_rr *find_dname(const struct dns_msg *m, const struct dns
 static bool is_svcb(uint16_t t)
 {
 	return t == DNS_T_SVCB || t == DNS_T_HTTPS;
-}
-
-/*
- * SvcParams of an AliasMode record are to be ignored (RFC 9460 2.4.2), and
- * hints there would carry real addresses no policy looked at: such a record
- * is only ever emitted bare (priority and target, as parsed into sv), and a
- * response holding one, or an unparsable one, is never passed through (see
- * svcb_ok()).
- */
-static int add_bare_alias(struct dns_msg *m, const struct dns_rr *rr,
-                          const struct svcb_view *sv)
-{
-	return dns_msg_add_rr(m, DNS_S_AN, rr->owner, rr->owner_len, rr->type, rr->cls,
-	                      rr->ttl, rr->rdata, (uint16_t)(2 + sv->target_len));
 }
 
 static int afamily(uint16_t qtype)
@@ -682,7 +668,9 @@ static bool svcb_has_hints(const struct svcb_view *v)
  * whose rule may be block or fakeip whatever the owner's: they may leave
  * only when that target matched a plain forward rule (then recorded as a
  * dependency). The caller makes sure no latch is on. An AliasMode record
- * may not carry SvcParams at all, and an unparsable record never leaves.
+ * leaves as received: clients ignore its SvcParams (RFC 9460 2.4.2). An
+ * unparsable record never leaves, since its params cannot be checked for
+ * hints.
  */
 static bool svcb_ok(struct resolve_req *r, const struct dns_rr *rr)
 {
@@ -692,9 +680,7 @@ static bool svcb_ok(struct resolve_req *r, const struct dns_rr *rr)
 
 	if (svcb_parse(rr->rdata, rr->rdlen, &sv))
 		return false;
-	if (!sv.priority)
-		return !sv.params_len;
-	if (!svcb_has_hints(&sv))
+	if (!sv.priority || !svcb_has_hints(&sv))
 		return true;
 	root = svcb_target_is_root(&sv);
 	rule = dep_match(r, root ? rr->owner : sv.target, root ? rr->owner_len : sv.target_len);
@@ -1018,8 +1004,8 @@ static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struc
 
 /*
  * Decide one ServiceMode RR (match its effective target). An AliasMode RR
- * (to ".", or scan() would have followed it) is kept, bare if it has
- * SvcParams.
+ * (to ".", or scan() would have followed it) is kept as received: clients
+ * ignore its SvcParams (RFC 9460 2.4.2).
  */
 static int plan_svcb(struct resolve_req *r, struct plan *p)
 {
@@ -1032,11 +1018,8 @@ static int plan_svcb(struct resolve_req *r, struct plan *p)
 		return 0;
 	}
 	p->act = ACT_KEEP;
-	if (!p->sv.priority) {
-		if (p->sv.params_len)
-			p->act = ACT_BARE;
+	if (!p->sv.priority)
 		return 0;
-	}
 	t = svcb_target_is_root(&p->sv) ? r->name.data : p->sv.target;
 	tlen = svcb_target_is_root(&p->sv) ? r->name.len : p->sv.target_len;
 	rule = dep_match(r, t, tlen);
@@ -1134,10 +1117,6 @@ static int build_terminal(struct resolve_req *r, bool changed, bool *rewritten)
 			break;
 		case ACT_HINTS:
 			ret = emit_hints(r, &m->rr[i], &plan[i], rewritten);
-			break;
-		case ACT_BARE:
-			ret = add_bare_alias(&r->out, &m->rr[i], &plan[i].sv);
-			*rewritten = true;
 			break;
 		}
 	}
@@ -1334,13 +1313,12 @@ static const struct plan *find_svcb_alias(const struct resolve_req *r)
 
 static int scan_svcb_alias(struct resolve_req *r, const struct plan *p)
 {
-	struct dns_rr rr = r->resp.rr[p - plan];
+	const struct dns_rr *rr = &r->resp.rr[p - plan];
 	struct dns_name target;
 
 	memcpy(target.data, p->sv.target, p->sv.target_len);
 	target.len = p->sv.target_len;
-	rr.rdlen = (uint16_t)(2 + p->sv.target_len);	/* bare, as add_bare_alias() */
-	if (prefix_add(r, &rr)) {
+	if (prefix_add(r, rr)) {
 		servfail(r);
 		return SCAN_DONE;
 	}

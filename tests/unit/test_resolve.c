@@ -1035,21 +1035,34 @@ TEST(m_https_alias_mode)
 	CHECK_EQ(count(DNS_S_AN), 1);
 }
 
-/* rdata of an AliasMode record without SvcParams: priority 0, the target */
-static bool alias_bare(const struct dns_rr *rr, const char *target)
+/* does the rendered reply carry the IPv4 address anywhere? */
+static bool carries4(const char *ip)
+{
+	uint8_t a[4];
+
+	inet_pton(AF_INET, ip, a);
+	return memmem(res_wire, (size_t)res_len, a, 4) != NULL;
+}
+
+/* is rr an AliasMode record to target with its ipv4hint still ip? */
+static bool alias_hint(const struct dns_rr *rr, const char *target, const char *ip)
 {
 	struct dns_name t = N(target);
+	const uint8_t *val;
+	uint16_t len;
+	uint8_t a[4];
 
-	return (rr->type == DNS_T_HTTPS || rr->type == DNS_T_SVCB) &&
-	       rr->rdlen == 2 + t.len && !rr->rdata[0] && !rr->rdata[1] &&
-	       !memcmp(rr->rdata + 2, t.data, t.len);
+	inet_pton(AF_INET, ip, a);
+	return (rr->type == DNS_T_HTTPS || rr->type == DNS_T_SVCB) && rr->rdlen > 2 + t.len &&
+	       !rr->rdata[0] && !rr->rdata[1] && !memcmp(rr->rdata + 2, t.data, t.len) &&
+	       svcb_param(rr, SVCB_KEY_IPV4HINT, &val, &len) && len == 4 && !memcmp(val, a, 4);
 }
 
 /*
- * SvcParams of AliasMode records are to be ignored (RFC 9460 2.4.2), and
- * their hints would carry real addresses past any policy: such records are
- * answered with the SvcParams stripped, under a latch or not, followed or
- * terminal, so they never pass through as received.
+ * Clients ignore the SvcParams of AliasMode records (RFC 9460 2.4.2), so
+ * those records leave as received, hints included: followed or terminal,
+ * under a latch or not, in the answer or the additional section, and they
+ * do not keep a response from passing through.
  */
 TEST(z_alias_mode_params)
 {
@@ -1064,34 +1077,44 @@ TEST(z_alias_mode_params)
 	  "an a2.vpn.example 300 HTTPS 0 t.vpn.example ipv4hint=5.5.5.6;"
 	  "an t.vpn.example 300 HTTPS 1 . ipv4hint=7.7.7.7");
 	S("10.0.0.1", "a3.plain.example", DNS_T_HTTPS, 0,
-	  "an a3.plain.example 300 HTTPS 0 . ipv4hint=5.5.5.7");
+	  "an a3.plain.example 300 HTTPS 0 . ipv4hint=5.5.5.7;an a3.plain.example 300 RRSIG");
 	S("10.0.0.1", "a4.plain.example", DNS_T_HTTPS, 0,
 	  "an a4.plain.example 300 HTTPS 0 t.plain.example ipv4hint=5.5.5.8;"
 	  "an t.plain.example 300 HTTPS 1 . alpn=h2 ipv4hint=8.8.8.8");
+	S("10.0.0.1", "a5.plain.example", DNS_T_A, 0,
+	  "an a5.plain.example 300 A 1.1.1.5;"
+	  "ar a5.plain.example 300 HTTPS 0 t.vpn.example ipv4hint=5.5.5.9");
 	for (k = 0; k < 2; k++) {	/* fresh, then cached */
-		/* terminal under a latch */
+		/* terminal under a latch: kept as received */
 		CHECK(run("a1.vpn.example", DNS_T_HTTPS));
 		CHECK_EQ(count(DNS_S_AN), 1);
-		CHECK(alias_bare(&res.rr[0], "."));
-		CHECK_EQ(res.rr[0].ttl, 300);
+		CHECK(res.nrr && alias_hint(&res.rr[0], ".", "5.5.5.5"));
+		CHECK_EQ(res.nrr ? res.rr[0].ttl : 0, 300);
 
-		/* followed under a latch: the target's hints are fakes */
+		/* followed under a latch: as received; the target's hints are fakes */
 		CHECK(run("a2.vpn.example", DNS_T_HTTPS));
 		CHECK_EQ(count(DNS_S_AN), 2);
-		CHECK(alias_bare(&res.rr[0], "t.vpn.example"));
+		CHECK(res.nrr && alias_hint(&res.rr[0], "t.vpn.example", "5.5.5.6"));
 		CHECK(res.nrr > 1 && svcb_param(&res.rr[1], SVCB_KEY_IPV4HINT, &val, &len) &&
 		      is_fake(4, val, "7.7.7.7", MARK1, "t.vpn.example"));
 
-		/* no latch, a single response: assembled, not passed through */
+		/* no latch, a single response: passed through (RRSIG kept) */
 		CHECK(run("a3.plain.example", DNS_T_HTTPS));
-		CHECK_EQ(count(DNS_S_AN), 1);
-		CHECK(alias_bare(&res.rr[0], "."));
+		CHECK_EQ(count(DNS_S_AN), 2);
+		CHECK(res.nrr && alias_hint(&res.rr[0], ".", "5.5.5.7"));
+		CHECK_EQ(res.nrr > 1 ? res.rr[1].type : 0, DNS_T_RRSIG);
 
 		CHECK(run("a4.plain.example", DNS_T_HTTPS));
 		CHECK_EQ(count(DNS_S_AN), 2);
-		CHECK(alias_bare(&res.rr[0], "t.plain.example"));
+		CHECK(res.nrr && alias_hint(&res.rr[0], "t.plain.example", "5.5.5.8"));
 		CHECK(res.nrr > 1 && svcb_param(&res.rr[1], SVCB_KEY_IPV4HINT, &val, &len) &&
 		      len == 4 && !memcmp(val, "\x08\x08\x08\x08", 4));
+
+		/* glue of a forward owner, to a fakeip target: kept, passed through */
+		CHECK(run("a5.plain.example", DNS_T_A));
+		CHECK_STR(R(0), "a5.plain.example 300 A 1.1.1.5");
+		CHECK_EQ(count(DNS_S_AR), 1);
+		CHECK(carries4("5.5.5.9"));
 		CHECK(k == 0 || no_queries());
 	}
 }
@@ -1640,15 +1663,6 @@ TEST(y_pass_through_chain_only)
 	}
 }
 
-/* does the rendered reply carry the IPv4 address anywhere? */
-static bool carries4(const char *ip)
-{
-	uint8_t a[4];
-
-	inet_pton(AF_INET, ip, a);
-	return memmem(res_wire, (size_t)res_len, a, 4) != NULL;
-}
-
 /*
  * ipv4hint/ipv6hint of an SVCB/HTTPS record are addresses of its effective
  * target, which may be blocked or fakeip while the owner is a plain forward.
@@ -1673,8 +1687,7 @@ TEST(z_svcb_target_hints)
 	  "an s3b.plain.example 300 HTTPS 1 . alpn=h2");
 	S("10.0.0.1", "s4.plain.example", DNS_T_A, 0,
 	  "an s4.plain.example 300 A 1.1.1.4;"
-	  "ar s4.plain.example 300 HTTPS 1 t.vpn.example ipv4hint=9.9.9.4;"
-	  "ar s4.plain.example 300 HTTPS 0 t.vpn.example ipv4hint=9.9.9.6");
+	  "ar s4.plain.example 300 HTTPS 1 t.vpn.example ipv4hint=9.9.9.4");
 	S("10.0.0.1", "s5.plain.example", DNS_T_A, 0,
 	  "an s5.plain.example 300 A 1.1.1.5;"
 	  "an s5.plain.example 300 HTTPS 1 t.ads.example ipv4hint=9.9.9.5");
@@ -1702,11 +1715,10 @@ TEST(z_svcb_target_hints)
 		CHECK_EQ(count(DNS_S_AN), 2);
 		CHECK_STR(R(0), "s3.plain.example 300 CNAME s3b.plain.example");
 
-		/* glue: ServiceMode to a fakeip target and AliasMode with hints */
+		/* glue: ServiceMode to a fakeip target */
 		CHECK(run("s4.plain.example", DNS_T_A));
 		CHECK_STR(R(0), "s4.plain.example 300 A 1.1.1.4");
 		CHECK(!carries4("9.9.9.4"));
-		CHECK(!carries4("9.9.9.6"));
 		CHECK_EQ(count(DNS_S_AR), 0);
 
 		/* another type in the answer section: left out */

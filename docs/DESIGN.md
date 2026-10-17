@@ -217,11 +217,10 @@ still `block`, but they cannot change the routing decision.
   hint is also removed from `mandatory`. Targets are never resolved
   proactively. If every record is dropped, the answer is NODATA.
 - **HTTPS/SVCB AliasMode**: whether followed (it joins the prefix) or
-  terminal (target `.`), the record is answered bare: priority and target,
-  its SvcParams stripped. RFC 9460 has clients ignore them, and their
-  hints would carry real addresses no policy looked at, under a latch
-  too. A response holding such a record is therefore never passed
-  through as received (see below).
+  terminal (target `.`), the record is passed through as received,
+  SvcParams included, under a latch too. RFC 9460 §2.4.2 has clients
+  ignore the SvcParams of an AliasMode record, so any hints there are
+  never used as addresses and need no policy.
 - **Other types** pass through unchanged after the walk.
 
 ### Answer assembly
@@ -245,7 +244,7 @@ final response's, filtered:
   safe as received (below), since its hints are its target's addresses.
 
 An SVCB/HTTPS record is *safe as received* when it parses and either is
-AliasMode without SvcParams, or is ServiceMode and carries no
+AliasMode (whatever its SvcParams, as above), or is ServiceMode and carries no
 `ipv4hint`/`ipv6hint`, or is ServiceMode and its effective target matches a
 plain `forward` rule (that target is then recorded as a dependency). Only
 terminal records are planned per target as above; any other SVCB/HTTPS
