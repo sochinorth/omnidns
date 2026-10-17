@@ -270,9 +270,13 @@ OPT dropped. Any other answer record, including other records of a DNAME's
 owner, belongs to a name never matched against the rules, so such a
 response is assembled instead, which leaves the record out.
 
-The finished answer is serialized once, with name compression, into the
-bytes the cache stores and every reply is rendered from (see
-[Cache](#answer-cache)).
+The answer is serialized as it is assembled: each record, once decided, is
+written with name compression straight into the bytes the cache stores and
+every reply is rendered from (see [Cache](#answer-cache)), with no
+intermediate message. A record that does not fit is rolled back; an
+additional record ends the message there, an answer or authority record
+leaves just header and question with TC set. An answer that has to wait
+(for its bindings' nftables batch) is kept as those bytes.
 
 ### Deferred binding
 
@@ -614,8 +618,8 @@ output_reject      (filter, output,     filter-1):  same
   queries always use DO=0, so the DO bit is not part of the key.
 - **Value**, in a single allocation (about 260 bytes, overhead included,
   for a CNAME plus three A records):
-  - the final response in wire format, as it was serialized once when the
-    answer was complete: header, question (the key, in the case it was first
+  - the final response in wire format, as it was serialized while it was
+    assembled: header, question (the key, in the case it was first
     asked with), the records with their names compressed; no OPT. An answer
     larger than a DNS message is stored as serialization cuts it (trailing
     additional records dropped, or just header and question with TC set),
@@ -791,11 +795,14 @@ cached answers skip revalidation. The log still says
   randomized model tests for the hash map, S3-FIFO and the binding table.
   Replies rendered from cached bytes are compared byte for byte with
   serializing the message for the client (a recorded corpus covering
-  truncation, TTL aging, flags and 0x20 case, plus randomized messages). The
+  truncation, TTL aging, flags and 0x20 case, plus randomized messages);
+  serialization of randomized messages at every size limit is pinned byte
+  for byte. The
   nftables tests run in an unprivileged user+net namespace against the real
   kernel, including a real DNATed connection with the expected marks.
 - **Resolver tests**: the walk has a table-driven suite with a scripted
-  upstream and real nftables underneath.
+  upstream and real nftables underneath. Every answer it produces is pinned
+  byte for byte by a recorded table.
 - **End-to-end**: `tests/integ/test_integ.py` builds a router namespace and a
   client namespace connected by veth, runs omnidns with Python fake
   upstreams, and checks:

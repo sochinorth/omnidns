@@ -226,8 +226,10 @@ void dns_msg_set_rcode(struct dns_msg *m, int rcode);	/* sets ext_rcode too */
  * that does not fit; if an AN/NS record does not fit, the AN/NS sections
  * are dropped entirely, TC is set and only header + question (+ OPT) are
  * emitted.
- * The OPT RR is emitted from m->edns when present.
- * Returns the number of bytes written or a negative errno.
+ * The OPT RR is emitted from m->edns when present (and reserved for).
+ * This is the streaming builder below over m's records. Returns the number
+ * of bytes written, -ENOSPC if not even the question fits, -EINVAL for a
+ * record out of section order.
  */
 int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen);
 

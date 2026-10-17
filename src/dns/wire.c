@@ -679,283 +679,19 @@ int dns_parse_query(struct dns_msg *m, const uint8_t *buf, size_t len)
 
 /* ---- building ---- */
 
-#define CTAB_MAX	256
-#define CTAB_BUCKETS	256
 #define CTAB_OFF_MAX	0x3fff
 #define CTAB_NONE	0xffff
 
 /*
- * Compression table: remembered name suffixes already written to the
- * output, hashed into buckets so lookups stay O(1) for hostile inputs.
- * Suffixes match case-insensitively (names are equal regardless of case,
- * RFC 4343), so a name compresses against an earlier one in another case
- * and takes that name's case. This makes the compression structure of a
- * message independent of case: replacing the question by the same name in
- * another case (dns_reply_render()) yields exactly what building with that
- * question would have.
+ * Compression table (struct dns_builder): remembered name suffixes already
+ * written to the output, hashed into buckets so lookups stay O(1) for
+ * hostile inputs. Suffixes match case-insensitively (names are equal
+ * regardless of case, RFC 4343), so a name compresses against an earlier
+ * one in another case and takes that name's case. This makes the
+ * compression structure of a message independent of case: replacing the
+ * question by the same name in another case (dns_reply_render()) yields
+ * exactly what building with that question would have.
  */
-struct ctab_ent {
-	const uint8_t *name;		/* uncompressed suffix in the source */
-	uint32_t hash;
-	uint16_t off, next;
-	uint8_t len;
-};
-
-struct bctx {
-	uint8_t *out;
-	size_t cap, len;
-	int nent;
-	uint16_t head[CTAB_BUCKETS];
-	struct ctab_ent ent[CTAB_MAX];
-};
-
-static void ctab_rehead(struct bctx *b)
-{
-	int i;
-
-	memset(b->head, 0xff, sizeof(b->head));
-	for (i = 0; i < b->nent; i++) {
-		struct ctab_ent *e = &b->ent[i];
-
-		e->next = b->head[e->hash % CTAB_BUCKETS];
-		b->head[e->hash % CTAB_BUCKETS] = (uint16_t)i;
-	}
-}
-
-/* Drop entries added after a rollback point. */
-static void ctab_truncate(struct bctx *b, int nent)
-{
-	if (b->nent != nent) {
-		b->nent = nent;
-		ctab_rehead(b);
-	}
-}
-
-static int ctab_find(const struct bctx *b, const uint8_t *s, uint8_t slen,
-                     uint32_t h)
-{
-	uint16_t i;
-
-	for (i = b->head[h % CTAB_BUCKETS]; i != CTAB_NONE; i = b->ent[i].next) {
-		const struct ctab_ent *e = &b->ent[i];
-
-		if (e->hash == h && dns_name_eq(e->name, e->len, s, slen))
-			return e->off;
-	}
-	return -1;
-}
-
-static void ctab_add(struct bctx *b, const uint8_t *s, uint8_t slen, uint32_t h)
-{
-	struct ctab_ent *e;
-
-	if (b->len >= CTAB_OFF_MAX || b->nent >= CTAB_MAX)
-		return;
-	e = &b->ent[b->nent];
-	e->name = s;
-	e->len = slen;
-	e->hash = h;
-	e->off = (uint16_t)b->len;
-	e->next = b->head[h % CTAB_BUCKETS];
-	b->head[h % CTAB_BUCKETS] = (uint16_t)b->nent++;
-}
-
-static int put_bytes(struct bctx *b, const void *p, size_t n)
-{
-	if (b->cap - b->len < n)
-		return -ENOSPC;
-	memcpy(b->out + b->len, p, n);
-	b->len += n;
-	return 0;
-}
-
-static int put_u16(struct bctx *b, uint16_t v)
-{
-	uint8_t t[2];
-
-	put16(t, v);
-	return put_bytes(b, t, 2);
-}
-
-/*
- * Write an uncompressed name with compression. Suffix hashes are computed
- * right to left so that each suffix costs O(its first label).
- */
-static int put_name(struct bctx *b, const uint8_t *name, uint8_t len)
-{
-	uint8_t offs[DNS_MAX_NAME / 2 + 1];
-	uint32_t hash[DNS_MAX_NAME / 2 + 1], h = 2166136261u;
-	int nl = 0, k, off;
-	size_t i = 0, j;
-
-	if (dns_name_check(name, len) != len)
-		return -EINVAL;
-	while (name[i]) {
-		offs[nl++] = (uint8_t)i;
-		i += (size_t)name[i] + 1;
-	}
-	for (k = nl - 1; k >= 0; k--) {
-		for (j = offs[k]; j <= offs[k] + (size_t)name[offs[k]]; j++)
-			h = (h ^ lc(name[j])) * 16777619u;
-		hash[k] = h;
-	}
-	for (k = 0; k < nl; k++) {
-		uint8_t sl = len - offs[k];
-
-		off = ctab_find(b, name + offs[k], sl, hash[k]);
-		if (off >= 0)
-			return put_u16(b, 0xc000 | off);
-		ctab_add(b, name + offs[k], sl, hash[k]);
-		if (put_bytes(b, name + offs[k], (size_t)name[offs[k]] + 1))
-			return -ENOSPC;
-	}
-	return put_bytes(b, "", 1);
-}
-
-static int put_rdata(struct bctx *b, const struct dns_rr *rr)
-{
-	const struct rd_layout *lo = rd_layout(rr->type);
-	const uint8_t *rd = rr->rdata;
-	size_t off;
-	int i, r;
-
-	if (!lo || !rd_valid(lo, rd, rr->rdlen))
-		return put_bytes(b, rd, rr->rdlen);
-	r = put_bytes(b, rd, lo->pre);
-	off = lo->pre;
-	for (i = 0; !r && i < lo->names; i++) {
-		int n = dns_name_check(rd + off, rr->rdlen - off);
-
-		r = put_name(b, rd + off, (uint8_t)n);
-		off += n;
-	}
-	if (!r)
-		r = put_bytes(b, rd + off, lo->post);
-	return r;
-}
-
-static int put_rr(struct bctx *b, const struct dns_rr *rr)
-{
-	size_t save = b->len, rdpos;
-	int nent = b->nent, r;
-	uint8_t fix[DNS_RR_FIXED];
-
-	r = put_name(b, rr->owner, rr->owner_len);
-	if (!r) {
-		put16(fix, rr->type);
-		put16(fix + 2, rr->cls);
-		put32(fix + 4, rr->ttl);
-		put16(fix + 8, 0);
-		r = put_bytes(b, fix, sizeof(fix));
-	}
-	rdpos = b->len;
-	if (!r)
-		r = put_rdata(b, rr);
-	if (!r && b->len - rdpos > 0xffff)
-		r = -EINVAL;
-	if (r) {
-		b->len = save;
-		ctab_truncate(b, nent);
-		return r;
-	}
-	put16(b->out + rdpos - 2, (uint16_t)(b->len - rdpos));
-	return 0;
-}
-
-static void opt_write(uint8_t *p, const struct dns_edns *e)
-{
-	p[0] = 0;
-	put16(p + 1, DNS_T_OPT);
-	put16(p + 3, e->udp_size);
-	put32(p + 5, (uint32_t)e->ext_rcode << 24 | (uint32_t)e->version << 16 |
-	             (e->do_bit ? 0x8000u : 0));
-	put16(p + 9, 0);
-}
-
-static void put_opt(struct bctx *b, const struct dns_edns *e)
-{
-	opt_write(b->out + b->len, e);
-	b->len += DNS_OPT_LEN;
-}
-
-/*
- * One build context for the whole process (~6.7 KB: too big for the stack of
- * small targets, wasteful to malloc per message). This is safe because the
- * daemon is single-threaded and dns_build() is not re-entrant by construction:
- * nothing below it calls back into other code (no callbacks, no uloop, no
- * signal handler builds messages), so a second dns_build() cannot start while
- * one is running.
- *
- * Per-call reset: only the scalars and head[] (512 bytes) need it. ent[] is
- * read only through head[]/next chains of indices < nent, so whatever a
- * previous (possibly failed) build left in it is unreachable once head[] is
- * cleared and nent is 0.
- */
-static struct bctx build_ctx;
-
-int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
-{
-	struct bctx *b = &build_ctx;
-	uint16_t cnt[3] = { 0 }, flags = m->flags;
-	size_t qend, optlen = m->edns.present ? DNS_OPT_LEN : 0;
-	int nent, r;
-	uint16_t i;
-
-	if (maxlen > DNS_MAX_MSG)
-		maxlen = DNS_MAX_MSG;
-	if (maxlen < DNS_HDR_LEN + optlen)
-		return -ENOSPC;
-	b->out = out;
-	b->cap = maxlen - optlen;
-	b->len = DNS_HDR_LEN;
-	b->nent = 0;
-	ctab_rehead(b);
-	if (m->has_q) {
-		r = put_name(b, dns_msg_qname(m), m->qlen);
-		if (!r)
-			r = put_u16(b, m->qtype);
-		if (!r)
-			r = put_u16(b, m->qclass);
-		if (r)
-			return r;
-	}
-	qend = b->len;
-	nent = b->nent;
-	for (i = 0; i < m->nrr; i++) {
-		const struct dns_rr *rr = &m->rr[i];
-
-		if (rr->section > DNS_S_AR)
-			return -EINVAL;
-		r = put_rr(b, rr);
-		if (r == -ENOSPC && rr->section == DNS_S_AR) {
-			r = 0;
-			break;
-		}
-		if (r == -ENOSPC) {
-			flags |= DNS_F_TC;
-			b->len = qend;
-			ctab_truncate(b, nent);
-			memset(cnt, 0, sizeof(cnt));
-			r = 0;
-			break;
-		}
-		if (r)
-			return r;
-		cnt[rr->section]++;
-	}
-	put16(out, m->id);
-	put16(out + 2, flags);
-	put16(out + 4, m->has_q);
-	put16(out + 6, cnt[0]);
-	put16(out + 8, cnt[1]);
-	put16(out + 10, cnt[2] + (m->edns.present ? 1 : 0));
-	if (m->edns.present)
-		put_opt(b, &m->edns);
-	return (int)b->len;
-}
-
-/* ---- streaming builder ---- */
-
 static void wb_rehead(struct dns_builder *b)
 {
 	int i;
@@ -1126,20 +862,23 @@ int dns_build_add(struct dns_builder *b, enum dns_section sec,
 	put16(fix + 2, cls);
 	put32(fix + 4, ttl);
 	put16(fix + 8, 0);
-	if (wb_name(b, owner) < 0 || wb_bytes(b, fix, DNS_RR_FIXED) ||
-	    (rdpos = b->len, wb_rdata(b, type, rdata, rdlen))) {
-		b->cut = true;
-		if (sec == DNS_S_AR) {
-			wb_rollback(b, save, nent);
-		} else {
-			wb_rollback(b, b->qend, b->qent);
-			b->flags |= DNS_F_TC;
-			memset(b->cnt, 0, sizeof(b->cnt));
-		}
-		return 0;
-	}
+	if (wb_name(b, owner) < 0 || wb_bytes(b, fix, DNS_RR_FIXED))
+		goto cut;
+	rdpos = b->len;
+	if (wb_rdata(b, type, rdata, rdlen))
+		goto cut;
 	put16(b->out + rdpos - 2, (uint16_t)(b->len - rdpos));
 	b->cnt[sec]++;
+	return 0;
+cut:
+	b->cut = true;
+	if (sec == DNS_S_AR) {
+		wb_rollback(b, save, nent);
+	} else {
+		wb_rollback(b, b->qend, b->qent);
+		b->flags |= DNS_F_TC;
+		memset(b->cnt, 0, sizeof(b->cnt));
+	}
 	return 0;
 }
 
@@ -1152,6 +891,50 @@ int dns_build_end(struct dns_builder *b)
 	put16(b->out + 8, b->cnt[1]);
 	put16(b->out + 10, b->cnt[2]);
 	return (int)b->len;
+}
+
+static void opt_write(uint8_t *p, const struct dns_edns *e)
+{
+	p[0] = 0;
+	put16(p + 1, DNS_T_OPT);
+	put16(p + 3, e->udp_size);
+	put32(p + 5, (uint32_t)e->ext_rcode << 24 | (uint32_t)e->version << 16 |
+	             (e->do_bit ? 0x8000u : 0));
+	put16(p + 9, 0);
+}
+
+/*
+ * One builder for dns_build() (~6.7 KB: too big for the stack of small
+ * targets, wasteful to malloc per message). This is safe because the
+ * daemon is single-threaded and dns_build() is not re-entrant by
+ * construction: nothing below it calls back into other code.
+ */
+static struct dns_builder build_ctx;
+
+int dns_build(const struct dns_msg *m, uint8_t *out, size_t maxlen)
+{
+	struct dns_builder *b = &build_ctx;
+	size_t optlen = m->edns.present ? DNS_OPT_LEN : 0;
+	uint16_t i;
+	int r, n;
+
+	if (maxlen > DNS_MAX_MSG)
+		maxlen = DNS_MAX_MSG;
+	if (maxlen < DNS_HDR_LEN + optlen)
+		return -ENOSPC;
+	r = dns_build_begin(b, out, maxlen - optlen, m->id, m->flags, dns_msg_qname(m), m->qlen,
+	                    m->qtype, m->qclass);
+	for (i = 0; !r && i < m->nrr; i++)
+		r = dns_build_add_rr(b, m->rr[i].section, &m->rr[i]);
+	if (r)
+		return r;
+	n = dns_build_end(b);
+	if (m->edns.present) {
+		put16(out + 10, b->cnt[DNS_S_AR] + 1);
+		opt_write(out + n, &m->edns);
+		n += DNS_OPT_LEN;
+	}
+	return n;
 }
 
 /* ---- rendering a built response ---- */
