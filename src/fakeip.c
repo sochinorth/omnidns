@@ -269,9 +269,9 @@ static struct binding *binding_new(int pid, int family, const uint8_t *fake,
 	b->policy = pid;
 	b->family = family;
 	b->endpoint_len = endpoint_len;
-	memcpy(b->fake, fake, n);
-	memcpy(b->real, real, n);
-	memcpy(b->endpoint, endpoint, endpoint_len);
+	memcpy(b->tail, fake, n);
+	memcpy(b->tail + n, real, n);
+	memcpy(b->tail + 2 * n, endpoint, endpoint_len);
 	return b;
 }
 

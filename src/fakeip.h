@@ -56,11 +56,18 @@ struct nft_ctx;
 struct nft_elem;
 
 /*
- * Layout: no padding holes, the endpoint follows the fixed part directly
- * and bindings are allocated as offsetof(endpoint) + endpoint_len. The key
- * hash is not stored: by_key uses s3.hash (its low 32 bits; hmap keeps
- * only 31), and the 64-bit value is only needed when allocating. The
- * by_fake hash is recomputed from (family, fake) on removal.
+ * Layout: no padding holes, a variable tail follows the fixed part
+ * directly:
+ *
+ *   [fake: alen][real: alen][endpoint: endpoint_len]
+ *
+ * alen = 4 (v4) or 16 (v6), so a v4 binding does not carry 24 unused
+ * address bytes. Bindings are allocated as binding_size(family,
+ * endpoint_len); read the tail with binding_fake() / binding_real() /
+ * binding_endpoint(). The key hash is not stored: by_key uses s3.hash (its
+ * low 32 bits; hmap keeps only 31), and the 64-bit value is only needed
+ * when allocating. The by_fake hash is recomputed from (family, fake) on
+ * removal.
  *
  * Rule id and mark live in the db's policy table: read them with
  * fakeip_rule_id() / fakeip_mark().
@@ -73,20 +80,17 @@ struct binding {
 	uint16_t policy;	/* (rule_id, mark) index, owned by db */
 	uint8_t family;		/* 4 or 6 */
 	uint8_t endpoint_len;
-	uint8_t fake[16];
-	uint8_t real[16];
-	uint8_t endpoint[];	/* lowercased wire name */
+	uint8_t tail[];		/* fake, real, endpoint (lowercased wire name) */
 };
 
-/* s3 (2 pointers + 8) + ticket + 2 * u32 + u16 + 2 + 2 * 16:
- * 76 bytes on LP64, 68 on ILP32. Endpoints that fit the smaller classes:
- * ILP32 musl 96 B slots up to 24 bytes; LP64 musl 112 B up to 32, glibc
- * 112 B chunks up to 28. */
-_Static_assert(offsetof(struct binding, endpoint) == 2 * sizeof(void *) + 60,
+/* s3 (2 pointers + 8) + ticket + 2 * u32 + u16 + 2: 44 bytes on LP64, 36
+ * on ILP32, then 2 * alen + endpoint_len. v4 endpoints that fit the
+ * smaller classes: LP64 glibc 80 B chunks up to 20 bytes (96 up to 36),
+ * LP64 musl 80 B slots up to 24 (96 up to 40), ILP32 musl 64 B slots up to
+ * 16 (80 up to 32). */
+_Static_assert(offsetof(struct binding, tail) == 2 * sizeof(void *) + 28,
                "binding layout");
 
-/* Read a binding's addresses and endpoint through these (fake and real
- * are alen(family) bytes). */
 static inline size_t binding_alen(const struct binding *b)
 {
 	return b->family == 4 ? 4 : 16;
@@ -94,23 +98,22 @@ static inline size_t binding_alen(const struct binding *b)
 
 static inline size_t binding_size(int family, uint8_t endpoint_len)
 {
-	(void)family;
-	return offsetof(struct binding, endpoint) + endpoint_len;
+	return offsetof(struct binding, tail) + 2 * (family == 4 ? 4 : 16) + endpoint_len;
 }
 
 static inline const uint8_t *binding_fake(const struct binding *b)
 {
-	return b->fake;
+	return b->tail;
 }
 
 static inline const uint8_t *binding_real(const struct binding *b)
 {
-	return b->real;
+	return b->tail + binding_alen(b);
 }
 
 static inline const uint8_t *binding_endpoint(const struct binding *b)
 {
-	return b->endpoint;
+	return b->tail + 2 * binding_alen(b);
 }
 
 struct fakeip_db;
