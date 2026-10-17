@@ -54,6 +54,7 @@
  */
 
 #define NFT_BATCH_MAX 1024
+#define NFT_SECRET_LEN 16
 
 struct nft_ctx;
 
@@ -69,17 +70,52 @@ struct nft_desired {
 struct nft_ctx *nft_open(const char *table);
 void nft_close(struct nft_ctx *n);	/* does not delete the table */
 
+/*
+ * The fake IP allocation secret stored in the table's userdata (with a
+ * layout version and the fwmask) whenever this context creates the table;
+ * zero until set.
+ */
+void nft_set_secret(struct nft_ctx *n, const uint8_t secret[NFT_SECRET_LEN]);
+
 /* Delete table if present, create everything per `d` (empty maps). Sync. */
 int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d);
+
+/* A map element of an existing table, paired per fake (see nft_adopt()). */
+struct nft_elem {
+	uint8_t family;		/* 4 or 6 */
+	bool ok;		/* fake -> real and fake -> jump mark_<mark>, chain known */
+	uint32_t mark;
+	uint8_t fake[16];
+	uint8_t real[16];
+};
+
+/*
+ * Startup instead of nft_bootstrap(): take over the table an earlier
+ * process left. Returns 1 if the table exists with this layout version and
+ * d->fwmask (pools and marks of `d` are not compared) and could be read:
+ * `secret` gets its secret (also kept for re-creations), the shadow state is
+ * rebuilt from the kernel (its mark chains; d's pools if every policy rule
+ * says it was written for exactly that state, else the next reconcile
+ * rewrites the policy rules), and *elems (malloc'ed, sorted by family and
+ * fake, *nelems of them) holds the map elements. Nothing in the kernel is
+ * changed: the caller destroys the elements it does not keep, then calls
+ * nft_reconcile(). Returns 0 otherwise (logged): no table, another version
+ * or fwmask, a missing chain, more than `max_elems` elements in the
+ * fake2real or the fake2mark maps, or a read error; then bootstrap. Sync.
+ */
+int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems,
+              uint8_t secret[NFT_SECRET_LEN], struct nft_elem **elems, uint32_t *nelems);
 
 /*
  * Bring chains/rules to `d` in one atomic transaction without touching map
  * contents: add missing mark chains, rewrite restore/dstnat/reject rules,
  * delete mark chains no longer desired. Caller guarantees that no map
- * element references a chain being deleted. On failure nothing changes and
- * the shadow state is kept. If `d` equals the shadow state (the state of the
- * last successful bootstrap/reconcile), no transaction is sent: external
- * edits to our chains are not repaired then. Sync.
+ * element references a chain being deleted. A new fwmask instead recreates
+ * the whole table (empty maps, the same secret); it fails if the table is
+ * gone. On failure nothing changes and the shadow state is kept. If `d`
+ * equals the shadow state (the state of the last successful bootstrap,
+ * reconcile or adoption whose rules were current), no transaction is sent:
+ * external edits to our chains are not repaired then. Sync.
  */
 int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d);
 

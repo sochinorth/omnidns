@@ -42,6 +42,17 @@
 #define RECV_TIMEOUT_MS	10000
 #define SOCK_BUF	(4 << 20)
 
+/*
+ * Persistent state in the table's userdata (NFTA_TABLE_USERDATA, libnftnl
+ * udata TLVs), written once when the table is created: the layout version,
+ * the fwmask and the fake IP allocation secret. Policy rules carry a tag
+ * (NFTA_RULE_USERDATA) identifying the shadow state that wrote them. nft
+ * uses the low TLV types itself (comments) and ignores unknown ones.
+ */
+#define LAYOUT_VERSION	1
+enum { UD_VERSION = 0x80, UD_FWMASK, UD_SECRET };	/* table */
+#define UD_TAG		0x80				/* policy rules */
+
 #define TYPE_MARK	19		/* nft userspace datatypes */
 #define TYPE_IPADDR	7
 #define TYPE_IP6ADDR	8
@@ -105,7 +116,9 @@ struct nft_ctx {
 	struct txn ctl_tx;
 
 	bool have_state;
+	bool stale;		/* policy rules may not match sh: rewrite them */
 	struct shadow sh;
+	uint8_t secret[NFT_SECRET_LEN];	/* stored in a table we create */
 
 	struct uloop_fd ufd;
 	struct uloop_timeout submit_tmo, ready_tmo, kick_tmo;
@@ -183,12 +196,24 @@ static struct nlmsghdr *txn_msg(struct nft_ctx *n, struct txn *t, int type,
 	                             n->seq++);
 }
 
-static void txn_table(struct nft_ctx *n, struct txn *t, int type, uint16_t flags)
+/* `fwmask` non-zero: a NEWTABLE carrying the persistent state */
+static void txn_table(struct nft_ctx *n, struct txn *t, int type, uint16_t flags,
+                      uint32_t fwmask)
 {
 	struct nftnl_table *tb = oom(nftnl_table_alloc());
 	struct nlmsghdr *nlh;
 
 	nftnl_table_set_str(tb, NFTNL_TABLE_NAME, n->table);
+	if (fwmask) {
+		struct nftnl_udata_buf *u = oom(nftnl_udata_buf_alloc(64));
+
+		nftnl_udata_put_u32(u, UD_VERSION, LAYOUT_VERSION);
+		nftnl_udata_put_u32(u, UD_FWMASK, fwmask);
+		nftnl_udata_put(u, UD_SECRET, NFT_SECRET_LEN, n->secret);
+		nftnl_table_set_data(tb, NFTNL_TABLE_USERDATA, nftnl_udata_buf_data(u),
+		                     nftnl_udata_buf_len(u));
+		nftnl_udata_buf_free(u);
+	}
 	nlh = txn_msg(n, t, type, flags, 1024);
 	nftnl_table_nlmsg_build_payload(nlh, tb);
 	nbuf_commit(&t->b, nlh);
@@ -240,16 +265,6 @@ static void txn_flush_chain(struct nft_ctx *n, struct txn *t, const char *chain)
 	nftnl_rule_free(r);
 }
 
-/* A DELSETELEM without elements flushes the set. */
-static void txn_flush_set(struct nft_ctx *n, struct txn *t, const char *set)
-{
-	struct nlmsghdr *nlh = txn_msg(n, t, NFT_MSG_DELSETELEM, 0, 1024);
-
-	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, n->table);
-	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set);
-	nbuf_commit(&t->b, nlh);
-}
-
 static void txn_set(struct nft_ctx *n, struct txn *t, struct nftnl_set *s)
 {
 	struct nlmsghdr *nlh;
@@ -289,6 +304,18 @@ static void txn_rule(struct nft_ctx *n, struct txn *t, struct nftnl_rule *r)
 	nftnl_rule_nlmsg_build_payload(nlh, r);
 	nbuf_commit(&t->b, nlh);
 	nftnl_rule_free(r);
+}
+
+/* a policy rule: tagged with the shadow state it was written for */
+static void txn_prule(struct nft_ctx *n, struct txn *t, struct nftnl_rule *r, uint64_t tag)
+{
+	struct nftnl_udata_buf *u = oom(nftnl_udata_buf_alloc(32));
+
+	nftnl_udata_put(u, UD_TAG, sizeof(tag), &tag);
+	nftnl_rule_set_data(r, NFTNL_RULE_USERDATA, nftnl_udata_buf_data(u),
+	                    nftnl_udata_buf_len(u));
+	nftnl_udata_buf_free(u);
+	txn_rule(n, t, r);
 }
 
 static struct nftnl_expr *expr(struct nftnl_rule *r, const char *name)
@@ -409,7 +436,7 @@ static void set_key_host_endian(struct nftnl_set *s)
 
 /* ct mark & M vmap { V : jump mark_V, ... } via an anonymous constant map */
 static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
-                             const uint32_t *marks, uint32_t nmarks)
+                             const uint32_t *marks, uint32_t nmarks, uint64_t tag)
 {
 	struct nftnl_set *s = oom(nftnl_set_alloc());
 	uint32_t id = ++n->set_id, zero = 0;
@@ -457,7 +484,7 @@ static void txn_restore_rule(struct nft_ctx *n, struct txn *t, uint32_t mask,
 	e_ct(r, NFT_CT_MARK, false);
 	e_bitwise(r, &mask, &zero, 4);
 	e_lookup(r, "__map%d", id, NFT_REG_VERDICT);
-	txn_rule(n, t, r);
+	txn_prule(n, t, r, tag);
 }
 
 /*
@@ -489,7 +516,7 @@ static struct nftnl_rule *pool_rule(struct nft_ctx *n, const char *chain,
 }
 
 static void txn_dstnat_rules(struct nft_ctx *n, struct txn *t, const char *chain,
-                             const struct ip_prefix *p)
+                             const struct ip_prefix *p, uint64_t tag)
 {
 	bool v6 = p->family == AF_INET6;
 	uint32_t off = v6 ? 24 : 16, alen = v6 ? 16 : 4;
@@ -499,7 +526,7 @@ static void txn_dstnat_rules(struct nft_ctx *n, struct txn *t, const char *chain
 	r = pool_rule(n, chain, p);
 	e_payload(r, off, alen);
 	e_lookup(r, set_names[v6 ? S_MARK6 : S_MARK4], 0, NFT_REG_VERDICT);
-	txn_rule(n, t, r);
+	txn_prule(n, t, r, tag);
 
 	r = pool_rule(n, chain, p);
 	e_payload(r, off, alen);
@@ -508,11 +535,11 @@ static void txn_dstnat_rules(struct nft_ctx *n, struct txn *t, const char *chain
 	nftnl_expr_set_u32(e, NFTNL_EXPR_NAT_TYPE, NFT_NAT_DNAT);
 	nftnl_expr_set_u32(e, NFTNL_EXPR_NAT_FAMILY, v6 ? NFPROTO_IPV6 : NFPROTO_IPV4);
 	nftnl_expr_set_u32(e, NFTNL_EXPR_NAT_REG_ADDR_MIN, NFT_REG_1);
-	txn_rule(n, t, r);
+	txn_prule(n, t, r, tag);
 }
 
 static void txn_reject_rule(struct nft_ctx *n, struct txn *t, const char *chain,
-                            const struct ip_prefix *p)
+                            const struct ip_prefix *p, uint64_t tag)
 {
 	struct nftnl_rule *r = pool_rule(n, chain, p);
 	struct nftnl_expr *e = expr(r, "reject");
@@ -520,7 +547,7 @@ static void txn_reject_rule(struct nft_ctx *n, struct txn *t, const char *chain,
 	/* icmp(v6) port-unreachable, as nft's plain `reject` in inet */
 	nftnl_expr_set_u32(e, NFTNL_EXPR_REJECT_TYPE, NFT_REJECT_ICMP_UNREACH);
 	nftnl_expr_set_u8(e, NFTNL_EXPR_REJECT_CODE, p->family == AF_INET6 ? 4 : 3);
-	txn_rule(n, t, r);
+	txn_prule(n, t, r, tag);
 }
 
 static void txn_jump_rule(struct nft_ctx *n, struct txn *t, const char *chain,
@@ -538,21 +565,35 @@ static void txn_jump_rule(struct nft_ctx *n, struct txn *t, const char *chain,
 static const char *const dstnat_chains[] = { "prerouting_dstnat", "output_dstnat" };
 static const char *const reject_chains[] = { "forward_reject", "output_reject" };
 
+static uint64_t shadow_tag(const struct shadow *s);
+
 /* Rules of restore_marks, *_dstnat and *_reject (chains assumed empty). */
 static void txn_policy_rules(struct nft_ctx *n, struct txn *t, const struct shadow *s)
 {
+	uint64_t tag = shadow_tag(s);
+
 	if (s->nmarks)
-		txn_restore_rule(n, t, s->fwmask, s->marks, s->nmarks);
+		txn_restore_rule(n, t, s->fwmask, s->marks, s->nmarks, tag);
 	for (int i = 0; i < 2; i++) {
 		if (s->has_pool4)
-			txn_dstnat_rules(n, t, dstnat_chains[i], &s->pool4);
+			txn_dstnat_rules(n, t, dstnat_chains[i], &s->pool4, tag);
 		if (s->has_pool6)
-			txn_dstnat_rules(n, t, dstnat_chains[i], &s->pool6);
+			txn_dstnat_rules(n, t, dstnat_chains[i], &s->pool6, tag);
 		if (s->has_pool4)
-			txn_reject_rule(n, t, reject_chains[i], &s->pool4);
+			txn_reject_rule(n, t, reject_chains[i], &s->pool4, tag);
 		if (s->has_pool6)
-			txn_reject_rule(n, t, reject_chains[i], &s->pool6);
+			txn_reject_rule(n, t, reject_chains[i], &s->pool6, tag);
 	}
+}
+
+/* rules per policy chain for `s`: restore_marks, then dstnat_chains[i] and
+ * reject_chains[i] alike for both i */
+static void policy_rule_counts(const struct shadow *s, uint32_t *restore, uint32_t *dstnat,
+                               uint32_t *reject)
+{
+	*restore = s->nmarks ? 1 : 0;
+	*reject = (uint32_t)s->has_pool4 + s->has_pool6;
+	*dstnat = 2 * *reject;
 }
 
 static void txn_maps(struct nft_ctx *n, struct txn *t)
@@ -781,25 +822,55 @@ bool nft_mark_known(const struct nft_ctx *n, uint32_t mark)
 	return n->have_state && has_mark(&n->sh, mark);
 }
 
+/*
+ * Identifies the policy rules written for `s`, across processes (a fixed
+ * key: it detects edits and stale rules, not an adversary who can edit the
+ * ruleset anyway).
+ */
+static uint64_t shadow_tag(const struct shadow *s)
+{
+	static const uint8_t key[16];
+	struct {
+		uint64_t marks;
+		uint32_t fwmask;
+		uint8_t has4, has6, plen4, plen6;
+		uint8_t a4[16], a6[16];
+	} v;
+
+	memset(&v, 0, sizeof(v));
+	v.marks = siphash24(key, s->marks, s->nmarks * sizeof(*s->marks));
+	v.fwmask = s->fwmask;
+	v.has4 = s->has_pool4;
+	v.has6 = s->has_pool6;
+	if (s->has_pool4) {
+		v.plen4 = s->pool4.plen;
+		memcpy(v.a4, s->pool4.addr, sizeof(v.a4));
+	}
+	if (s->has_pool6) {
+		v.plen6 = s->pool6.plen;
+		memcpy(v.a6, s->pool6.addr, sizeof(v.a6));
+	}
+	return siphash24(key, &v, sizeof(v));
+}
+
 /* ---- control plane ---- */
 
-int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d)
+/*
+ * The whole table for `s`, in one transaction. `exists`: the table must be
+ * there already (an fwmask change), so a table deleted meanwhile (omnidns
+ * -F at stop) makes the transaction fail instead of coming back; otherwise
+ * add+delete is "delete if exists".
+ */
+static void txn_create(struct nft_ctx *n, struct txn *t, const struct shadow *s, bool exists)
 {
-	struct txn *t = &n->ctl_tx;
-	struct shadow s;
-	int err;
-
-	err = shadow_from(&s, d);
-	if (err)
-		return err;
 	txn_begin(n, t);
-	/* add+delete: "delete if exists" */
-	txn_table(n, t, NFT_MSG_NEWTABLE, NLM_F_CREATE);
-	txn_table(n, t, NFT_MSG_DELTABLE, 0);
-	txn_table(n, t, NFT_MSG_NEWTABLE, NLM_F_CREATE);
+	if (!exists)
+		txn_table(n, t, NFT_MSG_NEWTABLE, NLM_F_CREATE, 0);
+	txn_table(n, t, NFT_MSG_DELTABLE, 0, 0);
+	txn_table(n, t, NFT_MSG_NEWTABLE, NLM_F_CREATE, s->fwmask);
 	txn_maps(n, t);
-	for (uint32_t i = 0; i < s.nmarks; i++)
-		txn_mark_chain(n, t, s.fwmask, s.marks[i]);
+	for (uint32_t i = 0; i < s->nmarks; i++)
+		txn_mark_chain(n, t, s->fwmask, s->marks[i]);
 	txn_chain(n, t, NFT_MSG_NEWCHAIN, chain_new(n, "restore_marks"));
 	txn_base_chain(n, t, "prerouting_mangle", "filter", NF_INET_PRE_ROUTING,
 	               NF_IP_PRI_MANGLE);
@@ -815,18 +886,41 @@ int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d)
 	               NF_IP_PRI_FILTER - 1);
 	txn_jump_rule(n, t, "prerouting_mangle", "restore_marks");
 	txn_jump_rule(n, t, "output_mangle", "restore_marks");
-	txn_policy_rules(n, t, &s);
+	txn_policy_rules(n, t, s);
 	txn_end(n, t);
+}
 
-	err = ctl_commit(n, t, "bootstrap");
+/* Commit t; on success s becomes the shadow state, else it is freed. */
+static int ctl_apply(struct nft_ctx *n, struct txn *t, struct shadow *s, const char *what)
+{
+	int err = ctl_commit(n, t, what);
+
 	if (err) {
-		shadow_free(&s);
+		shadow_free(s);
 		return err;
 	}
 	shadow_free(&n->sh);
-	n->sh = s;
+	n->sh = *s;
 	n->have_state = true;
+	n->stale = false;
 	return 0;
+}
+
+void nft_set_secret(struct nft_ctx *n, const uint8_t secret[NFT_SECRET_LEN])
+{
+	memcpy(n->secret, secret, NFT_SECRET_LEN);
+}
+
+int nft_bootstrap(struct nft_ctx *n, const struct nft_desired *d)
+{
+	struct shadow s;
+	int err;
+
+	err = shadow_from(&s, d);
+	if (err)
+		return err;
+	txn_create(n, &n->ctl_tx, &s, false);
+	return ctl_apply(n, &n->ctl_tx, &s, "bootstrap");
 }
 
 int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d)
@@ -834,7 +928,6 @@ int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d)
 	struct txn *t = &n->ctl_tx;
 	struct shadow s;
 	char name[32];
-	bool remask;
 	int err;
 
 	if (!n->have_state) {
@@ -844,36 +937,33 @@ int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d)
 	err = shadow_from(&s, d);
 	if (err)
 		return err;
-	if (shadow_eq(&s, &n->sh)) {
+	if (!n->stale && shadow_eq(&s, &n->sh)) {
 		/* nothing to do; rules changed behind our back stay changed */
 		shadow_free(&s);
 		return 0;
 	}
-	remask = s.fwmask != n->sh.fwmask;
+	/*
+	 * A new fwmask comes with no live binding (main.c), and the table's
+	 * userdata, which records the fwmask, cannot be updated in place:
+	 * recreate the table. That also drops elements a failed element batch
+	 * may have left jumping to an old chain (deleting that chain would
+	 * fail with EBUSY).
+	 */
+	if (s.fwmask != n->sh.fwmask) {
+		txn_create(n, t, &s, true);
+		return ctl_apply(n, t, &s, "reconcile (new fwmask)");
+	}
 
 	txn_begin(n, t);
-	for (uint32_t i = 0; i < s.nmarks; i++) {
-		if (!has_mark(&n->sh, s.marks[i])) {
+	for (uint32_t i = 0; i < s.nmarks; i++)
+		if (!has_mark(&n->sh, s.marks[i]))
 			txn_mark_chain(n, t, s.fwmask, s.marks[i]);
-		} else if (remask) {
-			mark_chain_name(name, s.marks[i]);
-			txn_flush_chain(n, t, name);
-			txn_mark_rules(n, t, name, s.fwmask, s.marks[i]);
-		}
-	}
 	txn_flush_chain(n, t, "restore_marks");
 	for (int i = 0; i < 2; i++) {
 		txn_flush_chain(n, t, dstnat_chains[i]);
 		txn_flush_chain(n, t, reject_chains[i]);
 	}
 	txn_policy_rules(n, t, &s);
-	/*
-	 * A new fwmask comes with no live binding (main.c), but a failed element
-	 * batch may have left elements jumping to an old chain, and the chain
-	 * delete would fail with EBUSY on every retry: flush the maps first.
-	 */
-	for (int i = 0; remask && i < S_NUM; i++)
-		txn_flush_set(n, t, set_names[i]);
 	for (uint32_t i = 0; i < n->sh.nmarks; i++) {
 		if (has_mark(&s, n->sh.marks[i]))
 			continue;
@@ -881,15 +971,7 @@ int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d)
 		txn_chain(n, t, NFT_MSG_DELCHAIN, chain_new(n, name));
 	}
 	txn_end(n, t);
-
-	err = ctl_commit(n, t, "reconcile");
-	if (err) {
-		shadow_free(&s);
-		return err;
-	}
-	shadow_free(&n->sh);
-	n->sh = s;
-	return 0;
+	return ctl_apply(n, t, &s, "reconcile");
 }
 
 int nft_destroy_table(struct nft_ctx *n)
@@ -898,8 +980,8 @@ int nft_destroy_table(struct nft_ctx *n)
 	int err;
 
 	txn_begin(n, t);
-	txn_table(n, t, NFT_MSG_NEWTABLE, NLM_F_CREATE);
-	txn_table(n, t, NFT_MSG_DELTABLE, 0);
+	txn_table(n, t, NFT_MSG_NEWTABLE, NLM_F_CREATE, 0);
+	txn_table(n, t, NFT_MSG_DELTABLE, 0, 0);
 	txn_end(n, t);
 	err = ctl_commit(n, t, "destroy table");
 	if (!err) {
@@ -907,6 +989,448 @@ int nft_destroy_table(struct nft_ctx *n)
 		n->have_state = false;
 	}
 	return err;
+}
+
+/* ---- adoption: reading an existing table ---- */
+
+/*
+ * A reply larger than this would be truncated: netlink sizes dump messages
+ * by the largest buffer recv() was given, capped at 32 KiB.
+ */
+#define DUMP_BUF	32768
+/* chains in a table to adopt: the fixed ones, mark chains, some foreign */
+#define ADOPT_MAX_CHAINS	8192
+
+static const char *const fixed_chains[] = {
+	"restore_marks", "prerouting_mangle", "output_mangle", "prerouting_dstnat",
+	"output_dstnat", "forward_reject", "output_reject",
+};
+#define NFIXED (sizeof(fixed_chains) / sizeof(fixed_chains[0]))
+
+struct attrs {
+	const struct nlattr **tb;
+	int max;
+};
+
+static int attr_cb(const struct nlattr *a, void *data)
+{
+	struct attrs *s = data;
+	int type = mnl_attr_get_type(a);
+
+	if (type <= s->max)
+		s->tb[type] = a;
+	return MNL_CB_OK;
+}
+
+static void parse_msg(const struct nlmsghdr *nlh, const struct nlattr **tb, int max)
+{
+	struct attrs s = { tb, max };
+
+	memset(tb, 0, sizeof(*tb) * (max + 1));
+	mnl_attr_parse(nlh, sizeof(struct nfgenmsg), attr_cb, &s);
+}
+
+static void parse_nest(const struct nlattr *nest, const struct nlattr **tb, int max)
+{
+	struct attrs s = { tb, max };
+
+	memset(tb, 0, sizeof(*tb) * (max + 1));
+	if (nest)
+		mnl_attr_parse_nested(nest, attr_cb, &s);
+}
+
+/* NUL-terminated string attribute, or NULL */
+static const char *attr_str(const struct nlattr *a)
+{
+	uint16_t len = a ? mnl_attr_get_payload_len(a) : 0;
+
+	if (!len || ((const char *)mnl_attr_get_payload(a))[len - 1])
+		return NULL;
+	return mnl_attr_get_str(a);
+}
+
+static bool our_table(const struct nft_ctx *n, const struct nlattr *a)
+{
+	const char *t = attr_str(a);
+
+	return t && !strcmp(t, n->table);
+}
+
+/*
+ * Send a GET request (a dump, or one object asking for an ack) on the
+ * control socket and pass each reply message to cb. 0, or -errno (-ENOENT:
+ * no such object); a callback failing with errno set ends it early.
+ */
+static int ctl_get(struct nft_ctx *n, struct nlmsghdr *nlh, mnl_cb_t cb, void *priv)
+{
+	int fd = mnl_socket_get_fd(n->ctl), r;
+	uint32_t seq = nlh->nlmsg_seq, portid = mnl_socket_get_portid(n->ctl);
+	char *buf = oom(malloc(DUMP_BUF));
+
+	ctl_discard(fd, buf, DUMP_BUF);
+	r = mnl_socket_sendto(n->ctl, nlh, nlh->nlmsg_len) < 0 ? -errno : MNL_CB_OK;
+	while (r == MNL_CB_OK) {
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		ssize_t len;
+
+		if (poll(&pfd, 1, RECV_TIMEOUT_MS) <= 0) {
+			r = -ETIMEDOUT;
+			break;
+		}
+		len = recv(fd, buf, DUMP_BUF, 0);
+		if (len < 0) {
+			if (errno != EINTR)
+				r = -errno;
+			continue;
+		}
+		r = mnl_cb_run(buf, (size_t)len, seq, portid, cb, priv);
+		if (r < 0)
+			r = errno ? -errno : -EPROTO;
+	}
+	free(buf);
+	return r < 0 ? r : 0;
+}
+
+static struct nlmsghdr *get_msg(struct nft_ctx *n, char *buf, int type, uint16_t flags)
+{
+	return nftnl_nlmsg_build_hdr(buf, type, NFPROTO_INET, flags, n->seq++);
+}
+
+struct table_st {
+	uint32_t version, fwmask;
+	bool has_secret;
+	uint8_t secret[NFT_SECRET_LEN];
+};
+
+static int table_ud_cb(const struct nftnl_udata *a, void *data)
+{
+	struct table_st *st = data;
+	uint8_t len = nftnl_udata_len(a);
+
+	switch (nftnl_udata_type(a)) {
+	case UD_VERSION:
+		if (len == 4)
+			st->version = nftnl_udata_get_u32(a);
+		break;
+	case UD_FWMASK:
+		if (len == 4)
+			st->fwmask = nftnl_udata_get_u32(a);
+		break;
+	case UD_SECRET:
+		if (len == NFT_SECRET_LEN) {
+			memcpy(st->secret, nftnl_udata_get(a), NFT_SECRET_LEN);
+			st->has_secret = true;
+		}
+		break;
+	}
+	return MNL_CB_OK;
+}
+
+static int table_cb(const struct nlmsghdr *nlh, void *priv)
+{
+	const struct nlattr *tb[NFTA_TABLE_MAX + 1];
+	const struct nlattr *u;
+
+	parse_msg(nlh, tb, NFTA_TABLE_MAX);
+	u = tb[NFTA_TABLE_USERDATA];
+	if (u)
+		nftnl_udata_parse(mnl_attr_get_payload(u), mnl_attr_get_payload_len(u),
+		                  table_ud_cb, priv);
+	return MNL_CB_OK;
+}
+
+/* mark_%08x, exactly as mark_chain_name() prints it, valid for `fwmask` */
+static bool parse_mark_chain(const char *name, uint32_t fwmask, uint32_t *v)
+{
+	char buf[32];
+	unsigned long x;
+
+	if (strncmp(name, "mark_", 5) || strlen(name) != 13)
+		return false;
+	x = strtoul(name + 5, NULL, 16);
+	mark_chain_name(buf, (uint32_t)x);
+	if (strcmp(buf, name) || !x || (x & ~(unsigned long)fwmask))
+		return false;
+	*v = (uint32_t)x;
+	return true;
+}
+
+struct chain_st {
+	const struct nft_ctx *n;
+	uint32_t fwmask;
+	uint32_t nchains, fixed;	/* fixed: bit i = fixed_chains[i] seen */
+	uint32_t *marks, nmarks;
+};
+
+static int chain_cb(const struct nlmsghdr *nlh, void *priv)
+{
+	const struct nlattr *tb[NFTA_CHAIN_MAX + 1];
+	struct chain_st *st = priv;
+	const char *name;
+	uint32_t v;
+
+	parse_msg(nlh, tb, NFTA_CHAIN_MAX);
+	name = attr_str(tb[NFTA_CHAIN_NAME]);
+	if (!our_table(st->n, tb[NFTA_CHAIN_TABLE]) || !name)
+		return MNL_CB_OK;
+	if (++st->nchains > ADOPT_MAX_CHAINS) {
+		errno = E2BIG;
+		return MNL_CB_ERROR;
+	}
+	for (uint32_t i = 0; i < NFIXED; i++)
+		if (!strcmp(name, fixed_chains[i]))
+			st->fixed |= 1u << i;
+	if (parse_mark_chain(name, st->fwmask, &v))
+		st->marks[st->nmarks++] = v;
+	return MNL_CB_OK;
+}
+
+struct rule_st {
+	uint64_t tag;
+	uint32_t n;
+	bool bad;
+};
+
+static int rule_ud_cb(const struct nftnl_udata *a, void *data)
+{
+	struct rule_st *st = data;
+	uint64_t tag;
+
+	if (nftnl_udata_type(a) == UD_TAG && nftnl_udata_len(a) == sizeof(tag)) {
+		memcpy(&tag, nftnl_udata_get(a), sizeof(tag));
+		if (tag == st->tag)
+			st->bad = false;
+	}
+	return MNL_CB_OK;
+}
+
+static int rule_cb(const struct nlmsghdr *nlh, void *priv)
+{
+	const struct nlattr *tb[NFTA_RULE_MAX + 1];
+	struct rule_st *st = priv;
+	const struct nlattr *u;
+	bool bad = st->bad;
+
+	parse_msg(nlh, tb, NFTA_RULE_MAX);
+	st->n++;
+	st->bad = true;		/* unless this rule carries the tag */
+	u = tb[NFTA_RULE_USERDATA];
+	if (u)
+		nftnl_udata_parse(mnl_attr_get_payload(u), mnl_attr_get_payload_len(u),
+		                  rule_ud_cb, st);
+	st->bad |= bad;
+	return MNL_CB_OK;
+}
+
+/* true if `chain` holds exactly `want` rules, all tagged `tag` */
+static bool rules_current(struct nft_ctx *n, const char *chain, uint64_t tag, uint32_t want)
+{
+	struct rule_st st = { .tag = tag };
+	char buf[512];
+	struct nlmsghdr *nlh = get_msg(n, buf, NFT_MSG_GETRULE, NLM_F_DUMP);
+
+	mnl_attr_put_strz(nlh, NFTA_RULE_TABLE, n->table);
+	mnl_attr_put_strz(nlh, NFTA_RULE_CHAIN, chain);
+	return !ctl_get(n, nlh, rule_cb, &st) && !st.bad && st.n == want;
+}
+
+struct elem_st {
+	const struct shadow *sh;
+	uint8_t family;
+	bool mark;			/* a fake2mark map */
+	struct nft_elem *v;
+	uint32_t n, cap, max;
+};
+
+static int elem_cb(const struct nlmsghdr *nlh, void *priv)
+{
+	const struct nlattr *tb[NFTA_SET_ELEM_LIST_MAX + 1], *a;
+	struct elem_st *st = priv;
+	uint32_t alen = st->family == 6 ? 16 : 4;
+
+	parse_msg(nlh, tb, NFTA_SET_ELEM_LIST_MAX);
+	if (!tb[NFTA_SET_ELEM_LIST_ELEMENTS])
+		return MNL_CB_OK;
+	mnl_attr_for_each_nested(a, tb[NFTA_SET_ELEM_LIST_ELEMENTS]) {
+		const struct nlattr *e[NFTA_SET_ELEM_MAX + 1], *k[NFTA_DATA_MAX + 1];
+		const struct nlattr *dt[NFTA_DATA_MAX + 1], *vd[NFTA_VERDICT_MAX + 1];
+		struct nft_elem *x;
+		const char *chain;
+
+		parse_nest(a, e, NFTA_SET_ELEM_MAX);
+		parse_nest(e[NFTA_SET_ELEM_KEY], k, NFTA_DATA_MAX);
+		if (!k[NFTA_DATA_VALUE] || mnl_attr_get_payload_len(k[NFTA_DATA_VALUE]) != alen)
+			continue;	/* not a key of ours: nothing we could destroy */
+		if (st->n == st->max) {
+			errno = E2BIG;
+			return MNL_CB_ERROR;
+		}
+		if (st->n == st->cap) {
+			st->cap = st->cap ? st->cap * 2 : 256;
+			st->v = oom(realloc(st->v, st->cap * sizeof(*st->v)));
+		}
+		x = &st->v[st->n++];
+		memset(x, 0, sizeof(*x));
+		x->family = st->family;
+		memcpy(x->fake, mnl_attr_get_payload(k[NFTA_DATA_VALUE]), alen);
+		parse_nest(e[NFTA_SET_ELEM_DATA], dt, NFTA_DATA_MAX);
+		if (!st->mark) {
+			if (dt[NFTA_DATA_VALUE] &&
+			    mnl_attr_get_payload_len(dt[NFTA_DATA_VALUE]) == alen) {
+				memcpy(x->real, mnl_attr_get_payload(dt[NFTA_DATA_VALUE]), alen);
+				x->ok = true;
+			}
+			continue;
+		}
+		parse_nest(dt[NFTA_DATA_VERDICT], vd, NFTA_VERDICT_MAX);
+		chain = attr_str(vd[NFTA_VERDICT_CHAIN]);
+		x->ok = vd[NFTA_VERDICT_CODE] &&
+		        mnl_attr_get_payload_len(vd[NFTA_VERDICT_CODE]) == 4 &&
+		        ntohl(mnl_attr_get_u32(vd[NFTA_VERDICT_CODE])) == (uint32_t)NFT_JUMP &&
+		        chain && parse_mark_chain(chain, st->sh->fwmask, &x->mark) &&
+		        has_mark(st->sh, x->mark);
+	}
+	return MNL_CB_OK;
+}
+
+static int dump_map(struct nft_ctx *n, int set, struct elem_st *st)
+{
+	char buf[512];
+	struct nlmsghdr *nlh = get_msg(n, buf, NFT_MSG_GETSETELEM, NLM_F_DUMP);
+
+	st->family = set >= S_REAL6 ? 6 : 4;
+	st->mark = set & 1;
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_TABLE, n->table);
+	mnl_attr_put_strz(nlh, NFTA_SET_ELEM_LIST_SET, set_names[set]);
+	return ctl_get(n, nlh, elem_cb, st);
+}
+
+static int cmp_elem(const void *a, const void *b)
+{
+	const struct nft_elem *x = a, *y = b;
+
+	if (x->family != y->family)
+		return x->family < y->family ? -1 : 1;
+	return memcmp(x->fake, y->fake, sizeof(x->fake));
+}
+
+/*
+ * Pair fake2real elements r[] with fake2mark elements m[] by fake (both
+ * sorted): one entry per fake, ok only if both halves are.
+ */
+static uint32_t pair_elems(const struct nft_elem *r, uint32_t nr, const struct nft_elem *m,
+                           uint32_t nm, struct nft_elem *out)
+{
+	uint32_t i = 0, j = 0, k = 0;
+
+	while (i < nr || j < nm) {
+		int c = i == nr ? 1 : j == nm ? -1 : cmp_elem(&r[i], &m[j]);
+
+		out[k] = c <= 0 ? r[i] : m[j];
+		if (c) {
+			out[k].ok = false;
+		} else {
+			out[k].mark = m[j].mark;
+			out[k].ok = r[i].ok && m[j].ok;
+		}
+		k++;
+		i += c <= 0;
+		j += c >= 0;
+	}
+	return k;
+}
+
+int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems,
+              uint8_t secret[NFT_SECRET_LEN], struct nft_elem **elems, uint32_t *nelems)
+{
+	struct table_st tst = { 0 };
+	struct chain_st cst = { .n = n, .fwmask = d->fwmask };
+	struct elem_st est[2] = { { 0 } };	/* fake2real, fake2mark (both families) */
+	uint32_t want[3], i;
+	struct nft_elem *out = NULL;
+	struct nlmsghdr *nlh;
+	struct shadow s;
+	const char *why;
+	char buf[512];
+	uint64_t tag;
+	int err;
+
+	*elems = NULL;
+	*nelems = 0;
+	if (shadow_from(&s, d))
+		return 0;
+	nlh = get_msg(n, buf, NFT_MSG_GETTABLE, NLM_F_ACK);
+	mnl_attr_put_strz(nlh, NFTA_TABLE_NAME, n->table);
+	err = ctl_get(n, nlh, table_cb, &tst);
+	if (err == -ENOENT) {
+		log_info("nft: no table %s yet", n->table);
+		goto fail_quiet;
+	}
+	why = "cannot read it";
+	if (err)
+		goto fail;
+	why = "made by another omnidns version";
+	if (tst.version != LAYOUT_VERSION || !tst.has_secret)
+		goto fail;
+	why = "made for another fwmask";
+	if (tst.fwmask != d->fwmask)
+		goto fail;
+
+	free(s.marks);
+	s.marks = cst.marks = oom(malloc(ADOPT_MAX_CHAINS * sizeof(uint32_t)));
+	s.nmarks = 0;
+	nlh = get_msg(n, buf, NFT_MSG_GETCHAIN, NLM_F_DUMP);
+	why = "cannot list its chains, or too many";
+	if (ctl_get(n, nlh, chain_cb, &cst))
+		goto fail;
+	why = "a chain is missing";
+	if (cst.fixed != (1u << NFIXED) - 1)
+		goto fail;
+	qsort(cst.marks, cst.nmarks, sizeof(uint32_t), cmp_u32);
+	s.marks = oom(realloc(cst.marks, (cst.nmarks + 1) * sizeof(uint32_t)));
+	s.nmarks = cst.nmarks;
+
+	why = "cannot list its maps, or more elements than fakeip_max_bindings allows";
+	for (i = 0; i < 2; i++) {
+		est[i].sh = &s;
+		est[i].max = max_elems;
+		if (dump_map(n, i ? S_MARK4 : S_REAL4, &est[i]) ||
+		    dump_map(n, i ? S_MARK6 : S_REAL6, &est[i]))
+			goto fail;
+		if (est[i].n)
+			qsort(est[i].v, est[i].n, sizeof(*est[i].v), cmp_elem);
+	}
+	out = oom(malloc(((size_t)est[0].n + est[1].n + 1) * sizeof(*out)));
+	*nelems = pair_elems(est[0].v, est[0].n, est[1].v, est[1].n, out);
+	*elems = out;
+
+	/* policy rules: exactly what `s` would install, or rewrite them */
+	tag = shadow_tag(&s);
+	policy_rule_counts(&s, &want[0], &want[1], &want[2]);
+	n->stale = !rules_current(n, "restore_marks", tag, want[0]);
+	for (i = 0; i < 2 && !n->stale; i++)
+		n->stale = !rules_current(n, dstnat_chains[i], tag, want[1]) ||
+		           !rules_current(n, reject_chains[i], tag, want[2]);
+
+	shadow_free(&n->sh);
+	n->sh = s;
+	n->have_state = true;
+	memcpy(n->secret, tst.secret, NFT_SECRET_LEN);
+	memcpy(secret, tst.secret, NFT_SECRET_LEN);
+	log_info("nft: adopting table %s: %u map elements, %u mark chains%s", n->table,
+	         *nelems, s.nmarks, n->stale ? ", policy rules to rewrite" : "");
+	free(est[0].v);
+	free(est[1].v);
+	return 1;
+
+fail:
+	log_warn("nft: not adopting table %s (%s): it is recreated, its fake IPs are lost",
+	         n->table, why);
+fail_quiet:
+	free(est[0].v);
+	free(est[1].v);
+	shadow_free(&s);
+	return 0;
 }
 
 /* ---- async element batches ---- */

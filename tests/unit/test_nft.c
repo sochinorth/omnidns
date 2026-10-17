@@ -886,7 +886,7 @@ TEST(fakeip_failed_batch)
  * A failed batch rolls back the deletes it carried, so the kernel may keep
  * elements the binding table already forgot, jumping to old mark chains. An
  * fwmask change (accepted only with no live binding) must still be able to
- * delete those chains: it flushes the maps in the same transaction. Any
+ * delete those chains: it recreates the table, maps included. Any
  * other reconcile leaves the maps alone.
  */
 TEST(reconcile_fwmask_stale_elems)
@@ -944,6 +944,242 @@ TEST(reconcile_fwmask_stale_elems)
 	run_loop();
 	CHECK_EQ(a.err, 0);
 	CHECK_EQ(count_elems("fake2mark_v4"), 1);
+}
+
+/* ---- adoption across a restart ---- */
+
+static const uint8_t secret_a[NFT_SECRET_LEN] = { 0xa1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+static const uint8_t secret_b[NFT_SECRET_LEN] = { 0xb2, 7 };
+
+static void elem_sync(int family, const char *fake, const char *real, uint32_t mark)
+{
+	uint8_t f[16], r[16];
+
+	inet_pton(family, fake, f);
+	inet_pton(family, real, r);
+	nft_elem_add(n, family, f, r, mark);
+}
+
+/* a second context on the same table, as a restarted daemon has */
+static int adopt(const struct nft_desired *d, uint32_t max, uint8_t *secret,
+                 struct nft_elem **el, uint32_t *nel, struct nft_ctx **out)
+{
+	struct nft_ctx *m = nft_open(TABLE);
+	int r = m ? nft_adopt(m, d, max, secret, el, nel) : -1;
+
+	if (out)
+		*out = m;
+	else
+		nft_close(m);
+	return r;
+}
+
+static bool elem_is(const struct nft_elem *e, int family, const char *fake, bool ok,
+                    const char *real, uint32_t mark)
+{
+	uint8_t f[16] = { 0 }, r[16] = { 0 };
+
+	inet_pton(family, fake, f);
+	if (real)
+		inet_pton(family, real, r);
+	return e->family == (family == AF_INET ? 4 : 6) && !memcmp(e->fake, f, 16) &&
+	       e->ok == ok && (!ok || (!memcmp(e->real, r, 16) && e->mark == mark));
+}
+
+TEST(adopt_userdata_secret)
+{
+	static const uint32_t m1[] = { 0x01000000 };
+	struct nft_desired d = desired(true, false, m1, 1);
+	uint8_t got[NFT_SECRET_LEN];
+	struct nft_elem *el;
+	uint32_t nel;
+	char *o;
+
+	nft_set_secret(n, secret_a);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	memset(got, 0, sizeof(got));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 1);
+	CHECK(!memcmp(got, secret_a, sizeof(got)));
+	CHECK_EQ(nel, 0);
+	free(el);
+	/* nft still lists the table (it ignores our userdata types) */
+	o = list_table();
+	CHECK(has(o, "chain mark_01000000"));
+	free(o);
+
+	/* an fwmask change recreates the table: same secret, new fwmask */
+	nft_set_secret(n, secret_b);	/* not used: the table already has one */
+	{
+		struct nft_ctx *m;
+
+		REQUIRE(adopt(&d, 100, got, &el, &nel, &m) == 1);
+		free(el);
+		d.fwmask = 0x00ff0000;
+		d.nmarks = 0;
+		CHECK_EQ(nft_reconcile(m, &d), 0);
+		nft_close(m);
+	}
+	memset(got, 0, sizeof(got));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 1);
+	CHECK(!memcmp(got, secret_a, sizeof(got)));
+	free(el);
+	d.fwmask = 0xff000000;
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);	/* the old fwmask */
+
+	/* an fwmask change never brings back a table deleted meanwhile (-F) */
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	free(sh("nft delete table inet " TABLE));
+	d.fwmask = 0x00ff0000;
+	CHECK(nft_reconcile(n, &d) < 0);
+	o = list_table();
+	CHECK(lacks(o, "table inet " TABLE " {"));
+	free(o);
+}
+
+TEST(adopt_dump)
+{
+	static const uint32_t m1[] = { 0x01000000, 0x02000000 };
+	struct nft_desired d = desired(true, true, m1, 2);
+	uint8_t got[NFT_SECRET_LEN];
+	struct nft_elem *el;
+	uint32_t nel;
+
+	nft_set_secret(n, secret_a);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	elem_sync(AF_INET, "198.18.0.1", "10.1.1.1", 0x01000000);
+	elem_sync(AF_INET6, "fc00::1", "2001:db8::1", 0x02000000);
+	elem_sync(AF_INET, "198.18.0.3", "10.3.3.3", 0x02000000);
+	REQUIRE(nft_drain(n) == 0);
+	/* foreign state: a half element, a jump to a foreign chain, a mark
+	 * chain we did not make (not valid for the fwmask) */
+	free(sh("nft add chain inet " TABLE " foo; nft add chain inet " TABLE " mark_00000001; "
+	        "nft add element inet " TABLE " fake2real_v4 '{ 198.18.0.9 : 10.9.9.9 }'; "
+	        "nft add element inet " TABLE " fake2real_v4 '{ 198.18.0.10 : 10.9.9.9 }'; "
+	        "nft add element inet " TABLE " fake2mark_v4 '{ 198.18.0.10 : jump foo }'; "
+	        "nft add element inet " TABLE " fake2mark_v4 '{ 198.18.0.11 : jump mark_00000001 }'; "
+	        "nft add element inet " TABLE " fake2mark_v6 '{ fc00::2 : jump mark_01000000 }'"));
+	REQUIRE(adopt(&d, 100, got, &el, &nel, NULL) == 1);
+	REQUIRE(nel == 7);
+	CHECK(elem_is(&el[0], AF_INET, "198.18.0.1", true, "10.1.1.1", 0x01000000));
+	CHECK(elem_is(&el[1], AF_INET, "198.18.0.3", true, "10.3.3.3", 0x02000000));
+	CHECK(elem_is(&el[2], AF_INET, "198.18.0.9", false, NULL, 0));
+	CHECK(elem_is(&el[3], AF_INET, "198.18.0.10", false, NULL, 0));
+	CHECK(elem_is(&el[4], AF_INET, "198.18.0.11", false, NULL, 0));
+	CHECK(elem_is(&el[5], AF_INET6, "fc00::1", true, "2001:db8::1", 0x02000000));
+	CHECK(elem_is(&el[6], AF_INET6, "fc00::2", false, NULL, 0));
+	free(el);
+	/* bounded: more elements in the fake2mark (or fake2real) maps than
+	 * allowed declines adoption; here 6 (and 5) */
+	el = NULL;
+	CHECK_EQ(adopt(&d, 5, got, &el, &nel, NULL), 0);
+	CHECK(!el);
+	CHECK_EQ(adopt(&d, 6, got, &el, &nel, NULL), 1);
+	free(el);
+	free(sh("nft flush map inet " TABLE " fake2mark_v4; nft flush map inet " TABLE " fake2real_v4; "
+	        "nft flush map inet " TABLE " fake2mark_v6; nft flush map inet " TABLE " fake2real_v6; "
+	        "nft delete chain inet " TABLE " mark_00000001; nft delete chain inet " TABLE " foo"));
+}
+
+/* a restarted daemon: adopt, destroy what it does not keep, reconcile */
+TEST(adopt_reconcile_keeps_elements)
+{
+	static const uint32_t m1[] = { 0x01000000, 0x02000000 };
+	static const uint32_t m2[] = { 0x01000000 };
+	struct nft_desired d = desired(true, true, m1, 2);
+	uint8_t got[NFT_SECRET_LEN], f[4];
+	struct nft_elem *el;
+	struct nft_ctx *m;
+	uint32_t nel;
+	char *a, *b;
+
+	nft_set_secret(n, secret_a);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	elem_sync(AF_INET, "198.18.0.1", "10.1.1.1", 0x01000000);
+	elem_sync(AF_INET, "198.18.0.2", "10.2.2.2", 0x02000000);
+	REQUIRE(nft_drain(n) == 0);
+	a = sh("nft -a list table inet " TABLE);
+
+	/* unchanged desired state: nothing is sent */
+	REQUIRE(adopt(&d, 100, got, &el, &nel, &m) == 1);
+	CHECK_EQ(nel, 2);
+	free(el);
+	CHECK(nft_mark_known(m, 0x02000000));
+	CHECK_EQ(nft_reconcile(m, &d), 0);
+	b = sh("nft -a list table inet " TABLE);
+	CHECK_STR(a, b);
+	free(b);
+
+	/* the restarted daemon keeps only the first: mark_02000000 goes */
+	v4(f, "198.18.0.2");
+	nft_elem_del(m, AF_INET, f);
+	CHECK_EQ(nft_drain(m), 0);
+	d.marks = m2;
+	d.nmarks = 1;
+	CHECK_EQ(nft_reconcile(m, &d), 0);
+	b = list_table();
+	CHECK(has(b, "198.18.0.1 : 10.1.1.1"));
+	CHECK(has(b, "198.18.0.1 : jump mark_01000000"));
+	CHECK(lacks(b, "198.18.0.2"));
+	CHECK(lacks(b, "mark_02000000"));
+	free(b);
+	nft_close(m);
+
+	/* policy rules edited behind our back: the adopting reconcile rewrites them */
+	free(sh("nft flush chain inet " TABLE " forward_reject"));
+	REQUIRE(adopt(&d, 100, got, &el, &nel, &m) == 1);
+	free(el);
+	CHECK_EQ(nft_reconcile(m, &d), 0);
+	b = list_table();
+	CHECK(has(b, "chain forward_reject {\n\t\ttype filter hook forward priority "
+	          "filter - 1; policy accept;\n\t\tip daddr 198.18.0.0/15 reject"));
+	CHECK(has(b, "198.18.0.1 : 10.1.1.1"));
+	free(b);
+	/* ... and so is a pool change made while no daemon ran */
+	d.pool4 = pfx(AF_INET, "198.18.0.0", 16);
+	nft_close(m);
+	REQUIRE(adopt(&d, 100, got, &el, &nel, &m) == 1);
+	free(el);
+	CHECK_EQ(nft_reconcile(m, &d), 0);
+	b = list_table();
+	CHECK(has(b, "ip daddr 198.18.0.0/16 dnat ip to ip daddr map @fake2real_v4"));
+	free(b);
+	nft_close(m);
+	free(a);
+}
+
+TEST(adopt_mismatch_bootstraps)
+{
+	static const uint32_t m1[] = { 0x01000000 };
+	struct nft_desired d = desired(true, false, m1, 1);
+	uint8_t got[NFT_SECRET_LEN];
+	struct nft_elem *el;
+	uint32_t nel;
+
+	nft_set_secret(n, secret_a);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	elem_sync(AF_INET, "198.18.0.1", "10.1.1.1", 0x01000000);
+	REQUIRE(nft_drain(n) == 0);
+	/* another fwmask */
+	d.fwmask = 0x0f000000;
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	CHECK(!el && !nel);
+	d.fwmask = 0xff000000;
+	/* a chain missing */
+	free(sh("nft delete chain inet " TABLE " output_reject"));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	/* no table */
+	free(sh("nft delete table inet " TABLE));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	/* a table without our userdata (another layout version) */
+	free(sh("nft add table inet " TABLE " '{ comment \"x\"; }'"));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	/* the bootstrap that follows replaces it with a fresh secret */
+	nft_set_secret(n, secret_b);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	CHECK_EQ(count_elems("fake2real_v4"), 0);
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 1);
+	CHECK(!memcmp(got, secret_b, sizeof(got)));
+	free(el);
 }
 
 /* ---- real packets in the netns ---- */
@@ -1354,6 +1590,10 @@ int main(int argc, char **argv)
 	RUN(async_burst_inflight);
 	RUN(fakeip_failed_batch);
 	RUN(reconcile_fwmask_stale_elems);
+	RUN(adopt_userdata_secret);
+	RUN(adopt_dump);
+	RUN(adopt_reconcile_keeps_elements);
+	RUN(adopt_mismatch_bootstraps);
 	RUN(wire_v4v6_all_marks);
 	RUN(wire_batch_max);
 	RUN(batch_buffers);
