@@ -1791,6 +1791,79 @@ TEST(batch_buffers)
 	CHECK_EQ(nfails, 0);
 }
 
+/*
+ * Every chain is checked: one edited behind our back is rewritten by the
+ * reconcile after adoption, keeping the elements; one that cannot be
+ * rewritten in place (another hook or priority, a map of another type)
+ * declines adoption.
+ */
+TEST(adopt_repairs_chains)
+{
+	static const uint32_t m1[] = { 0x01000000, 0x02000000 };
+	struct nft_desired d = desired(true, true, m1, 2);
+	uint8_t got[NFT_SECRET_LEN];
+	struct nft_elem *el;
+	struct nft_ctx *m;
+	uint32_t nel;
+	char *a, *b;
+
+	nft_set_secret(n, secret_a);
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	elem_sync(AF_INET, "198.18.0.1", "10.1.1.1", 0x02000000);
+	REQUIRE(nft_drain(n) == 0);
+	a = list_table();
+	/* no ct mark restored; a mark chain doing something else; a foreign
+	 * rule; a base chain dropping */
+	free(sh("nft flush chain inet " TABLE " prerouting_mangle; "
+	        "nft flush chain inet " TABLE " mark_02000000; "
+	        "nft add rule inet " TABLE " mark_02000000 accept; "
+	        "nft add rule inet " TABLE " output_mangle counter; "
+	        "nft add chain inet " TABLE " output_reject '{ policy drop; }'"));
+	REQUIRE(adopt(&d, 100, got, &el, &nel, &m) == 1);
+	CHECK_EQ(nel, 1);
+	free(el);
+	CHECK_EQ(nft_reconcile(m, &d), 0);
+	b = list_table();
+	CHECK_STR(a, b);
+	free(b);
+	/* repaired, it is current again */
+	CHECK_EQ(nft_reconcile(m, &d), 0);
+	nft_close(m);
+	REQUIRE(adopt(&d, 100, got, &el, &nel, &m) == 1);
+	free(el);
+	cap_start();
+	CHECK_EQ(nft_reconcile(m, &d), 0);
+	cap.on = false;
+	CHECK_EQ(cap.nsend, 0);
+	nft_close(m);
+	free(a);
+
+	/* another priority */
+	free(sh("nft flush chain inet " TABLE " prerouting_dstnat; "
+	        "nft delete chain inet " TABLE " prerouting_dstnat; "
+	        "nft add chain inet " TABLE " prerouting_dstnat "
+	        "'{ type nat hook prerouting priority -90; }'"));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	/* a mark chain that is a base chain */
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	free(sh("nft flush chain inet " TABLE " restore_marks; "
+	        "nft delete chain inet " TABLE " mark_02000000; "
+	        "nft add chain inet " TABLE " mark_02000000 "
+	        "'{ type filter hook input priority 0; }'"));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	/* a map of another type */
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	free(sh("nft flush chain inet " TABLE " prerouting_dstnat; "
+	        "nft flush chain inet " TABLE " output_dstnat; "
+	        "nft delete map inet " TABLE " fake2real_v6; "
+	        "nft add map inet " TABLE " fake2real_v6 '{ type ipv6_addr : ipv4_addr; }'"));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+	/* a dormant table */
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	free(sh("nft add table inet " TABLE " '{ flags dormant; }'"));
+	CHECK_EQ(adopt(&d, 100, got, &el, &nel, NULL), 0);
+}
+
 int main(int argc, char **argv)
 {
 	test_require_netns(argv);
@@ -1822,6 +1895,7 @@ int main(int argc, char **argv)
 	RUN(adopt_dump);
 	RUN(adopt_reconcile_keeps_elements);
 	RUN(adopt_mismatch_bootstraps);
+	RUN(adopt_repairs_chains);
 	RUN(adopt_crafted_userdata);
 	RUN(adopt_cap_bounds_work);
 	RUN(adopt_under_churn);

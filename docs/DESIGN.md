@@ -366,16 +366,33 @@ At startup omnidns reads the table, if any:
 
 1. The table's userdata holds a layout version, the fwmask and the
    allocation secret. If the table is missing, has another version or
-   fwmask, lacks one of its fixed chains, or cannot be read, omnidns
-   bootstraps with a fresh secret, as on a first start, and logs why. A
+   fwmask, is dormant, or cannot be read, omnidns bootstraps with a fresh
+   secret, as on a first start, and logs why. So does a table in which a
+   fixed chain is missing or not of its type, hook and priority, a
+   `mark_V` chain is a base chain, or one of the four maps is missing or
+   of another type: those cannot be changed in place without losing the
+   elements. Layout version 2 tags every rule (below); a table of version
+   1, which tagged only the policy rules, is bootstrapped. A
    commit anywhere in the netns (fw4, dnsmasq's nftset, mwan3) interrupts
    a dump that is under way (`NLM_F_DUMP_INTR`): the whole reading then
    starts over, as nft does, up to 16 times with pauses doubling from 1 to
-   128 ms (about 1.2 s); only then does it bootstrap.
+   128 ms (about 1.2 s); only then does it bootstrap. Each reading uses a
+   netlink socket of its own, closed when it ends or gives up, which ends
+   a dump left unread: the kernel produces the next part of a dump only
+   when its socket is read, so stopping at a cap (below) bounds the work.
 2. Otherwise the shadow state is rebuilt from the kernel: the mark chains
-   present, and the configuration's pools if every policy rule carries the
-   tag of exactly that state (each policy rule records one); else the
-   policy rules count as stale.
+   present and the configuration's pools. Every rule omnidns writes
+   carries a tag (rule userdata) of what it was written for: the policy
+   rules (`restore_marks`, `*_dstnat`, `*_reject`) the shadow state, a
+   mark chain's rules the fwmask and its mark, the jumps to
+   `restore_marks` the fwmask. One rule dump of the table checks every
+   chain of ours by tag and count. A chain with another count, a rule
+   without its tag, or a base chain whose policy is not accept, is
+   rewritten by the reconcile that follows (a base chain is also defined
+   again, which restores its policy); the maps and their elements stay.
+   This also repairs, say, a flushed `prerouting_mangle`, after which ct
+   marks would no longer be restored, or a foreign chain named like a
+   mark chain.
 3. The four maps are read and paired per fake. A pair `fake → real`,
    `fake → jump mark_V` with `mark_V` present and the fake allocatable in
    the current pool becomes a *placeholder* binding: a reserved policy
@@ -388,8 +405,9 @@ At startup omnidns reads the table, if any:
    hold any fake. Every other element is destroyed, as are
    pairs beyond `fakeip_max_bindings` (the first ones in address order, v4
    first, are kept: the kernel keeps no age). A map with more than twice
-   `fakeip_max_bindings` elements, or more than 8192 chains, makes it
-   bootstrap instead, which bounds the work on kernel state.
+   `fakeip_max_bindings` elements, more than 8192 chains or sets, or more
+   than 16448 rules, makes it bootstrap instead, which bounds the work on
+   kernel state.
 4. The placeholders' marks join the kept marks (more than 4096 in all:
    bootstrap). After the destroys have landed, a normal reconcile runs,
    which sends nothing if the table already matches the configuration.
@@ -552,11 +570,10 @@ output_reject      (filter, output,     filter-1):  same
   marks and those of the fakes it takes over. If the desired state (pools, fwmask, mark set) equals what
   the last successful transaction installed, no transaction is sent. The
   cost is that a no-op reload no longer repairs rules someone edited
-  inside our chains; the next real change, or a restart, does (each policy
-  rule carries a tag of the state it was written for, and a restart
-  rewrites them unless all of them carry the right one). That repair
-  was only ever partial: a deleted chain or table made every reconcile
-  fail instead.
+  inside our chains; the next real change repairs the policy rules, and
+  a restart every chain (every rule carries a tag of what it was written
+  for, see [Restart](#restart)). A deleted chain or map makes the restart
+  bootstrap.
 - **Large transactions** stay one transaction each. Element lists (only
   the `restore_marks` vmap) go in messages of 256 elements, since a
   message's elements share one nest with a 16-bit length (at most 1023

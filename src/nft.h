@@ -55,9 +55,10 @@
 
 #define NFT_BATCH_MAX 1024
 #define NFT_SECRET_LEN 16
-/* version of the table layout (table userdata); nft_adopt() takes over
- * only a table of this version */
-#define NFT_LAYOUT_VERSION 1
+/* version of the table layout (table userdata, rule tags); nft_adopt()
+ * takes over only a table of this version (2: every rule tagged; a table of
+ * version 1 is bootstrapped) */
+#define NFT_LAYOUT_VERSION 2
 
 struct nft_ctx;
 
@@ -95,16 +96,19 @@ struct nft_elem {
 /*
  * Startup instead of nft_bootstrap(): take over the table an earlier
  * process left. Returns 1 if the table exists with this layout version and
- * d->fwmask (pools and marks of `d` are not compared) and could be read:
- * `secret` gets its secret (also kept for re-creations), the shadow state is
- * rebuilt from the kernel (its mark chains; d's pools if every policy rule
- * says it was written for exactly that state, else the next reconcile
- * rewrites the policy rules), and *elems (malloc'ed, sorted by family and
- * fake, *nelems of them) holds the map elements. Nothing in the kernel is
- * changed: the caller destroys the elements it does not keep, then calls
- * nft_reconcile(). Returns 0 otherwise (logged): no table, another version
- * or fwmask, a missing chain, more than `max_elems` elements in the
- * fake2real or the fake2mark maps, or a read error; then bootstrap. Sync.
+ * d->fwmask (pools and marks of `d` are not compared), not dormant, with
+ * every fixed chain of its type, hook and priority, regular mark chains and
+ * the four maps of their types, and could be read: `secret` gets its secret
+ * (also kept for re-creations), the shadow state is rebuilt from the kernel
+ * (its mark chains, d's pools), and *elems (malloc'ed, sorted by family and
+ * fake, *nelems of them) holds the map elements. Every rule records what it
+ * was written for: a chain whose rules are not exactly those, or a base
+ * chain whose policy is not accept, is rewritten by the next reconcile.
+ * Nothing in the kernel is changed: the caller destroys the elements it
+ * does not keep, then calls nft_reconcile(). Returns 0 otherwise (logged),
+ * also for more than `max_elems` elements in the fake2real or the
+ * fake2mark maps, a read error, or dumps interrupted by commits elsewhere
+ * 16 times over; then bootstrap. Sync.
  */
 int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems,
               uint8_t secret[NFT_SECRET_LEN], struct nft_elem **elems, uint32_t *nelems);
@@ -117,8 +121,8 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
  * the whole table (empty maps, the same secret); it fails if the table is
  * gone. On failure nothing changes and the shadow state is kept. If `d`
  * equals the shadow state (the state of the last successful bootstrap,
- * reconcile or adoption whose rules were current), no transaction is sent:
- * external edits to our chains are not repaired then. Sync.
+ * reconcile or adoption whose chains were all current), no transaction is
+ * sent: external edits to our chains are not repaired then. Sync.
  */
 int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d);
 
