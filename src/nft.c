@@ -1981,8 +1981,10 @@ static void async_read(struct nft_ctx *n)
 			if (errno == EINTR)
 				continue;
 			if (errno != EAGAIN && errno != EWOULDBLOCK) {
-				log_err("nft: async recv: %s", strerror(errno));
-				fail_inflight(n, -errno);
+				int err = errno;
+
+				log_err("nft: async recv: %s", strerror(err));
+				fail_inflight(n, -err);
 			}
 			break;
 		}
