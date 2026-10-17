@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -717,12 +718,17 @@ struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t 
 	k.policy = policy_find(db, &k);
 	/* no binding can carry a pair that is not interned */
 	b = k.policy == POLICY_NONE ? NULL : hmap_get(&db->by_key, khash, &k, key_eq, NULL);
-	if (!b)
-		return binding_create(db, &k, khash, now, ttl, err);
-	s3_touch(&b->s3);
-	su = until(now, (uint64_t)ttl + db->grace);
-	if (su > b->safe_until)
-		b->safe_until = su;
+	if (!b) {
+		b = binding_create(db, &k, khash, now, ttl, err);
+	} else {
+		s3_touch(&b->s3);
+		su = until(now, (uint64_t)ttl + db->grace);
+		if (su > b->safe_until)
+			b->safe_until = su;
+	}
+	/* answers read the endpoint, a placeholder's is its raw fake (with
+	 * fakeip_lookup(), the only ways out to answers) */
+	assert(!b || !is_placeholder(db, b));
 	return b;
 }
 
