@@ -147,9 +147,12 @@ You provide the policy routing itself, e.g.
   written or does not match the table, logged) every fake of the table is
   kept for `fakeip_ttl_max` + `fakeip_grace` (70 minutes by default), the
   longest a client may hold one. `-r dir` moves the hold file and the
-  `omnidns-<table>.lock` next to it (tests); an instance started while
-  another one still runs on the same table (e.g. both on port 53 through
-  SO_REUSEPORT) makes the older one exit without a hold file.
+  `omnidns-<table>.lock` next to it (tests).
+- One daemon per table runs at a time: a daemon started while another one
+  still holds the table (a restart starts the new one before the old one
+  has exited) logs `waiting for another instance of the table to exit`
+  and starts once it has, with its hold file. After 15 s it gives up and
+  exits non-zero (procd starts it again). `omnidns -F` waits the same way.
 - The table is recreated from scratch instead (all fakes lost, logged) when
   it was made by another omnidns version, the `fwmask` changed while the
   daemon was down, or it cannot be taken over. Fakes outside a changed pool

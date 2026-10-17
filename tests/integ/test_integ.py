@@ -748,8 +748,10 @@ def restart_hold_file(env):
     what is left of their life) and destroys the other elements, so new
     names still get fakes. After a crash (SIGKILL, no hold file) every
     element is kept until fakeip_ttl_max + fakeip_grace have passed, holding
-    its capacity. `omnidns -F` deletes the table and the hold file. Runs a
-    second daemon (own port, table and pool, short lifetimes, 3 bindings)."""
+    its capacity. A daemon started while the old one still runs waits for
+    it to exit, then reads its hold file. `omnidns -F` deletes the table and
+    the hold file. Runs a second daemon (own port, table and pool, short
+    lifetimes, 3 bindings)."""
     table, port = TABLE + "r", 5397
     d = env.dir + "/restart"
     hold = "%s/omnidns-%s.hold" % (d, table)
@@ -769,9 +771,12 @@ def restart_hold_file(env):
         with open(d + "/daemon.log") as f:
             return f.read()
 
-    def start():
-        p = subprocess.Popen([env.binary, "-f", "-t", table, "-r", d, "-c", d + "/omnidns"],
-                             stdout=lf, stderr=lf)
+    def spawn():
+        return subprocess.Popen([env.binary, "-f", "-t", table, "-r", d, "-c", d + "/omnidns"],
+                                stdout=lf, stderr=lf)
+
+    def start(p=None):
+        p = p or spawn()
         for _ in range(100):
             try:
                 dnsmini.query(LAN, port, "ads.test", "A", timeout=0.2)
@@ -829,7 +834,23 @@ def restart_hold_file(env):
         r = q("long.warp.test")
         check(r["rcode"] == 2, "the kept fakes do not hold their capacity: %r" % r)
         time.sleep(max(0, t0 + 5.2 - time.monotonic()))
-        fake_of("long.warp.test")
+        recent = fake_of("long.warp.test")
+
+        # overlap (a procd restart starts the new process before the old
+        # one has exited): the new one waits for the table lock
+        off = len(log())
+        p2 = spawn()
+        time.sleep(1)
+        out = log()[off:]
+        check(p2.poll() is None and "waiting for another instance" in out and
+              "omnidns started" not in out, "no wait for the running daemon:\n" + out)
+        p.terminate()
+        p.wait(10)
+        p = start(p2)
+        out = log()[off:]
+        check("lists 1 fake IPs in use" in out and "kept 1 fake IPs" in out,
+              "hold file of the old daemon not used:\n" + out)
+        check(env.connect(recent) == "hello from " + REAL_A, "kept fake broken after overlap")
     finally:
         p.terminate()
         p.wait(10)

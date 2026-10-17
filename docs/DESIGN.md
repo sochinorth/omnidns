@@ -358,9 +358,7 @@ deletes its table on exit. `omnidns -F` deletes it (and the hold file,
 below): the init script runs it
 when the service stops (`stop`, `shutdown`, package removal) but not from
 its own `restart`, and a procd respawn after a crash never runs it. `-F`
-racing a daemon that is still exiting is harmless: only startup creates
-the table (an fwmask change recreates it only if it still exists), so the
-exiting daemon's last element updates just fail.
+waits for a daemon that is still exiting (the table lock, below).
 
 At startup omnidns reads the table, if any:
 
@@ -455,25 +453,28 @@ or of no table never lingers. A write failure is logged and only costs
 the next start its full quarantine. `-x` (table deleted on exit) writes
 none.
 
-Overlapping instances (two daemons on the same table, as SO_REUSEPORT
-allows) are kept apart with `<run_dir>/omnidns-<table>.lock`. Each
-instance takes a shared flock on it before reading the table and keeps it
-for its life. An exiting instance writes the hold file only if it can
-turn its lock exclusive, i.e. no other instance holds it, and keeps it
-exclusive until the rename is done:
+One instance of a table runs at a time: `<run_dir>/omnidns-<table>.lock`
+serializes them. A daemon takes an exclusive flock on it before it reads
+the table or the hold file and holds it until the hold file is written at
+exit; `omnidns -F` takes it before deleting the table and the hold file.
+procd's restart starts the new process before the old one has exited,
+and SO_REUSEPORT lets both bind, so without the lock the old daemon's
+exit drain could destroy elements the new one had just adopted (a claimed
+placeholder would then answer a fake with no element), and a `-F` racing
+a starting daemon could leave the table behind. With it:
 
-- A new instance started before the old one exits holds the shared lock,
-  so the old one writes no file: the new one found none at its start and
-  quarantines everything, and none is left for a later crash of the new
-  one to trust (that file would not list the new instance's bindings,
-  whose elements would be destroyed).
-- A new instance started while the old one writes waits for the lock and
-  then reads the whole file; one started after reads it as in a plain
-  restart.
-- The old instance never touches the table at exit: everything it changed
+- The new daemon reads the table only after the old one is done with it,
+  and a clean restart always finds the old daemon's hold file.
+- The old daemon never touches the table at exit: everything it changed
   was acked before the file was written, so the file and the maps agree.
-  Without the lock (it cannot be opened), an instance neither reads nor
-  writes a hold file.
+- The wait is bounded at 15 s, longer than an exiting daemon can last
+  (procd SIGKILLs it 5 s after SIGTERM, and its exit drain gives up after
+  the 10 s netlink receive timeout). On timeout the daemon logs and exits
+  non-zero, and procd respawns it: going on beside an instance still
+  holding the table is the unsafe overlap itself. `-F` then fails without
+  deleting anything.
+- If the lock file cannot be opened (no such directory), the daemon runs
+  without lock and without hold file, i.e. as before either existed.
 
 ### Abuse limits
 

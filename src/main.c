@@ -22,6 +22,7 @@
 #include "server.h"
 #include "upstream.h"
 #include "util/hash.h"
+#include "util/time.h"
 
 /*
  * Mark chains installed at once: bounds the bootstrap/reconcile transaction,
@@ -42,15 +43,31 @@ static bool log_to_stderr;
 /*
  * <run_dir>/omnidns-<table>.hold: the hold file (fakeip_hold_save()), how
  * long each fake of the table must still be kept, written by a clean exit
- * and consumed by the next adoption. <run_dir>/omnidns-<table>.lock: every
- * instance holds a shared flock on it for its whole life, taken before it
- * reads the table. An exiting instance writes the hold file only if it can
- * turn that lock into an exclusive one, i.e. no other instance of the table
- * runs (one started meanwhile, e.g. through SO_REUSEPORT, makes bindings
- * the file would not list), and keeps it exclusive until the rename is
- * done, so an instance starting meanwhile waits and then reads the whole
- * file. Empty paths (the table name is no file name): no hold file.
+ * and consumed by the next adoption.
+ *
+ * <run_dir>/omnidns-<table>.lock: one instance of a table at a time. A
+ * daemon takes an exclusive flock on it before it reads the table or the
+ * hold file and keeps it until it has written the hold file at exit (the
+ * process ending releases it); `-F` takes it before deleting the table.
+ * Without it, a restart through procd (which lets the new process start
+ * before the old one has exited; SO_REUSEPORT lets both bind) would have
+ * the old daemon's exit drain destroy elements the new one just adopted,
+ * and a `-F` racing a starting daemon could leave the table behind. With
+ * it, a restart always finds the old daemon's hold file.
+ *
+ * The wait is bounded by LOCK_WAIT_MS, longer than an exiting daemon can
+ * take: procd SIGKILLs it 5 s after SIGTERM (term_timeout) and its exit
+ * drain gives up after the 10 s netlink receive timeout. On timeout the
+ * daemon exits non-zero (procd respawns it) rather than run beside an
+ * instance still holding the table, which is the unsafe overlap; `-F`
+ * fails without deleting anything. If the lock file cannot be opened
+ * (no such directory), the daemon runs without it and without hold file,
+ * as before there was one.
+ *
+ * Empty paths (the table name is no file name): neither.
  */
+#define LOCK_WAIT_MS 15000
+
 static char hold_path[512], lock_path[512];
 static int lock_fd = -1;
 
@@ -67,27 +84,45 @@ static void run_paths(void)
 		hold_path[0] = lock_path[0] = 0;
 }
 
-/* The shared instance lock; without it no hold file is read or written. */
-static void lock_instance(void)
+/* The table lock, see above: 0 (or no lock file: logged, lock_fd -1) or
+ * -ETIMEDOUT (logged). */
+static int lock_table(void)
 {
+	static const struct timespec poll = { .tv_nsec = 50 * 1000 * 1000 };
+	uint64_t deadline = omni_now_ms() + LOCK_WAIT_MS;
+	bool waiting = false;
 	int fd;
 
 	if (!lock_path[0])
-		return;
+		return 0;
 	fd = open(lock_path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
 	if (fd < 0) {
-		log_warn("%s: %s; restarts keep every fake IP of the table for "
-		         "fakeip_ttl_max + fakeip_grace", lock_path, strerror(errno));
-		return;
+		log_warn("%s: %s; running without the table lock and hold file", lock_path,
+		         strerror(errno));
+		return 0;
 	}
-	while (flock(fd, LOCK_SH)) {
-		if (errno != EINTR) {
-			log_warn("%s: flock: %s", lock_path, strerror(errno));
+	while (flock(fd, LOCK_EX | LOCK_NB)) {
+		if (errno == EINTR)
+			continue;
+		if (errno != EWOULDBLOCK) {
+			log_warn("%s: flock: %s; running without the table lock and hold file",
+			         lock_path, strerror(errno));
 			close(fd);
-			return;
+			return 0;
 		}
+		if (omni_now_ms() >= deadline) {
+			log_err("%s: another instance still holds the table after %d s",
+			        lock_path, LOCK_WAIT_MS / 1000);
+			close(fd);
+			return -ETIMEDOUT;
+		}
+		if (!waiting)
+			log_info("waiting for another instance of the table to exit");
+		waiting = true;
+		nanosleep(&poll, NULL);
 	}
 	lock_fd = fd;
+	return 0;
 }
 
 /* CLOCK_BOOTTIME seconds: steady across processes, unlike the wall clock,
@@ -100,18 +135,14 @@ static uint64_t boot_clock(void)
 	return (uint64_t)ts.tv_sec;
 }
 
-/* At exit, after the last element batch is acked. The table is left alone. */
+/* At exit, after the last element batch is acked, under the table lock.
+ * The table is left alone. */
 static void save_hold(void)
 {
 	int ret;
 
 	if (lock_fd < 0 || !omni.fdb || destroy_on_exit)
 		return;
-	if (flock(lock_fd, LOCK_EX | LOCK_NB)) {
-		log_info("another instance uses the table: no hold file (a restart keeps "
-		         "every fake IP for fakeip_ttl_max + fakeip_grace)");
-		return;
-	}
 	ret = fakeip_hold_save(omni.fdb, hold_path, boot_clock());
 	if (ret)
 		log_warn("%s: %s (a restart keeps every fake IP for fakeip_ttl_max + "
@@ -431,11 +462,15 @@ int main(int argc, char **argv)
 	run_paths();
 	if (flush_only) {
 		/* the config is not read: a broken one must not keep the table */
+		if (lock_table())
+			return 1;
 		omni.nft = nft_open(nft_table);
 		ret = !omni.nft || nft_destroy_table(omni.nft);
 		nft_close(omni.nft);
 		if (hold_path[0])
 			unlink(hold_path);
+		if (lock_fd >= 0)
+			close(lock_fd);
 		return ret;
 	}
 	hash_init();
@@ -464,7 +499,8 @@ int main(int argc, char **argv)
 		goto out_loop;
 	}
 	nft_set_secret(omni.nft, secret);
-	lock_instance();
+	if (lock_table())
+		goto out_nft;
 	if (!adopt_table()) {
 		nft_set_secret(omni.nft, secret);	/* adoption may have read another */
 		if (build_desired(omni.cfg, &d, marks, false) || nft_bootstrap(omni.nft, &d)) {
@@ -478,8 +514,7 @@ int main(int argc, char **argv)
 		                      omni.cfg->fakeip_max_bindings, omni.cfg->fakeip_grace,
 		                      secret, omni.nft);
 	}
-	/* read by the adoption, or stale (another table, or none): under the
-	 * lock no other instance writes one any more */
+	/* read by the adoption, or stale (of another table, or of none) */
 	if (lock_fd >= 0)
 		unlink(hold_path);
 	omni.cache = cache_new(omni.cfg->cache_size, omni.cfg->cache_max_bytes, omni.fdb);
