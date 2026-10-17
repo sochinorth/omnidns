@@ -97,13 +97,11 @@ static bool binding_evictable(const struct binding *b, uint32_t now)
 	return b->safe_until < now && !b->refcnt;
 }
 
+/* out of the table, kept for its references (list_del() clears the links) */
 static bool binding_detached(const struct binding *b)
 {
 	return !b->s3.list.next;
 }
-
-/* Policies by id: see the policy table below. */
-static bool is_placeholder(const struct fakeip_db *db, const struct binding *b);
 
 /* ---- pools ---- */
 
@@ -383,23 +381,42 @@ static void binding_free(struct fakeip_db *db, struct binding *b)
 	free(b);
 }
 
-/* Remove from the maps (not from s3). */
-static void binding_unmap(struct fakeip_db *db, struct binding *b)
+/* Remove from the maps, once out of s3; freed unless still referenced. */
+static void binding_unmap(struct fakeip_db *db, struct binding *b, bool nft_del)
 {
 	hmap_del_ptr(&db->by_key, b->s3.hash, b);
 	hmap_del_ptr(&db->by_fake, fake_hash(b->family, binding_fake(b)), b);
-}
-
-/* Full removal; the binding is freed unless still referenced. */
-static void binding_drop(struct fakeip_db *db, struct binding *b, bool nft_del)
-{
-	s3_remove(&db->s3, &b->s3);
-	b->s3.list.next = b->s3.list.prev = NULL;
-	binding_unmap(db, b);
 	if (nft_del)
 		nft_elem_del(db->nft, b->family, binding_fake(b));
 	if (!b->refcnt)
 		binding_free(db, b);
+}
+
+static void binding_drop(struct fakeip_db *db, struct binding *b, bool nft_del)
+{
+	s3_remove(&db->s3, &b->s3);
+	binding_unmap(db, b, nft_del);
+}
+
+/* b may become evictable at b->safe_until: a stalled pass may be retried then */
+static void stall_wake(struct fakeip_db *db, const struct binding *b)
+{
+	if (b->safe_until < db->stall_until)
+		db->stall_until = b->safe_until;
+}
+
+/* Map b and queue it for eviction; nothing is mapped on failure. */
+static int binding_insert(struct fakeip_db *db, struct binding *b, uint64_t khash)
+{
+	if (hmap_put(&db->by_key, khash, b))
+		return -ENOMEM;
+	if (hmap_put(&db->by_fake, fake_hash(b->family, binding_fake(b)), b)) {
+		hmap_del_ptr(&db->by_key, khash, b);
+		return -ENOMEM;
+	}
+	s3_insert(&db->s3, &b->s3, khash);
+	stall_wake(db, b);
+	return 0;
 }
 
 static bool s3_can_evict(struct s3fifo *s, struct s3_node *n)
@@ -414,22 +431,10 @@ static bool s3_can_evict(struct s3fifo *s, struct s3_node *n)
 	return false;
 }
 
-/* b may become evictable at b->safe_until: a stalled pass may be retried then */
-static void stall_wake(struct fakeip_db *db, const struct binding *b)
-{
-	if (b->safe_until < db->stall_until)
-		db->stall_until = b->safe_until;
-}
-
+/* unlinked by s3 already, and unreferenced (s3_can_evict()) */
 static void s3_on_evict(struct s3fifo *s, struct s3_node *n)
 {
-	struct binding *b = container_of(n, struct binding, s3);
-	struct fakeip_db *db = s->priv;
-
-	b->s3.list.next = b->s3.list.prev = NULL;
-	binding_unmap(db, b);
-	nft_elem_del(db->nft, b->family, binding_fake(b));
-	binding_free(db, b);
+	binding_unmap(s->priv, container_of(n, struct binding, s3), true);
 }
 
 static const struct s3_ops fakeip_s3_ops = {
@@ -520,9 +525,10 @@ bool fakeip_has_pool(const struct fakeip_db *db, int family)
 	return db_pool(db, norm_family(family)) != NULL;
 }
 
-static uint32_t safe_until_for(const struct fakeip_db *db, uint32_t now, uint32_t ttl)
+/* now + secs, saturated */
+static uint32_t until(uint32_t now, uint64_t secs)
 {
-	uint64_t t = (uint64_t)now + ttl + db->grace;
+	uint64_t t = now + secs;
 
 	return t > UINT32_MAX ? UINT32_MAX : (uint32_t)t;
 }
@@ -620,7 +626,6 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 {
 	struct binding *b, *victim;
 	uint8_t fake[16];
-	uint32_t hold = 0;
 	bool claim;
 	int r, pid;
 
@@ -633,15 +638,13 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	if (pid == -ENOSPC && fakeip_evict_expired(db))
 		pid = policy_get(db, k);
 	if (pid < 0) {
-		r = pid;
-		goto fail;
+		*err = pid;
+		return NULL;
 	}
 	r = find_slot(db, k, khash, now, fake, &victim);
 	if (r)
 		goto fail_policy;
 	claim = victim && claimable(db, victim, k);
-	if (claim)
-		hold = victim->safe_until;
 	if (!victim && hmap_len(&db->by_key) >= db->max_bindings) {
 		evict_to(db, evict_target(db));
 		if (hmap_len(&db->by_key) >= db->max_bindings) {
@@ -653,31 +656,25 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 	b = binding_new(pid, k->family, fake, k->real, k->endpoint, k->endpoint_len);
 	if (!b)
 		goto fail_policy;
-	b->safe_until = safe_until_for(db, now, ttl);
-	if (b->safe_until < hold)	/* clients of the earlier process may hold it */
-		b->safe_until = hold;
-	if (hmap_put(&db->by_key, khash, b))
-		goto fail_free;
-	if (hmap_put(&db->by_fake, fake_hash(b->family, binding_fake(b)), b)) {
-		hmap_del_ptr(&db->by_key, khash, b);
-		goto fail_free;
+	b->safe_until = until(now, (uint64_t)ttl + db->grace);
+	/* clients of the earlier process may hold a claimed fake longer */
+	if (claim && b->safe_until < victim->safe_until)
+		b->safe_until = victim->safe_until;
+	if (binding_insert(db, b, khash)) {
+		free(b);
+		goto fail_policy;
 	}
 	/* the add below replaces the victim's elements, no nft del */
 	if (victim)
 		binding_drop(db, victim, false);
-	s3_insert(&db->s3, &b->s3, khash);
-	stall_wake(db, b);
 	/* a claimed placeholder: the kernel has this very mapping (ticket 0
 	 * counts as done) */
 	b->ticket = claim ? 0 : nft_elem_add(db->nft, b->family, binding_fake(b),
 	                                     binding_real(b), k->mark);
 	return b;
 
-fail_free:
-	free(b);
 fail_policy:
 	policy_put(db, pid);
-fail:
 	*err = r;
 	return NULL;
 }
@@ -724,7 +721,7 @@ struct binding *fakeip_bind(struct fakeip_db *db, const char *rule_id, uint32_t 
 	if (!b)
 		return binding_create(db, &k, khash, now, ttl, err);
 	s3_touch(&b->s3);
-	su = safe_until_for(db, now, ttl);
+	su = until(now, (uint64_t)ttl + db->grace);
 	if (su > b->safe_until)
 		b->safe_until = su;
 	return b;
@@ -816,7 +813,7 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	};
 	const struct ip_prefix *p = db_pool(db, k.family);
 	struct binding *b;
-	uint64_t khash, t;
+	uint64_t khash;
 	int pid;
 
 	if (!p || !pool_allocatable(p, k.family, fake))
@@ -833,27 +830,16 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	if (pid < 0)
 		return pid;
 	b = binding_new(pid, k.family, fake, real, fake, k.endpoint_len);
-	if (!b) {
-		policy_put(db, pid);
-		return -ENOMEM;
-	}
-	t = (uint64_t)omni_now() + hold;	/* hold includes the grace */
-	b->safe_until = t > UINT32_MAX ? UINT32_MAX : (uint32_t)t;
-	if (hmap_put(&db->by_key, khash, b)) {
+	if (b) {
+		b->safe_until = until(omni_now(), hold);	/* hold includes the grace */
+		if (!binding_insert(db, b, khash)) {
+			db->nplaceholders++;
+			return 0;
+		}
 		free(b);
-		policy_put(db, pid);
-		return -ENOMEM;
 	}
-	if (hmap_put(&db->by_fake, fake_hash(b->family, binding_fake(b)), b)) {
-		hmap_del_ptr(&db->by_key, khash, b);
-		free(b);
-		policy_put(db, pid);
-		return -ENOMEM;
-	}
-	db->nplaceholders++;
-	s3_insert(&db->s3, &b->s3, khash);
-	stall_wake(db, b);
-	return 0;
+	policy_put(db, pid);
+	return -ENOMEM;
 }
 
 /* ---- hold file ---- */
