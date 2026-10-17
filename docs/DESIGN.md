@@ -355,10 +355,12 @@ safe_until = now + min(TTL, fakeip_ttl_max) + fakeip_grace
 
 procd sends SIGTERM both to stop and to restart, so the daemon never
 deletes its table on exit. `omnidns -F` deletes it (and the hold file,
-below): the init script runs it
-when the service stops (`stop`, `shutdown`, package removal) but not from
-its own `restart`, and a procd respawn after a crash never runs it. `-F`
-waits for a daemon that is still exiting (the table lock, below).
+below): the init script runs it when the service stops (`stop`,
+`shutdown`, package removal) but not from its own `restart` or a package
+upgrade (`stop` with `PKG_UPGRADE=1` from the old package's prerm, so
+only when upgrading from a release that has this check), and a procd
+respawn after a crash never runs it. `-F` waits for a daemon that is
+still exiting (the table lock, below).
 
 At startup omnidns reads the table, if any:
 

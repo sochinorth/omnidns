@@ -29,8 +29,12 @@ restart() {
 	start "$@"
 }
 
+# A package upgrade runs the old package's prerm (`stop`, with PKG_UPGRADE=1)
+# and then starts the new one: like a restart, it keeps the table. This
+# only helps upgrades *from* a package that has this check, since the
+# prerm that runs is the one being replaced.
 service_stopped() {
-	[ -n "$OMNIDNS_RESTART" ] || "$PROG" -F -c /etc/config/$CONF
+	[ -n "$OMNIDNS_RESTART" ] || [ "$PKG_UPGRADE" = 1 ] || "$PROG" -F -c /etc/config/$CONF
 }
 
 # Upstream resolv.conf files and namesets are re-read on SIGHUP.

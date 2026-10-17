@@ -163,10 +163,16 @@ You provide the policy routing itself, e.g.
   `fakeip_grace`; after a clean restart only for as long as the fakes
   still in use fill the table.
 - **Stop** (`/etc/init.d/omnidns stop`, shutdown, package removal) runs
-  `omnidns -F`, which deletes the table and the hold file and exits. The daemon itself never
-  deletes it on exit (unless started with `-x`, for tests). Use
-  `omnidns -F [-t table]` by hand to remove the table after killing the
-  daemon yourself.
+  `omnidns -F`, which deletes the table and the hold file and exits. The
+  daemon itself never deletes it on exit (unless started with `-x`, for
+  tests). Use `omnidns -F [-t table]` by hand to remove the table after
+  killing the daemon yourself.
+- A package **upgrade** (opkg/apk) stops the old package with
+  `PKG_UPGRADE=1` and starts the new one: the init script then skips `-F`,
+  so an upgrade keeps the fakes like a restart. The stop that runs is the
+  old package's, so this takes effect for upgrades from the first release
+  carrying it onwards; upgrading to it from an earlier release still
+  drops every fake once.
 
 ## Deploying on OpenWrt
 
