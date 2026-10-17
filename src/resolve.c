@@ -39,8 +39,9 @@ struct dep_memo {
 
 /*
  * Requests come from a pool (see req_get()): a request that ended keeps its
- * three messages' storage and its bindings array for the next one, so that
- * a typical miss allocates none of them. Everything else is zeroed.
+ * two messages' storage, its bindings array and its held-answer buffer for
+ * the next one, so that a typical miss allocates none of them. Everything
+ * else is zeroed.
  */
 struct resolve_req {
 	struct omni *o;			/* first: the pool's link while kept */
@@ -49,7 +50,7 @@ struct resolve_req {
 	struct uloop_timeout defer;
 	struct upstream_query *uq;
 	struct nft_waiter nw;
-	bool starting, deferred;
+	bool starting;
 	uint64_t gen0;
 
 	struct dns_name qname;
@@ -79,9 +80,15 @@ struct resolve_req {
 	/* commit */
 	struct binding **binds;
 	uint16_t nbinds, binds_cap, wait_i;
-	struct dns_msg out;
 	uint32_t lifetime;
 	bool cache_it;			/* insert the answer when delivering it */
+
+	/* the answer: alen bytes in wire, or in held while held_on */
+	bool bare;			/* header and question only, with rcode */
+	bool held_on;
+	uint8_t rcode;
+	uint32_t alen, held_cap;
+	uint8_t *held;
 };
 
 enum { SCAN_ALIAS, SCAN_DONE, SCAN_QUERY };
@@ -170,12 +177,6 @@ static int afamily(uint16_t qtype)
 	return qtype == DNS_T_A ? 4 : qtype == DNS_T_AAAA ? 6 : 0;
 }
 
-static int add_rr(struct dns_msg *m, enum dns_section sec, const struct dns_rr *rr)
-{
-	return dns_msg_add_rr(m, sec, rr->owner, rr->owner_len, rr->type, rr->cls,
-	                      rr->ttl, rr->rdata, rr->rdlen);
-}
-
 static bool rr_same(const struct dns_rr *a, const struct dns_rr *b)
 {
 	return a->type == b->type && a->rdlen == b->rdlen &&
@@ -190,7 +191,8 @@ static int prefix_add(struct resolve_req *r, const struct dns_rr *rr)
 	for (i = 0; i < r->prefix.nrr; i++)
 		if (rr_same(&r->prefix.rr[i], rr))
 			return 0;
-	return add_rr(&r->prefix, DNS_S_AN, rr);
+	return dns_msg_add_rr(&r->prefix, DNS_S_AN, rr->owner, rr->owner_len, rr->type,
+	                      rr->cls, rr->ttl, rr->rdata, rr->rdlen);
 }
 
 /* Index of the dependency on name among the first n, or -1. */
@@ -289,40 +291,107 @@ static void set_up(struct upstream_set **slot, struct upstream_set *u)
 	*slot = u;
 }
 
-/* ---- lifetime ---- */
+/* ---- the answer ---- */
 
-static uint32_t min_an_ttl(const struct dns_msg *m, uint32_t v)
+/*
+ * An answer is written into wire as it is decided, record by record
+ * (dns_build_add()), with what its lifetime needs noted on the way: the
+ * lowest answer TTL and the first authority SOA, among every record
+ * added (also those a cut leaves out). One answer is built at a time, all
+ * of it synchronously; one that has to wait (for nft, or out of
+ * resolve_start()) is copied to its request first, see hold().
+ *
+ * The compression table points into the names written, so they must stay
+ * in place until the answer is done: the question, r->prefix and r->resp
+ * do, as do bindings and the static synthetic SOA. hint_buf, reused by the
+ * next rewrite, holds SVCB rdata, which is never compressed.
+ */
+static uint8_t wire[DNS_MAX_MSG];
+
+static struct {
+	struct dns_builder b;
+	uint32_t an_ttl;
+	bool soa;
+	uint32_t soa_ttl, soa_min;
+} ans;
+
+static void ans_begin(struct resolve_req *r, int rcode)
 {
-	uint16_t i;
-
-	for (i = 0; i < m->nrr; i++)
-		if (m->rr[i].section == DNS_S_AN && m->rr[i].ttl < v)
-			v = m->rr[i].ttl;
-	return v;
+	r->bare = r->held_on = false;
+	r->rcode = rcode & DNS_F_RCODE;
+	ans.an_ttl = UINT32_MAX;
+	ans.soa = false;
+	/* cannot fail: the question fits in 64 KiB */
+	dns_build_begin(&ans.b, wire, sizeof(wire), 0, DNS_F_QR | DNS_F_RA | r->rd | r->rcode,
+	                r->qname.data, r->qname.len, r->qtype, r->qclass);
 }
 
-static uint32_t neg_lifetime(const struct config *cfg, const struct dns_msg *m)
+static int ans_add(enum dns_section sec, const uint8_t *owner, uint8_t owner_len,
+                   uint16_t type, uint16_t cls, uint32_t ttl,
+                   const uint8_t *rd, uint16_t rdlen)
 {
-	const struct dns_rr *soa = find_soa(m);
-	uint32_t v, min;
-
-	if (!soa || dns_soa_minimum(soa, &min))
-		return 0;
-	v = soa->ttl < min ? soa->ttl : min;
-	if (v > cfg->neg_ttl_max)
-		v = cfg->neg_ttl_max;
-	return min_an_ttl(m, v);
+	if (sec == DNS_S_AN && ttl < ans.an_ttl)
+		ans.an_ttl = ttl;
+	if (sec == DNS_S_NS && type == DNS_T_SOA && !ans.soa) {
+		/* rdata as parsed or synthesized: it ends with MINIMUM */
+		ans.soa = true;
+		ans.soa_ttl = ttl;
+		ans.soa_min = (uint32_t)rd[rdlen - 4] << 24 | (uint32_t)rd[rdlen - 3] << 16 |
+		              (uint32_t)rd[rdlen - 2] << 8 | rd[rdlen - 1];
+	}
+	return dns_build_add(&ans.b, sec, owner, owner_len, type, cls, ttl, rd, rdlen);
 }
 
-static uint32_t lifetime_of(const struct config *cfg, const struct dns_msg *m, int kind)
+static int ans_rr(enum dns_section sec, const struct dns_rr *rr)
 {
-	int rc = m->flags & DNS_F_RCODE;
+	return ans_add(sec, rr->owner, rr->owner_len, rr->type, rr->cls, rr->ttl, rr->rdata,
+	               rr->rdlen);
+}
 
-	if (kind == LIFE_NONE || (rc != DNS_R_NOERROR && rc != DNS_R_NXDOMAIN))
+/* The answer is complete; its lifetime as kind gives it. */
+static void ans_done(struct resolve_req *r, int kind)
+{
+	const struct config *cfg = r->o->cfg;
+	uint32_t v;
+
+	r->alen = (uint32_t)dns_build_end(&ans.b);
+	r->lifetime = 0;
+	if (kind == LIFE_NONE || (r->rcode != DNS_R_NOERROR && r->rcode != DNS_R_NXDOMAIN))
+		return;
+	if (kind == LIFE_POS) {
+		r->lifetime = ans.an_ttl;
+	} else if (ans.soa) {
+		v = ans.soa_ttl < ans.soa_min ? ans.soa_ttl : ans.soa_min;
+		if (v > cfg->neg_ttl_max)
+			v = cfg->neg_ttl_max;
+		r->lifetime = v < ans.an_ttl ? v : ans.an_ttl;
+	}
+}
+
+/* held-answer buffer: its first size, and the most a kept request keeps */
+#define HELD_MIN	512
+#define HELD_KEEP	2048
+
+/*
+ * Copy the answer out of wire, which other requests build into while this
+ * one waits. A bare answer needs nothing: it is written when delivered.
+ */
+static int hold(struct resolve_req *r)
+{
+	uint32_t cap = r->alen > HELD_MIN ? r->alen : HELD_MIN;
+
+	if (r->bare || r->held_on)
 		return 0;
-	if (kind == LIFE_POS)
-		return min_an_ttl(m, UINT32_MAX);
-	return neg_lifetime(cfg, m);
+	if (r->held_cap < r->alen) {
+		free(r->held);
+		r->held = malloc(cap);
+		r->held_cap = r->held ? cap : 0;
+		if (!r->held)
+			return -ENOMEM;
+	}
+	memcpy(r->held, wire, r->alen);
+	r->held_on = true;
+	return 0;
 }
 
 /* ---- request lifecycle ---- */
@@ -334,8 +403,8 @@ static void req_release(void *p)
 
 	dns_msg_free(&r->resp);
 	dns_msg_free(&r->prefix);
-	dns_msg_free(&r->out);
 	free(r->binds);
+	free(r->held);
 }
 
 /*
@@ -347,9 +416,11 @@ static struct pool req_pool = POOL_INIT(struct resolve_req, 64, 4, req_release);
 
 static struct resolve_req *req_get(void)
 {
-	struct dns_msg resp, prefix, out;
+	struct dns_msg resp, prefix;
 	struct binding **binds;
 	uint16_t binds_cap;
+	uint8_t *held;
+	uint32_t held_cap;
 	struct resolve_req *r;
 	bool fresh;
 
@@ -358,15 +429,17 @@ static struct resolve_req *req_get(void)
 		return r;
 	resp = r->resp;
 	prefix = r->prefix;
-	out = r->out;
 	binds = r->binds;
 	binds_cap = r->binds_cap;
+	held = r->held;
+	held_cap = r->held_cap;
 	memset(r, 0, sizeof(*r));
 	r->resp = resp;
 	r->prefix = prefix;
-	r->out = out;
 	r->binds = binds;
 	r->binds_cap = binds_cap;
+	r->held = held;
+	r->held_cap = held_cap;
 	return r;
 }
 
@@ -386,7 +459,11 @@ static void req_free(struct resolve_req *r)
 	upstream_set_put(r->cur_up);
 	dns_msg_recycle(&r->resp);
 	dns_msg_recycle(&r->prefix);
-	dns_msg_recycle(&r->out);
+	if (r->held_cap > HELD_KEEP) {
+		free(r->held);
+		r->held = NULL;
+		r->held_cap = 0;
+	}
 	if (r->deps != r->deps_inline)
 		free(r->deps);
 	pool_put(&req_pool, r);
@@ -397,37 +474,28 @@ void resolve_shutdown(void)
 	pool_drain(&req_pool);
 }
 
-static int out_init(struct resolve_req *r, int rcode);
-
 /*
  * The answer leaves as bytes, built once: the cache stores them and the
- * server renders every reply from them, fresh or cached. The buffer is
- * consumed by the callback before anything else can build.
+ * server renders every reply from them, fresh or cached. wire is consumed
+ * by the callback before anything else can build.
  */
-static uint8_t wire[DNS_MAX_MSG];
-
 static void deliver_now(struct resolve_req *r)
 {
+	const uint8_t *msg = r->held_on ? r->held : wire;
 	struct omni *o = r->o;
-	int len;
 
-	r->out.id = 0;
-	memset(&r->out.edns, 0, sizeof(r->out.edns));
-	len = dns_build(&r->out, wire, sizeof(wire));
-	if (len < 0) {
-		/* not for messages assembled here (valid names, bounded rdata) */
-		stats.servfail++;
-		r->cache_it = false;
-		out_init(r, DNS_R_SERVFAIL);
-		len = dns_build(&r->out, wire, sizeof(wire));
+	if (r->bare) {
+		ans_begin(r, r->rcode);
+		r->alen = (uint32_t)dns_build_end(&ans.b);
+		msg = wire;
 	}
 	/* not when the config changed under the walk (its deps are stale) */
 	if (r->cache_it && o->cfg->gen == r->gen0)
 		cache_insert(o->cache, o->cfg, r->qname.data, r->qname.len, r->qtype,
 		             r->qclass, r->key_hash,
-		             wire, (size_t)len, r->lifetime, r->deps, r->dsz, r->ndeps,
+		             msg, r->alen, r->lifetime, r->deps, r->dsz, r->ndeps,
 		             r->binds, r->nbinds);
-	r->cb(r->ctx, wire, (size_t)len);
+	r->cb(r->ctx, msg, r->alen);
 	req_free(r);
 }
 
@@ -436,37 +504,29 @@ static void defer_cb(struct uloop_timeout *t)
 	deliver_now(container_of(t, struct resolve_req, defer));
 }
 
+static void finish_rcode(struct resolve_req *r, int rcode);
+
 static void deliver(struct resolve_req *r)
 {
 	if (r->starting) {
-		r->deferred = true;
+		if (hold(r)) {
+			finish_rcode(r, DNS_R_SERVFAIL);
+			return;
+		}
 		uloop_timeout_set(&r->defer, 0);
 		return;
 	}
 	deliver_now(r);
 }
 
-/*
- * Cannot fail once resolve_start() has run it: the question then has room
- * in r->out's storage, which a reset keeps (and a swapped-in upstream
- * message carries the same question, so it has room too).
- */
-static int out_init(struct resolve_req *r, int rcode)
-{
-	int ret;
-
-	dns_msg_reset(&r->out);
-	ret = dns_msg_set_question(&r->out, r->qname.data, r->qname.len, r->qtype, r->qclass);
-	r->out.flags = DNS_F_QR | DNS_F_RA | r->rd;
-	dns_msg_set_rcode(&r->out, rcode);
-	return ret;
-}
-
+/* A bare answer: written when it is delivered, so it never needs holding. */
 static void finish_rcode(struct resolve_req *r, int rcode)
 {
 	if (rcode == DNS_R_SERVFAIL)
 		stats.servfail++;
-	out_init(r, rcode);
+	r->bare = true;
+	r->rcode = rcode & DNS_F_RCODE;
+	r->cache_it = false;
 	deliver(r);
 }
 
@@ -503,10 +563,11 @@ static void put32(uint8_t *p, uint32_t v)
 	p[3] = v;
 }
 
+/* rd is static: the compression table points into its names */
 static int add_synth_soa(struct resolve_req *r, uint32_t ttl)
 {
 	static const uint32_t fixed[] = { 1, 3600, 600, 86400 };
-	uint8_t rd[128];
+	static uint8_t rd[128];
 	int n, i;
 
 	n = put_name(rd, "omnidns.invalid.");
@@ -515,8 +576,8 @@ static int add_synth_soa(struct resolve_req *r, uint32_t ttl)
 		put32(rd + n, fixed[i]);
 	put32(rd + n, ttl);
 	n += 4;
-	return dns_msg_add_rr(&r->out, DNS_S_NS, r->qname.data, r->qname.len, DNS_T_SOA,
-	                      DNS_C_IN, ttl, rd, (uint16_t)n);
+	return ans_add(DNS_S_NS, r->qname.data, r->qname.len, DNS_T_SOA, DNS_C_IN, ttl, rd,
+	               (uint16_t)n);
 }
 
 static void finish_block(struct resolve_req *r)
@@ -526,17 +587,17 @@ static void finish_block(struct resolve_req *r)
 	int fam = afamily(r->qtype), ret;
 
 	stats.blocked++;
-	out_init(r, cfg->block_mode == BLOCK_NXDOMAIN ? DNS_R_NXDOMAIN : DNS_R_NOERROR);
+	ans_begin(r, cfg->block_mode == BLOCK_NXDOMAIN ? DNS_R_NXDOMAIN : DNS_R_NOERROR);
 	if (cfg->block_mode == BLOCK_NULL && fam)
-		ret = dns_msg_add_rr(&r->out, DNS_S_AN, r->qname.data, r->qname.len,
-		                     r->qtype, DNS_C_IN, cfg->block_ttl, zero,
-		                     fam == 4 ? 4 : 16);
+		ret = ans_add(DNS_S_AN, r->qname.data, r->qname.len, r->qtype, DNS_C_IN,
+		              cfg->block_ttl, zero, fam == 4 ? 4 : 16);
 	else
 		ret = add_synth_soa(r, cfg->block_ttl);
 	if (ret) {
 		servfail(r);
 		return;
 	}
+	ans_done(r, LIFE_NONE);
 	r->lifetime = cfg->block_ttl;
 	finish_cached(r);
 }
@@ -626,16 +687,16 @@ static bool try_ptr(struct resolve_req *r)
 		return false;
 	b = fakeip_lookup(fdb, fam, addr);
 	if (b) {
-		out_init(r, DNS_R_NOERROR);
-		if (dns_msg_add_rr(&r->out, DNS_S_AN, r->qname.data, r->qname.len,
-		                   DNS_T_PTR, DNS_C_IN, PTR_TTL, binding_endpoint(b),
-		                   b->endpoint_len))
+		ans_begin(r, DNS_R_NOERROR);
+		if (ans_add(DNS_S_AN, r->qname.data, r->qname.len, DNS_T_PTR, DNS_C_IN, PTR_TTL,
+		            binding_endpoint(b), b->endpoint_len))
 			return servfail(r), true;
 	} else {
-		out_init(r, DNS_R_NXDOMAIN);
+		ans_begin(r, DNS_R_NXDOMAIN);
 		if (add_synth_soa(r, r->o->cfg->block_ttl))
 			return servfail(r), true;
 	}
+	ans_done(r, LIFE_NONE);
 	deliver(r);
 	return true;
 }
@@ -722,7 +783,7 @@ static bool all_glue_ok(struct resolve_req *r)
 	return true;
 }
 
-/* Copy NS/AR of the last response into out (glue as glue_ok() allows). */
+/* Add NS/AR of the last response to the answer (glue as glue_ok() allows). */
 static int copy_tail(struct resolve_req *r, bool strip_sec)
 {
 	const struct dns_msg *m = &r->resp;
@@ -735,7 +796,7 @@ static int copy_tail(struct resolve_req *r, bool strip_sec)
 		if (rr->section == DNS_S_AN || (strip_sec && strip_type(r, rr->type)) ||
 		    !glue_ok(r, rr))
 			continue;
-		ret = add_rr(&r->out, rr->section, rr);
+		ret = ans_rr(rr->section, rr);
 		if (ret)
 			return ret;
 	}
@@ -748,7 +809,7 @@ static int copy_prefix(struct resolve_req *r)
 	int ret;
 
 	for (i = 0; i < r->prefix.nrr; i++) {
-		ret = add_rr(&r->out, DNS_S_AN, &r->prefix.rr[i]);
+		ret = ans_rr(DNS_S_AN, &r->prefix.rr[i]);
 		if (ret)
 			return ret;
 	}
@@ -822,22 +883,21 @@ static bool can_pass_through(struct resolve_req *r)
 }
 
 /*
- * The response becomes the answer: moved, not copied (nothing reads r->resp
- * after this; it is left empty, with the storage out had). Only the header
- * is ours: id 0, no OPT (which also drops an extended rcode), our flags (AA
- * and AD cleared) and the client's question.
+ * The response's records become the answer, all of them as received (what
+ * was added so far is dropped). Only the header is ours: id 0, no OPT
+ * (which also drops an extended rcode), our flags (AA and AD cleared) and
+ * the client's question.
  */
 static int pass_through(struct resolve_req *r)
 {
-	int rcode = r->resp.flags & DNS_F_RCODE;
+	const struct dns_msg *m = &r->resp;
+	uint16_t i;
+	int ret = 0;
 
-	dns_msg_swap(&r->out, &r->resp);
-	dns_msg_reset(&r->resp);
-	memset(&r->out.edns, 0, sizeof(r->out.edns));
-	r->out.id = 0;
-	r->out.flags = DNS_F_QR | DNS_F_RA | r->rd;
-	dns_msg_set_rcode(&r->out, rcode);
-	return dns_msg_set_question(&r->out, r->qname.data, r->qname.len, r->qtype, r->qclass);
+	ans_begin(r, m->flags & DNS_F_RCODE);
+	for (i = 0; !ret && i < m->nrr; i++)
+		ret = ans_rr(m->rr[i].section, &m->rr[i]);
+	return ret;
 }
 
 /* Answer = prefix + negative response (its SOA kept). */
@@ -848,7 +908,7 @@ static void finish_negative(struct resolve_req *r)
 	if (can_pass_through(r)) {
 		ret = pass_through(r);
 	} else {
-		out_init(r, rcode);
+		ans_begin(r, rcode);
 		ret = copy_prefix(r);
 		if (!ret)
 			ret = copy_tail(r, false);
@@ -857,7 +917,7 @@ static void finish_negative(struct resolve_req *r)
 		servfail(r);
 		return;
 	}
-	r->lifetime = lifetime_of(r->o->cfg, &r->out, LIFE_NEG);
+	ans_done(r, LIFE_NEG);
 	finish_cached(r);
 }
 
@@ -886,6 +946,10 @@ static void commit_wait(struct resolve_req *r)
 		struct binding *b = r->binds[r->wait_i];
 
 		if (!nft_ticket_done(o->nft, b->ticket)) {
+			if (hold(r)) {
+				servfail(r);
+				return;
+			}
 			r->nw.cb = nft_done;
 			nft_wait(o->nft, &r->nw, b->ticket);
 			return;
@@ -986,8 +1050,7 @@ static int emit_hints(struct resolve_req *r, const struct dns_rr *rr,
 		return ret;
 	if (len != rr->rdlen || memcmp(hint_buf, rr->rdata, len))
 		*changed = true;
-	return dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len,
-	                      rr->type, rr->cls, h.ttl, hint_buf, len);
+	return ans_add(DNS_S_AN, rr->owner, rr->owner_len, rr->type, rr->cls, h.ttl, hint_buf, len);
 }
 
 static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struct plan *p)
@@ -1000,8 +1063,8 @@ static int emit_addr(struct resolve_req *r, const struct dns_rr *rr, const struc
 	            rr->rdata, ttl, &err);
 	if (!b)
 		return err == -EDQUOT ? 0 : err;
-	return dns_msg_add_rr(&r->out, DNS_S_AN, rr->owner, rr->owner_len, rr->type,
-	                      rr->cls, ttl, binding_fake(b), rr->rdlen);
+	return ans_add(DNS_S_AN, rr->owner, rr->owner_len, rr->type, rr->cls, ttl,
+	               binding_fake(b), rr->rdlen);
 }
 
 /*
@@ -1047,12 +1110,12 @@ static int build_nodata(struct resolve_req *r)
 	const struct dns_rr *soa = find_soa(&r->resp);
 	int ret;
 
-	out_init(r, DNS_R_NOERROR);
+	ans_begin(r, DNS_R_NOERROR);
 	ret = copy_prefix(r);
 	if (ret)
 		return ret;
 	if (soa)
-		return add_rr(&r->out, DNS_S_NS, soa);
+		return ans_rr(DNS_S_NS, soa);
 	return add_synth_soa(r, r->o->cfg->block_ttl);
 }
 
@@ -1106,12 +1169,12 @@ static int build_terminal(struct resolve_req *r, bool changed, bool *rewritten)
 	uint16_t i;
 	int ret;
 
-	out_init(r, m->flags & DNS_F_RCODE);
+	ans_begin(r, m->flags & DNS_F_RCODE);
 	ret = copy_prefix(r);
 	for (i = 0; !ret && i < m->nrr && m->rr[i].section == DNS_S_AN; i++) {
 		switch (plan[i].act) {
 		case ACT_KEEP:
-			ret = add_rr(&r->out, DNS_S_AN, &m->rr[i]);
+			ret = ans_rr(DNS_S_AN, &m->rr[i]);
 			break;
 		case ACT_BIND:
 			ret = emit_addr(r, &m->rr[i], &plan[i]);
@@ -1150,7 +1213,7 @@ static void terminal(struct resolve_req *r)
 		servfail(r);
 		return;
 	}
-	r->lifetime = lifetime_of(r->o->cfg, &r->out, kind);
+	ans_done(r, kind);
 	r->wait_i = 0;
 	commit_wait(r);
 }
@@ -1268,11 +1331,13 @@ static int scan_dname(struct resolve_req *r, const struct dns_rr *dname)
 	} else if (!ret) {
 		ret = synth_cname(r, dname, &target);
 		if (ret == -EOVERFLOW) {
-			out_init(r, DNS_R_YXDOMAIN);
-			if (copy_prefix(r))
+			ans_begin(r, DNS_R_YXDOMAIN);
+			if (copy_prefix(r)) {
 				servfail(r);
-			else
+			} else {
+				ans_done(r, LIFE_NONE);
 				deliver(r);
+			}
 			return SCAN_DONE;
 		}
 	}
@@ -1421,11 +1486,6 @@ static struct resolve_req *start(struct omni *o, const struct dns_msg *query,
 	r->name = r->qname;
 	r->deps = r->deps_inline;
 	r->dcap = sizeof(r->deps_inline);
-	/* make room for the question now, so no later answer can lack it */
-	if (out_init(r, DNS_R_SERVFAIL)) {
-		req_free(r);
-		return NULL;
-	}
 	stats.requests++;
 
 	if (r->qtype == DNS_T_ANY)
