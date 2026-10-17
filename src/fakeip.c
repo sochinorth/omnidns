@@ -599,15 +599,6 @@ static void evict_to(struct fakeip_db *db, uint32_t target)
 	db->stalled = s3_count(&db->s3) > target;
 }
 
-static int find_slot(struct fakeip_db *db, const struct bkey *k, uint64_t khash, uint32_t now,
-                     uint8_t *fake, struct binding **victim)
-{
-	if (!probe(db, k, khash, now, fake, victim))
-		return 0;
-	evict_to(db, evict_target(db));
-	return probe(db, k, khash, now, fake, victim);
-}
-
 static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k,
                                       uint64_t khash, uint32_t now, uint32_t ttl, int *err)
 {
@@ -628,7 +619,11 @@ static struct binding *binding_create(struct fakeip_db *db, const struct bkey *k
 		*err = pid;
 		return NULL;
 	}
-	r = find_slot(db, k, khash, now, fake, &victim);
+	r = probe(db, k, khash, now, fake, &victim);
+	if (r) {
+		evict_to(db, evict_target(db));
+		r = probe(db, k, khash, now, fake, &victim);
+	}
 	if (r)
 		goto fail_policy;
 	claim = victim && claimable(db, victim, k);
