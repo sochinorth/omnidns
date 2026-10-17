@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <arpa/inet.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -1488,6 +1489,55 @@ TEST(adopt_capacity)
 	fakeip_free(db);
 }
 
+static int cmp_u32(const void *a, const void *b)
+{
+	uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+/* a typical table: thousands of fakes of one CDN address under one mark */
+TEST(adopt_same_real)
+{
+	enum { N = 65535 };
+	struct ip_prefix p4 = pfx("198.18.0.0", 15);
+	static uint32_t hs[N];
+	struct fakeip_db *db;
+	struct binding *b;
+	uint32_t i, n = 0, distinct = 0, it = 0;
+	struct timespec t0, t1;
+	uint8_t real[4], fake[4];
+	double secs;
+
+	reset();
+	kern_off = true;
+	db = fakeip_new(&p4, NULL, N, 0, SECRET, NFT);
+	REQUIRE(db);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	memcpy(real, addr4(0x0a000001), 4);
+	for (i = 0; i < N; i++) {
+		memcpy(fake, addr4(0xc6120001 + i), 4);
+		REQUIRE(fakeip_adopt(db, 4, fake, real, 0x100, 10) == 0);
+	}
+	/* distinct keys: their 32-bit hashes collide only by chance */
+	while ((b = fakeip_next(db, &it)))
+		hs[n++] = b->s3.hash;
+	CHECK_EQ(n, N);
+	qsort(hs, n, sizeof(hs[0]), cmp_u32);
+	for (i = 0; i < n; i++)
+		distinct += !i || hs[i] != hs[i - 1];
+	CHECK(distinct >= N - 8);
+	/* not a name: no PTR answer */
+	CHECK(!fakeip_lookup(db, 4, addr4(0xc6120001)));
+	time_override_advance(11);
+	CHECK_EQ(fakeip_evict_expired(db), N);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	/* linear: well under 0.1 s, even sanitized; quadratic took seconds */
+	secs = (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+	CHECK(secs < 1.0);
+	fakeip_free(db);
+}
+
 /* ---- hold file: what a clean exit hands to the next adoption ---- */
 
 static char hold_dir[64], hold_file[96];
@@ -1818,6 +1868,7 @@ int main(void)
 	RUN(adopt_claim);
 	RUN(adopt_other_mapping_quarantined);
 	RUN(adopt_capacity);
+	RUN(adopt_same_real);
 	RUN(hold_round_trip);
 	RUN(hold_rejected);
 	RUN(hold_adopt_elems);

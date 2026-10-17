@@ -375,9 +375,9 @@ At startup omnidns reads the table, if any:
 3. The four maps are read and paired per fake. A pair `fake → real`,
    `fake → jump mark_V` with `mark_V` present and the fake allocatable in
    the current pool becomes a *placeholder* binding: a reserved policy
-   carrying the mark, no endpoint, refcount 0, nothing to wait for, and
-   `safe_until = now + hold`. With a trusted hold file (below), `hold` is
-   what the file lists for that fake, less the time since it was written,
+   carrying the mark, the fake as its endpoint (a unique key, not a name),
+   refcount 0, nothing to wait for, and `safe_until = now + hold`. With a
+   trusted hold file (below), `hold` is what the file lists for that fake, less the time since it was written,
    and an element it does not list is destroyed: it was evictable when the
    earlier process exited, so no client may use it. Without one, `hold` is
    `fakeip_ttl_max + fakeip_grace`, the longest a client may legitimately

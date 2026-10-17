@@ -125,11 +125,13 @@ struct binding *fakeip_lookup(struct fakeip_db *db, int family, const uint8_t *f
 /*
  * Adoption at startup (main.c, after nft_adopt()): a map element the
  * kernel still holds from an earlier process becomes a placeholder
- * binding: fake -> (real, mark) under a reserved policy (rule id ""), no
- * endpoint, refcnt 0, its ticket done (0), safe_until = now + hold (hold:
+ * binding: fake -> (real, mark) under a reserved policy (rule id ""), the
+ * fake itself as endpoint (unique keys; never a name: no PTR answer),
+ * refcnt 0, its ticket done (0), safe_until = now + hold (hold:
  * fakeip_ttl_max + fakeip_grace, the longest a client may have been told
- * to keep it, or what the hold file says is left). Placeholders count against max_bindings and are evicted like any
- * expired binding (their elements destroyed). A bind whose key maps to the
+ * to keep it, or what the hold file says is left). Placeholders count
+ * against max_bindings and are evicted like any expired binding (their
+ * elements destroyed). A bind whose key maps to the
  * same (family, real, mark) claims a placeholder it probes: the binding
  * takes over that fake with no nft op (the kernel has the mapping) and
  * keeps at least its safe_until; a placeholder with another mapping is a

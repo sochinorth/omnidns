@@ -788,10 +788,16 @@ uint32_t fakeip_placeholders(const struct fakeip_db *db)
 int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const uint8_t *real,
                  uint32_t mark, uint32_t hold)
 {
-	static const uint8_t none[1];
+	/*
+	 * The endpoint is the fake itself: no name is known, and placeholders
+	 * of one (mark, real) would otherwise share one key hash, making
+	 * by_key chains (and adopting or evicting them) quadratic. No bind
+	 * matches the key (the rule id is reserved) and no PTR answer reads it
+	 * (fakeip_lookup() skips placeholders).
+	 */
 	struct bkey k = {
 		.rule_id = ADOPTED, .mark = mark, .family = norm_family(family),
-		.endpoint = none, .real = real,
+		.endpoint = fake, .endpoint_len = alen(norm_family(family)), .real = real,
 	};
 	const struct ip_prefix *p = db_pool(db, k.family);
 	struct binding *b;
@@ -811,7 +817,7 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	pid = policy_get(db, &k);
 	if (pid < 0)
 		return pid;
-	b = calloc(1, sizeof(*b));	/* no endpoint */
+	b = calloc(1, offsetof(struct binding, endpoint) + k.endpoint_len);
 	if (!b) {
 		policy_put(db, pid);
 		return -ENOMEM;
@@ -820,6 +826,8 @@ int fakeip_adopt(struct fakeip_db *db, int family, const uint8_t *fake, const ui
 	b->family = k.family;
 	memcpy(b->fake, fake, alen(k.family));
 	memcpy(b->real, real, alen(k.family));
+	b->endpoint_len = k.endpoint_len;
+	memcpy(b->endpoint, fake, k.endpoint_len);
 	t = (uint64_t)omni_now() + hold;	/* hold includes the grace */
 	b->safe_until = t > UINT32_MAX ? UINT32_MAX : (uint32_t)t;
 	if (hmap_put(&db->by_key, khash, b)) {
