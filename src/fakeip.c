@@ -960,7 +960,7 @@ static int hold_parse(const uint8_t *buf, size_t len, const uint8_t secret[16],
 	n = load32be(buf + 12);
 	if (n > max_records)
 		return -E2BIG;
-	if ((len - HOLD_HDR) % HOLD_REC || (len - HOLD_HDR) / HOLD_REC != n)
+	if (len - HOLD_HDR != (uint64_t)n * HOLD_REC)
 		return -EINVAL;		/* truncated, or trailing bytes */
 	if (load64be(buf + 16) != hold_fingerprint(secret))
 		return -ESTALE;
@@ -1057,7 +1057,7 @@ void fakeip_hold_free(struct fakeip_hold *h)
 
 uint32_t fakeip_hold_count(const struct fakeip_hold *h)
 {
-	return h ? h->n : 0;
+	return h->n;
 }
 
 bool fakeip_hold_find(const struct fakeip_hold *h, int family, const uint8_t *fake,
@@ -1066,8 +1066,6 @@ bool fakeip_hold_find(const struct fakeip_hold *h, int family, const uint8_t *fa
 	struct hold_rec k = { .family = norm_family(family) };
 	const struct hold_rec *e;
 
-	if (!h)
-		return false;
 	memcpy(k.fake, fake, alen(k.family));
 	e = bsearch(&k, h->rec, h->n, sizeof(k), hold_cmp);
 	if (e && hold)

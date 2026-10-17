@@ -200,8 +200,9 @@ struct fakeip_hold;
 struct fakeip_hold *fakeip_hold_load(const char *path, const uint8_t secret[16],
                                      uint32_t max_records, uint64_t clock, int *err);
 void fakeip_hold_free(struct fakeip_hold *h);
+/* h non-NULL: */
 uint32_t fakeip_hold_count(const struct fakeip_hold *h);
-/* true if listed, its adjusted hold in *hold */
+/* true if listed, its adjusted hold in *hold (if non-NULL) */
 bool fakeip_hold_find(const struct fakeip_hold *h, int family, const uint8_t *fake,
                       uint32_t *hold);
 
