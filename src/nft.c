@@ -1023,6 +1023,7 @@ int nft_destroy_table(struct nft_ctx *n)
 #define DUMP_BUF	32768
 /* chains in a table to adopt: the fixed ones, mark chains, some foreign */
 #define ADOPT_MAX_CHAINS	8192
+#define ADOPT_TRIES		16
 
 /* the reply to a GET request on the control socket, passed to an mnl callback */
 struct dump {
@@ -1187,16 +1188,19 @@ static int rule_cb(const struct nlmsghdr *nlh, void *priv)
 	return MNL_CB_OK;
 }
 
-/* true if `chain` holds exactly `want` rules, all tagged `tag` */
-static bool rules_current(struct nft_ctx *n, const char *chain, uint64_t tag, uint32_t want)
+/* 1 if `chain` holds exactly `want` rules, all tagged `tag`, else 0 or -errno */
+static int rules_current(struct nft_ctx *n, const char *chain, uint64_t tag, uint32_t want)
 {
 	struct rule_st st = { .tag = tag };
 	char buf[512];
 	struct nlmsghdr *nlh = get_msg(n, buf, NFT_MSG_GETRULE, NLM_F_DUMP);
+	int err;
 
 	mnl_attr_put_strz(nlh, NFTA_RULE_TABLE, n->table);
 	mnl_attr_put_strz(nlh, NFTA_RULE_CHAIN, chain);
-	return !rd_get(n, nlh, rule_cb, &st) && !st.bad && st.n == want;
+	err = rd_get(n, nlh, rule_cb, &st);
+
+	return err ? err : !st.bad && st.n == want;
 }
 
 struct elem_st {
@@ -1302,23 +1306,25 @@ static uint32_t pair_elems(const struct nft_elem *r, uint32_t nr, const struct n
 	return k;
 }
 
-int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems,
-              uint8_t secret[NFT_SECRET_LEN], struct nft_elem **elems, uint32_t *nelems)
+/*
+ * One reading of the table: 1 adopted, 0 not (logged), -EINTR if a commit
+ * anywhere in the netns interrupted a dump (NLM_F_DUMP_INTR).
+ */
+static int adopt_read(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems,
+                      uint8_t secret[NFT_SECRET_LEN], struct nft_elem **elems, uint32_t *nelems)
 {
 	struct table_st tst = { 0 };
 	struct chain_st cst = { .n = n, .fwmask = d->fwmask };
 	struct elem_st est[2] = { { 0 } };	/* fake2real, fake2mark (both families) */
 	uint32_t want[3], i;
-	struct nft_elem *out = NULL;
+	struct nft_elem *out;
 	struct nlmsghdr *nlh;
 	struct shadow s;
 	const char *why;
 	char buf[512];
 	uint64_t tag;
-	int err;
+	int err = 0;
 
-	*elems = NULL;
-	*nelems = 0;
 	if (shadow_from(&s, d))
 		return 0;
 	n->rd = mnl_socket_open(NETLINK_NETFILTER);
@@ -1344,9 +1350,11 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	free(s.marks);
 	s.marks = cst.marks = oom(malloc(ADOPT_MAX_CHAINS * sizeof(uint32_t)));
 	s.nmarks = 0;
+	/* kernels up to 6.18 at least ignore the table here and dump all chains */
 	nlh = get_msg(n, buf, NFT_MSG_GETCHAIN, NLM_F_DUMP);
+	mnl_attr_put_strz(nlh, NFTA_CHAIN_TABLE, n->table);
 	why = "cannot list its chains, or too many";
-	if (rd_get(n, nlh, chain_cb, &cst))
+	if ((err = rd_get(n, nlh, chain_cb, &cst)))
 		goto fail;
 	why = "a chain is missing";
 	if (cst.fixed != (1u << NFIXED) - 1)
@@ -1355,12 +1363,23 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	s.marks = oom(realloc(cst.marks, (cst.nmarks + 1) * sizeof(uint32_t)));
 	s.nmarks = cst.nmarks;
 
+	/* policy rules: exactly what `s` would install, or rewrite them */
+	tag = shadow_tag(&s);
+	policy_rule_counts(&s, &want[0], &want[1], &want[2]);
+	err = rules_current(n, "restore_marks", tag, want[0]);
+	for (i = 0; i < 2 && err > 0; i++)
+		if ((err = rules_current(n, fixed_chains[C_PRE_DSTNAT + i].name, tag, want[1])) > 0)
+			err = rules_current(n, fixed_chains[C_FWD_REJECT + i].name, tag, want[2]);
+	if (err == -EINTR)
+		goto fail;
+	n->stale = err <= 0;
+
 	why = "cannot list its maps, or more elements than fakeip_max_bindings allows";
 	for (i = 0; i < 2; i++) {
 		est[i].sh = &s;
 		est[i].max = max_elems;
-		if (dump_map(n, i ? S_MARK4 : S_REAL4, &est[i]) ||
-		    dump_map(n, i ? S_MARK6 : S_REAL6, &est[i]))
+		if ((err = dump_map(n, i ? S_MARK4 : S_REAL4, &est[i])) ||
+		    (err = dump_map(n, i ? S_MARK6 : S_REAL6, &est[i])))
 			goto fail;
 		if (est[i].n)
 			qsort(est[i].v, est[i].n, sizeof(*est[i].v), cmp_elem);
@@ -1369,14 +1388,6 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	*nelems = pair_elems(est[0].v, est[0].n, est[1].v, est[1].n, out);
 	*elems = out;
 
-	/* policy rules: exactly what `s` would install, or rewrite them */
-	tag = shadow_tag(&s);
-	policy_rule_counts(&s, &want[0], &want[1], &want[2]);
-	n->stale = !rules_current(n, "restore_marks", tag, want[0]);
-	for (i = 0; i < 2 && !n->stale; i++)
-		n->stale = !rules_current(n, fixed_chains[C_PRE_DSTNAT + i].name, tag, want[1]) ||
-		           !rules_current(n, fixed_chains[C_FWD_REJECT + i].name, tag, want[2]);
-
 	shadow_free(&n->sh);
 	n->sh = s;
 	n->have_state = true;
@@ -1384,22 +1395,47 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	memcpy(secret, tst.secret, NFT_SECRET_LEN);
 	log_info("nft: adopting table %s: %u map elements, %u mark chains%s", n->table,
 	         *nelems, s.nmarks, n->stale ? ", policy rules to rewrite" : "");
-	free(est[0].v);
-	free(est[1].v);
-	mnl_socket_close(n->rd);
-	n->rd = NULL;
-	return 1;
+	err = 1;
+	goto out;
 
 fail:
-	log_warn("nft: not adopting table %s (%s): it is recreated, its fake IPs are lost",
-	         n->table, why);
+	if (err != -EINTR)
+		log_warn("nft: not adopting table %s (%s): it is recreated, its fake IPs are lost",
+		         n->table, why);
 fail_quiet:
+	shadow_free(&s);
+	err = err == -EINTR ? -EINTR : 0;
+out:
 	free(est[0].v);
 	free(est[1].v);
-	shadow_free(&s);
 	if (n->rd)
 		mnl_socket_close(n->rd);
 	n->rd = NULL;
+	return err;
+}
+
+/*
+ * A dump interrupted by a commit (in any table: fw4, dnsmasq's nftset,
+ * mwan3) may be incomplete or mix two generations: the whole reading starts
+ * over on a fresh socket, as nft does, at most ADOPT_TRIES times, after a
+ * pause doubling from 1 ms up to 128 ms (about 1.2 s in all) to let a burst
+ * of commits pass.
+ */
+int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems,
+              uint8_t secret[NFT_SECRET_LEN], struct nft_elem **elems, uint32_t *nelems)
+{
+	int r;
+
+	*elems = NULL;
+	*nelems = 0;
+	for (int i = 0; i < ADOPT_TRIES; i++) {
+		if ((r = adopt_read(n, d, max_elems, secret, elems, nelems)) != -EINTR)
+			return r;
+		log_debug("nft: a dump of table %s was interrupted, reading it again", n->table);
+		usleep(1000u << (i < 7 ? i : 7));
+	}
+	log_warn("nft: not adopting table %s (the ruleset kept changing while it was read): "
+	         "it is recreated, its fake IPs are lost", n->table);
 	return 0;
 }
 

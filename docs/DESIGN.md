@@ -367,7 +367,11 @@ At startup omnidns reads the table, if any:
 1. The table's userdata holds a layout version, the fwmask and the
    allocation secret. If the table is missing, has another version or
    fwmask, lacks one of its fixed chains, or cannot be read, omnidns
-   bootstraps with a fresh secret, as on a first start, and logs why.
+   bootstraps with a fresh secret, as on a first start, and logs why. A
+   commit anywhere in the netns (fw4, dnsmasq's nftset, mwan3) interrupts
+   a dump that is under way (`NLM_F_DUMP_INTR`): the whole reading then
+   starts over, as nft does, up to 16 times with pauses doubling from 1 to
+   128 ms (about 1.2 s); only then does it bootstrap.
 2. Otherwise the shadow state is rebuilt from the kernel: the mark chains
    present, and the configuration's pools if every policy rule carries the
    tag of exactly that state (each policy rule records one); else the

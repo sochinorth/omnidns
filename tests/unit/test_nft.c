@@ -4,7 +4,9 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter/nf_tables.h>
 #include <libmnl/libmnl.h>
@@ -1350,6 +1352,64 @@ TEST(adopt_cap_bounds_work)
 	nft_close(m);
 }
 
+/* commits in another table, as fw4 or mwan3 may make them any time (in
+ * this netns, one every few ms) */
+static pid_t churn_start(unsigned pause_us)
+{
+	pid_t pid = fork();
+
+	if (pid)
+		return pid;
+	for (bool add = true;; add = !add) {
+		struct nftnl_table *t = nftnl_table_alloc();
+
+		nftnl_table_set_str(t, NFTNL_TABLE_NAME, "churn");
+		raw_commit(add ? NFT_MSG_NEWTABLE : NFT_MSG_DELTABLE, add ? NLM_F_CREATE : 0, t,
+		           NULL);
+		nftnl_table_free(t);
+		usleep(pause_us);
+	}
+}
+
+static void churn_stop(pid_t pid)
+{
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	free(sh("nft delete table inet churn 2>/dev/null"));
+}
+
+/*
+ * A commit anywhere while a dump runs interrupts it (NLM_F_DUMP_INTR): the
+ * readback starts over, and adoption still succeeds.
+ */
+TEST(adopt_under_churn)
+{
+	static const uint32_t m1[] = { 0x01000000 };
+	struct nft_desired d = desired(true, true, m1, 1);
+	uint8_t got[NFT_SECRET_LEN];
+	struct nft_elem *el;
+	uint32_t nel;
+	int ok = 0;
+	pid_t pid;
+
+	REQUIRE(nft_bootstrap(n, &d) == 0);
+	fill_maps(2000, false, 0x01000000);
+	fill_maps(2000, true, 0x01000000);
+	/* a large foreign table: the chain dump, of all tables, takes a while */
+	free(sh("{ echo 'add table inet foreign'; for i in $(seq 10000); do "
+	        "echo \"add chain inet foreign c$i\"; done; } | nft -f -"));
+	pid = churn_start(10000);
+	for (int i = 0; i < 30; i++) {
+		el = NULL;
+		if (adopt(&d, 10000, got, &el, &nel, NULL) == 1 && nel == 4000)
+			ok++;
+		free(el);
+	}
+	churn_stop(pid);
+	free(sh("nft delete table inet foreign"));
+	CHECK_EQ(ok, 30);
+}
+
 /* ---- real packets in the netns ---- */
 
 static int tcp_connect(const char *dst, int port)
@@ -1764,6 +1824,7 @@ int main(int argc, char **argv)
 	RUN(adopt_mismatch_bootstraps);
 	RUN(adopt_crafted_userdata);
 	RUN(adopt_cap_bounds_work);
+	RUN(adopt_under_churn);
 	RUN(wire_v4v6_all_marks);
 	RUN(wire_batch_max);
 	RUN(batch_buffers);
