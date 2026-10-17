@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <sys/time.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter/nfnetlink.h>
@@ -239,15 +240,32 @@ static void txn_chain(struct nft_ctx *n, struct txn *t, int type,
 	nftnl_chain_free(c);
 }
 
-static void txn_base_chain(struct nft_ctx *n, struct txn *t, const char *name,
-                           const char *type, int hook, int prio)
-{
-	struct nftnl_chain *c = chain_new(n, name);
+/* the table's chains other than mark chains; type NULL: a regular chain */
+enum { C_RESTORE, C_PRE_MANGLE, C_OUT_MANGLE, C_PRE_DSTNAT, C_OUT_DSTNAT, C_FWD_REJECT,
+       C_OUT_REJECT, NFIXED };
+static const struct {
+	const char *name, *type;
+	int hook, prio;
+} fixed_chains[NFIXED] = {
+	{ "restore_marks", NULL, 0, 0 },
+	{ "prerouting_mangle", "filter", NF_INET_PRE_ROUTING, NF_IP_PRI_MANGLE },
+	{ "output_mangle", "route", NF_INET_LOCAL_OUT, NF_IP_PRI_MANGLE },
+	{ "prerouting_dstnat", "nat", NF_INET_PRE_ROUTING, NF_IP_PRI_NAT_DST },
+	{ "output_dstnat", "nat", NF_INET_LOCAL_OUT, NF_IP_PRI_NAT_DST },
+	{ "forward_reject", "filter", NF_INET_FORWARD, NF_IP_PRI_FILTER - 1 },
+	{ "output_reject", "filter", NF_INET_LOCAL_OUT, NF_IP_PRI_FILTER - 1 },
+};
 
-	nftnl_chain_set_str(c, NFTNL_CHAIN_TYPE, type);
-	nftnl_chain_set_u32(c, NFTNL_CHAIN_HOOKNUM, hook);
-	nftnl_chain_set_s32(c, NFTNL_CHAIN_PRIO, prio);
-	nftnl_chain_set_u32(c, NFTNL_CHAIN_POLICY, NF_ACCEPT);
+static void txn_fixed_chain(struct nft_ctx *n, struct txn *t, int i)
+{
+	struct nftnl_chain *c = chain_new(n, fixed_chains[i].name);
+
+	if (fixed_chains[i].type) {
+		nftnl_chain_set_str(c, NFTNL_CHAIN_TYPE, fixed_chains[i].type);
+		nftnl_chain_set_u32(c, NFTNL_CHAIN_HOOKNUM, fixed_chains[i].hook);
+		nftnl_chain_set_s32(c, NFTNL_CHAIN_PRIO, fixed_chains[i].prio);
+		nftnl_chain_set_u32(c, NFTNL_CHAIN_POLICY, NF_ACCEPT);
+	}
 	txn_chain(n, t, NFT_MSG_NEWCHAIN, c);
 }
 
@@ -561,8 +579,6 @@ static void txn_jump_rule(struct nft_ctx *n, struct txn *t, const char *chain,
 	txn_rule(n, t, r);
 }
 
-static const char *const dstnat_chains[] = { "prerouting_dstnat", "output_dstnat" };
-static const char *const reject_chains[] = { "forward_reject", "output_reject" };
 
 static uint64_t shadow_tag(const struct shadow *s);
 
@@ -574,19 +590,22 @@ static void txn_policy_rules(struct nft_ctx *n, struct txn *t, const struct shad
 	if (s->nmarks)
 		txn_restore_rule(n, t, s->fwmask, s->marks, s->nmarks, tag);
 	for (int i = 0; i < 2; i++) {
+		const char *dnat = fixed_chains[C_PRE_DSTNAT + i].name;
+		const char *rej = fixed_chains[C_FWD_REJECT + i].name;
+
 		if (s->has_pool4)
-			txn_dstnat_rules(n, t, dstnat_chains[i], &s->pool4, tag);
+			txn_dstnat_rules(n, t, dnat, &s->pool4, tag);
 		if (s->has_pool6)
-			txn_dstnat_rules(n, t, dstnat_chains[i], &s->pool6, tag);
+			txn_dstnat_rules(n, t, dnat, &s->pool6, tag);
 		if (s->has_pool4)
-			txn_reject_rule(n, t, reject_chains[i], &s->pool4, tag);
+			txn_reject_rule(n, t, rej, &s->pool4, tag);
 		if (s->has_pool6)
-			txn_reject_rule(n, t, reject_chains[i], &s->pool6, tag);
+			txn_reject_rule(n, t, rej, &s->pool6, tag);
 	}
 }
 
-/* rules per policy chain for `s`: restore_marks, then dstnat_chains[i] and
- * reject_chains[i] alike for both i */
+/* rules per policy chain for `s`: restore_marks, then the dstnat and the
+ * reject chains */
 static void policy_rule_counts(const struct shadow *s, uint32_t *restore, uint32_t *dstnat,
                                uint32_t *reject)
 {
@@ -624,10 +643,12 @@ static bool seq_in(uint32_t seq, uint32_t first, uint32_t last)
 
 static int sock_setup(struct mnl_socket *nl)
 {
+	struct timeval tv = { RECV_TIMEOUT_MS / 1000, RECV_TIMEOUT_MS % 1000 * 1000 };
 	int fd = mnl_socket_get_fd(nl), one = 1, sz = SOCK_BUF;
 
 	if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0)
 		return -errno;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_NETLINK, NETLINK_CAP_ACK, &one, sizeof(one));
 	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &sz, sizeof(sz)) < 0)
 		setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
@@ -702,47 +723,60 @@ static void ctl_discard(int fd, char *buf, size_t size)
 		;
 }
 
+/*
+ * Receive datagrams into buf, passing each to fn until it returns <= 0 (0:
+ * done, else -errno). Waiting longer than RECV_TIMEOUT_MS (SO_RCVTIMEO)
+ * fails with -ETIMEDOUT. `overrun_ok`: after ENOBUFS, read what is queued
+ * without waiting, then fail with -ENOBUFS (see above); else ENOBUFS fails.
+ */
+typedef int (*recv_fn)(void *priv, const char *buf, size_t len);
+
+static int recv_loop(int fd, char *buf, size_t size, bool overrun_ok, recv_fn fn, void *priv)
+{
+	bool overrun = false;
+
+	for (;;) {
+		ssize_t len = recv(fd, buf, size, overrun ? MSG_DONTWAIT : 0);
+		int r;
+
+		if (len < 0 && errno == EINTR)
+			continue;
+		if (len < 0 && errno == ENOBUFS && overrun_ok && !overrun) {
+			log_debug("nft: replies overran the receive buffer");
+			overrun = true;
+			continue;
+		}
+		if (len < 0)
+			return errno != EAGAIN && errno != EWOULDBLOCK ? -errno :
+			       overrun ? -ENOBUFS : -ETIMEDOUT;
+		r = fn(priv, buf, (size_t)len);
+		if (r <= 0)
+			return r;
+	}
+}
+
+static int sync_recv(void *priv, const char *buf, size_t len)
+{
+	struct sync_state *st = priv;
+
+	parse_acks(buf, (int)len, sync_ack, st);
+	return st->err ? st->err : !st->done;
+}
+
 static int ctl_commit(struct nft_ctx *n, struct txn *t, const char *what)
 {
 	struct nlmsghdr *last = (struct nlmsghdr *)(t->b.p + t->last_off);
 	struct sync_state st = { t->seq_first, t->seq_last, last->nlmsg_seq, false, 0 };
-	int fd = mnl_socket_get_fd(n->ctl);
-	bool overrun = false;
+	int fd = mnl_socket_get_fd(n->ctl), err;
 	char buf[16384];
 
 	last->nlmsg_flags |= NLM_F_ACK;
 	ctl_discard(fd, buf, sizeof(buf));
-	if (mnl_socket_sendto(n->ctl, t->b.p, t->b.len) < 0) {
-		st.err = -errno;
-		goto out;
-	}
-	while (!st.done && !st.err) {
-		struct pollfd pfd = { .fd = fd, .events = POLLIN };
-		ssize_t len;
-
-		if (!overrun && poll(&pfd, 1, RECV_TIMEOUT_MS) <= 0) {
-			st.err = -ETIMEDOUT;
-			break;
-		}
-		len = recv(fd, buf, sizeof(buf), overrun ? MSG_DONTWAIT : 0);
-		if (len < 0) {
-			if (errno == EINTR)
-				continue;
-			if (errno == ENOBUFS && !overrun) {
-				log_debug("nft: %s: replies overran the receive buffer", what);
-				overrun = true;
-				continue;
-			}
-			st.err = overrun && (errno == EAGAIN || errno == EWOULDBLOCK) ?
-			         -ENOBUFS : -errno;
-			break;
-		}
-		parse_acks(buf, (int)len, sync_ack, &st);
-	}
-out:
-	if (st.err)
-		log_err("nft: %s (table %s) failed: %s", what, n->table, strerror(-st.err));
-	return st.err;
+	err = mnl_socket_sendto(n->ctl, t->b.p, t->b.len) < 0 ? -errno :
+	      recv_loop(fd, buf, sizeof(buf), true, sync_recv, &st);
+	if (err)
+		log_err("nft: %s (table %s) failed: %s", what, n->table, strerror(-err));
+	return err;
 }
 
 /* ---- shadow state ---- */
@@ -870,21 +904,10 @@ static void txn_create(struct nft_ctx *n, struct txn *t, const struct shadow *s,
 	txn_maps(n, t);
 	for (uint32_t i = 0; i < s->nmarks; i++)
 		txn_mark_chain(n, t, s->fwmask, s->marks[i]);
-	txn_chain(n, t, NFT_MSG_NEWCHAIN, chain_new(n, "restore_marks"));
-	txn_base_chain(n, t, "prerouting_mangle", "filter", NF_INET_PRE_ROUTING,
-	               NF_IP_PRI_MANGLE);
-	txn_base_chain(n, t, "output_mangle", "route", NF_INET_LOCAL_OUT,
-	               NF_IP_PRI_MANGLE);
-	txn_base_chain(n, t, "prerouting_dstnat", "nat", NF_INET_PRE_ROUTING,
-	               NF_IP_PRI_NAT_DST);
-	txn_base_chain(n, t, "output_dstnat", "nat", NF_INET_LOCAL_OUT,
-	               NF_IP_PRI_NAT_DST);
-	txn_base_chain(n, t, "forward_reject", "filter", NF_INET_FORWARD,
-	               NF_IP_PRI_FILTER - 1);
-	txn_base_chain(n, t, "output_reject", "filter", NF_INET_LOCAL_OUT,
-	               NF_IP_PRI_FILTER - 1);
-	txn_jump_rule(n, t, "prerouting_mangle", "restore_marks");
-	txn_jump_rule(n, t, "output_mangle", "restore_marks");
+	for (int i = 0; i < NFIXED; i++)
+		txn_fixed_chain(n, t, i);
+	txn_jump_rule(n, t, fixed_chains[C_PRE_MANGLE].name, "restore_marks");
+	txn_jump_rule(n, t, fixed_chains[C_OUT_MANGLE].name, "restore_marks");
 	txn_policy_rules(n, t, s);
 	txn_end(n, t);
 }
@@ -959,8 +982,8 @@ int nft_reconcile(struct nft_ctx *n, const struct nft_desired *d)
 			txn_mark_chain(n, t, s.fwmask, s.marks[i]);
 	txn_flush_chain(n, t, "restore_marks");
 	for (int i = 0; i < 2; i++) {
-		txn_flush_chain(n, t, dstnat_chains[i]);
-		txn_flush_chain(n, t, reject_chains[i]);
+		txn_flush_chain(n, t, fixed_chains[C_PRE_DSTNAT + i].name);
+		txn_flush_chain(n, t, fixed_chains[C_FWD_REJECT + i].name);
 	}
 	txn_policy_rules(n, t, &s);
 	for (uint32_t i = 0; i < n->sh.nmarks; i++) {
@@ -1000,59 +1023,21 @@ int nft_destroy_table(struct nft_ctx *n)
 /* chains in a table to adopt: the fixed ones, mark chains, some foreign */
 #define ADOPT_MAX_CHAINS	8192
 
-static const char *const fixed_chains[] = {
-	"restore_marks", "prerouting_mangle", "output_mangle", "prerouting_dstnat",
-	"output_dstnat", "forward_reject", "output_reject",
-};
-#define NFIXED (sizeof(fixed_chains) / sizeof(fixed_chains[0]))
-
-struct attrs {
-	const struct nlattr **tb;
-	int max;
+/* the reply to a GET request on the control socket, passed to an mnl callback */
+struct dump {
+	uint32_t seq, portid;
+	mnl_cb_t cb;
+	void *priv;
 };
 
-static int attr_cb(const struct nlattr *a, void *data)
+static int dump_recv(void *priv, const char *buf, size_t len)
 {
-	struct attrs *s = data;
-	int type = mnl_attr_get_type(a);
+	struct dump *d = priv;
+	int r;
 
-	if (type <= s->max)
-		s->tb[type] = a;
-	return MNL_CB_OK;
-}
-
-static void parse_msg(const struct nlmsghdr *nlh, const struct nlattr **tb, int max)
-{
-	struct attrs s = { tb, max };
-
-	memset(tb, 0, sizeof(*tb) * (max + 1));
-	mnl_attr_parse(nlh, sizeof(struct nfgenmsg), attr_cb, &s);
-}
-
-static void parse_nest(const struct nlattr *nest, const struct nlattr **tb, int max)
-{
-	struct attrs s = { tb, max };
-
-	memset(tb, 0, sizeof(*tb) * (max + 1));
-	if (nest)
-		mnl_attr_parse_nested(nest, attr_cb, &s);
-}
-
-/* NUL-terminated string attribute, or NULL */
-static const char *attr_str(const struct nlattr *a)
-{
-	uint16_t len = a ? mnl_attr_get_payload_len(a) : 0;
-
-	if (!len || ((const char *)mnl_attr_get_payload(a))[len - 1])
-		return NULL;
-	return mnl_attr_get_str(a);
-}
-
-static bool our_table(const struct nft_ctx *n, const struct nlattr *a)
-{
-	const char *t = attr_str(a);
-
-	return t && !strcmp(t, n->table);
+	errno = 0;
+	r = mnl_cb_run(buf, len, d->seq, d->portid, d->cb, d->priv);
+	return r >= 0 ? r : errno ? -errno : -EPROTO;
 }
 
 /*
@@ -1062,32 +1047,15 @@ static bool our_table(const struct nft_ctx *n, const struct nlattr *a)
  */
 static int ctl_get(struct nft_ctx *n, struct nlmsghdr *nlh, mnl_cb_t cb, void *priv)
 {
+	struct dump d = { nlh->nlmsg_seq, mnl_socket_get_portid(n->ctl), cb, priv };
 	int fd = mnl_socket_get_fd(n->ctl), r;
-	uint32_t seq = nlh->nlmsg_seq, portid = mnl_socket_get_portid(n->ctl);
 	char *buf = oom(malloc(DUMP_BUF));
 
 	ctl_discard(fd, buf, DUMP_BUF);
-	r = mnl_socket_sendto(n->ctl, nlh, nlh->nlmsg_len) < 0 ? -errno : MNL_CB_OK;
-	while (r == MNL_CB_OK) {
-		struct pollfd pfd = { .fd = fd, .events = POLLIN };
-		ssize_t len;
-
-		if (poll(&pfd, 1, RECV_TIMEOUT_MS) <= 0) {
-			r = -ETIMEDOUT;
-			break;
-		}
-		len = recv(fd, buf, DUMP_BUF, 0);
-		if (len < 0) {
-			if (errno != EINTR)
-				r = -errno;
-			continue;
-		}
-		r = mnl_cb_run(buf, (size_t)len, seq, portid, cb, priv);
-		if (r < 0)
-			r = errno ? -errno : -EPROTO;
-	}
+	r = mnl_socket_sendto(n->ctl, nlh, nlh->nlmsg_len) < 0 ? -errno :
+	    recv_loop(fd, buf, DUMP_BUF, false, dump_recv, &d);
 	free(buf);
-	return r < 0 ? r : 0;
+	return r;
 }
 
 static struct nlmsghdr *get_msg(struct nft_ctx *n, char *buf, int type, uint16_t flags)
@@ -1127,15 +1095,16 @@ static int table_ud_cb(const struct nftnl_udata *a, void *data)
 
 static int table_cb(const struct nlmsghdr *nlh, void *priv)
 {
-	const struct nlattr *tb[NFTA_TABLE_MAX + 1];
-	const struct nlattr *u;
+	struct nftnl_table *t = oom(nftnl_table_alloc());
+	const void *u;
+	uint32_t len;
+	int r = nftnl_table_nlmsg_parse(nlh, t);
 
-	parse_msg(nlh, tb, NFTA_TABLE_MAX);
-	u = tb[NFTA_TABLE_USERDATA];
-	if (u)
-		nftnl_udata_parse(mnl_attr_get_payload(u), mnl_attr_get_payload_len(u),
-		                  table_ud_cb, priv);
-	return MNL_CB_OK;
+	if (!r && (u = nftnl_table_get_data(t, NFTNL_TABLE_USERDATA, &len)))
+		nftnl_udata_parse(u, len, table_ud_cb, priv);
+	nftnl_table_free(t);
+	errno = EPROTO;
+	return r ? MNL_CB_ERROR : MNL_CB_OK;
 }
 
 /* mark_%08x, exactly as mark_chain_name() prints it, valid for `fwmask` */
@@ -1163,25 +1132,34 @@ struct chain_st {
 
 static int chain_cb(const struct nlmsghdr *nlh, void *priv)
 {
-	const struct nlattr *tb[NFTA_CHAIN_MAX + 1];
+	struct nftnl_chain *c = oom(nftnl_chain_alloc());
 	struct chain_st *st = priv;
-	const char *name;
+	const char *name, *table;
+	int r = MNL_CB_OK;
 	uint32_t v;
 
-	parse_msg(nlh, tb, NFTA_CHAIN_MAX);
-	name = attr_str(tb[NFTA_CHAIN_NAME]);
-	if (!our_table(st->n, tb[NFTA_CHAIN_TABLE]) || !name)
-		return MNL_CB_OK;
+	errno = EPROTO;
+	if (nftnl_chain_nlmsg_parse(nlh, c) < 0) {
+		r = MNL_CB_ERROR;
+		goto out;
+	}
+	table = nftnl_chain_get_str(c, NFTNL_CHAIN_TABLE);
+	name = nftnl_chain_get_str(c, NFTNL_CHAIN_NAME);
+	if (!table || !name || strcmp(table, st->n->table))
+		goto out;
+	errno = E2BIG;
 	if (++st->nchains > ADOPT_MAX_CHAINS) {
-		errno = E2BIG;
-		return MNL_CB_ERROR;
+		r = MNL_CB_ERROR;
+		goto out;
 	}
 	for (uint32_t i = 0; i < NFIXED; i++)
-		if (!strcmp(name, fixed_chains[i]))
+		if (!strcmp(name, fixed_chains[i].name))
 			st->fixed |= 1u << i;
 	if (parse_mark_chain(name, st->fwmask, &v))
 		st->marks[st->nmarks++] = v;
-	return MNL_CB_OK;
+out:
+	nftnl_chain_free(c);
+	return r;
 }
 
 struct rule_st {
@@ -1205,19 +1183,19 @@ static int rule_ud_cb(const struct nftnl_udata *a, void *data)
 
 static int rule_cb(const struct nlmsghdr *nlh, void *priv)
 {
-	const struct nlattr *tb[NFTA_RULE_MAX + 1];
+	struct nftnl_rule *r = oom(nftnl_rule_alloc());
 	struct rule_st *st = priv;
-	const struct nlattr *u;
 	bool bad = st->bad;
+	const void *u;
+	uint32_t len;
 
-	parse_msg(nlh, tb, NFTA_RULE_MAX);
 	st->n++;
 	st->bad = true;		/* unless this rule carries the tag */
-	u = tb[NFTA_RULE_USERDATA];
-	if (u)
-		nftnl_udata_parse(mnl_attr_get_payload(u), mnl_attr_get_payload_len(u),
-		                  rule_ud_cb, st);
+	if (nftnl_rule_nlmsg_parse(nlh, r) >= 0 &&
+	    (u = nftnl_rule_get_data(r, NFTNL_RULE_USERDATA, &len)))
+		nftnl_udata_parse(u, len, rule_ud_cb, st);
 	st->bad |= bad;
+	nftnl_rule_free(r);
 	return MNL_CB_OK;
 }
 
@@ -1241,55 +1219,52 @@ struct elem_st {
 	uint32_t n, cap, max;
 };
 
+static int elem_one(struct nftnl_set_elem *e, void *priv)
+{
+	struct elem_st *st = priv;
+	uint32_t alen = st->family == 6 ? 16 : 4, len;
+	const void *key = nftnl_set_elem_get(e, NFTNL_SET_ELEM_KEY, &len), *val;
+	const char *chain;
+	struct nft_elem *x;
+
+	if (!key || len != alen)
+		return 0;	/* not a key of ours: nothing we could destroy */
+	if (st->n == st->max) {
+		errno = E2BIG;
+		return -1;
+	}
+	if (st->n == st->cap) {
+		st->cap = st->cap ? st->cap * 2 : 256;
+		st->v = oom(realloc(st->v, st->cap * sizeof(*st->v)));
+	}
+	x = &st->v[st->n++];
+	memset(x, 0, sizeof(*x));
+	x->family = st->family;
+	memcpy(x->fake, key, alen);
+	if (!st->mark) {
+		val = nftnl_set_elem_get(e, NFTNL_SET_ELEM_DATA, &len);
+		if ((x->ok = val && len == alen))
+			memcpy(x->real, val, alen);
+		return 0;
+	}
+	chain = nftnl_set_elem_get_str(e, NFTNL_SET_ELEM_CHAIN);
+	x->ok = nftnl_set_elem_get_u32(e, NFTNL_SET_ELEM_VERDICT) == (uint32_t)NFT_JUMP &&
+	        chain && parse_mark_chain(chain, st->sh->fwmask, &x->mark) &&
+	        has_mark(st->sh, x->mark);
+	return 0;
+}
+
 static int elem_cb(const struct nlmsghdr *nlh, void *priv)
 {
-	const struct nlattr *tb[NFTA_SET_ELEM_LIST_MAX + 1], *a;
-	struct elem_st *st = priv;
-	uint32_t alen = st->family == 6 ? 16 : 4;
+	struct nftnl_set *s = oom(nftnl_set_alloc());
+	int r = nftnl_set_elems_nlmsg_parse(nlh, s);
 
-	parse_msg(nlh, tb, NFTA_SET_ELEM_LIST_MAX);
-	if (!tb[NFTA_SET_ELEM_LIST_ELEMENTS])
-		return MNL_CB_OK;
-	mnl_attr_for_each_nested(a, tb[NFTA_SET_ELEM_LIST_ELEMENTS]) {
-		const struct nlattr *e[NFTA_SET_ELEM_MAX + 1], *k[NFTA_DATA_MAX + 1];
-		const struct nlattr *dt[NFTA_DATA_MAX + 1], *vd[NFTA_VERDICT_MAX + 1];
-		struct nft_elem *x;
-		const char *chain;
-
-		parse_nest(a, e, NFTA_SET_ELEM_MAX);
-		parse_nest(e[NFTA_SET_ELEM_KEY], k, NFTA_DATA_MAX);
-		if (!k[NFTA_DATA_VALUE] || mnl_attr_get_payload_len(k[NFTA_DATA_VALUE]) != alen)
-			continue;	/* not a key of ours: nothing we could destroy */
-		if (st->n == st->max) {
-			errno = E2BIG;
-			return MNL_CB_ERROR;
-		}
-		if (st->n == st->cap) {
-			st->cap = st->cap ? st->cap * 2 : 256;
-			st->v = oom(realloc(st->v, st->cap * sizeof(*st->v)));
-		}
-		x = &st->v[st->n++];
-		memset(x, 0, sizeof(*x));
-		x->family = st->family;
-		memcpy(x->fake, mnl_attr_get_payload(k[NFTA_DATA_VALUE]), alen);
-		parse_nest(e[NFTA_SET_ELEM_DATA], dt, NFTA_DATA_MAX);
-		if (!st->mark) {
-			if (dt[NFTA_DATA_VALUE] &&
-			    mnl_attr_get_payload_len(dt[NFTA_DATA_VALUE]) == alen) {
-				memcpy(x->real, mnl_attr_get_payload(dt[NFTA_DATA_VALUE]), alen);
-				x->ok = true;
-			}
-			continue;
-		}
-		parse_nest(dt[NFTA_DATA_VERDICT], vd, NFTA_VERDICT_MAX);
-		chain = attr_str(vd[NFTA_VERDICT_CHAIN]);
-		x->ok = vd[NFTA_VERDICT_CODE] &&
-		        mnl_attr_get_payload_len(vd[NFTA_VERDICT_CODE]) == 4 &&
-		        ntohl(mnl_attr_get_u32(vd[NFTA_VERDICT_CODE])) == (uint32_t)NFT_JUMP &&
-		        chain && parse_mark_chain(chain, st->sh->fwmask, &x->mark) &&
-		        has_mark(st->sh, x->mark);
-	}
-	return MNL_CB_OK;
+	if (r < 0)
+		errno = EPROTO;
+	else
+		r = nftnl_set_elem_foreach(s, elem_one, priv);
+	nftnl_set_free(s);
+	return r < 0 ? MNL_CB_ERROR : MNL_CB_OK;
 }
 
 static int dump_map(struct nft_ctx *n, int set, struct elem_st *st)
@@ -1408,8 +1383,8 @@ int nft_adopt(struct nft_ctx *n, const struct nft_desired *d, uint32_t max_elems
 	policy_rule_counts(&s, &want[0], &want[1], &want[2]);
 	n->stale = !rules_current(n, "restore_marks", tag, want[0]);
 	for (i = 0; i < 2 && !n->stale; i++)
-		n->stale = !rules_current(n, dstnat_chains[i], tag, want[1]) ||
-		           !rules_current(n, reject_chains[i], tag, want[2]);
+		n->stale = !rules_current(n, fixed_chains[C_PRE_DSTNAT + i].name, tag, want[1]) ||
+		           !rules_current(n, fixed_chains[C_FWD_REJECT + i].name, tag, want[2]);
 
 	shadow_free(&n->sh);
 	n->sh = s;
